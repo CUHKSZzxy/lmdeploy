@@ -439,6 +439,26 @@ class InternVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
+class InternTSProjector(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        ts_hidden_size = config.ts_config.ts_hidden_dim
+        llm_hidden_size = config.text_config.hidden_size
+
+        self.layer_norm = nn.LayerNorm(ts_hidden_size)
+        self.linear_1 = nn.Linear(ts_hidden_size, llm_hidden_size)
+        self.act = nn.GELU()
+        self.linear_2 = nn.Linear(llm_hidden_size, llm_hidden_size)
+
+    def forward(self, ts_features):
+        hidden_states = self.layer_norm(ts_features)
+        hidden_states = self.linear_1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+
 class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMixin):
 
     def __init__(self,
@@ -459,6 +479,17 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         self.input_processor = InternVLProcessor(self.config, dtype)
 
         self.compile_vit = False
+
+        import pdb
+        pdb.set_trace()  # noqa: E999
+        from lmdeploy.pytorch.models.configuration_internts_encoder import InternTimeSeriesEncoderConfig
+        from lmdeploy.pytorch.models.internts_encoder import InternTimeSeriesModel
+
+        model_dir = 'ts_encoder'
+        ts_model_config = InternTimeSeriesEncoderConfig.from_pretrained(model_dir)
+        self.time_series_model = InternTimeSeriesModel(ts_model_config, ctx_mgr=ctx_mgr, dtype=dtype, device=device)
+
+        self.ts_projector = InternTSProjector(config)
 
     def compile_model(self):
         torch_version = version.parse(torch.__version__)
@@ -573,6 +604,42 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
 
         return vision_features
 
+    def get_audio_features(
+        self,
+        audio_values: torch.FloatTensor,
+        audio_len: int,
+        audio_output_len: int,
+        audio_feature_layer: Union[int, List[int]],
+        **kwargs,
+    ):
+        """Obtains image last hidden states from the audio encoder and apply
+        multimodal projection.
+
+        Args:
+            audio_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
+               The tensors corresponding to the input audios.
+            audio_feature_layer (`int` or `List[int]`):
+                Layer index or list of layer indices to extract features from.
+        Returns:
+            audio_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`.
+        """
+        ts_outputs = self.time_series_model(time_series_signals=audio_values,
+                                            x_lens=audio_len,
+                                            output_hidden_states=False,
+                                            return_dict=True)
+        if audio_feature_layer == -1:
+            ts_embeds = ts_outputs.last_hidden_state
+            ts_pad_mask = ts_outputs.ts_pad_mask
+        else:
+            # the pad_mask of each layer is the same
+            ts_embeds = ts_outputs.hidden_states[audio_feature_layer]
+            ts_pad_mask = ts_outputs.ts_pad_mask
+
+        # FIXME, double check, this projector maybe uncessary. We seems to have similar code in Whisper
+        # ts_embeds = self.ts_projector(ts_embeds)
+
+        return ts_embeds, ts_pad_mask
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -582,9 +649,13 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         pixel_values: torch.Tensor = None,
         image_mask: torch.Tensor = None,
         inputs_embeds: torch.Tensor = None,
+        audio_values: torch.Tensor = None,
+        ts_flags: Optional[torch.LongTensor] = None,  # FIXME, what is this???
         **kwargs,
     ):
         if inputs_embeds is None and pixel_values is not None:
+            assert audio_values is None, 'Cannot process more than one modality at a time.'
+
             # extract feature
             self._mark_dynamic_once(pixel_values, [0])
             vit_embeds = self.get_image_features(
@@ -597,6 +668,48 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
 
             inputs_embeds = lang_embeds
             input_ids = None
+
+        if inputs_embeds is None and audio_values is not None:
+            assert pixel_values is None, 'Cannot process more than one modality at a time.'
+
+            ts_embeds, ts_pad_mask = self.get_audio_features(
+                audio_values=audio_values,
+                audio_len=kwargs.get('audio_len', None),
+                audio_output_len=kwargs.get('audio_output_len', None),
+                audio_feature_layer=kwargs.get('audio_feature_layer', -1),
+            )
+            ts_flags = ts_flags.squeeze(-1)
+            ts_embeds = ts_embeds[ts_flags == 1]
+            B, N, C = inputs_embeds.shape
+
+            # get ts_embeds_valid
+            ts_pad_mask = ts_pad_mask[ts_flags == 1]
+            if self.config.adapter_type == 'qformer':
+                device = ts_pad_mask.device
+                ts_pad_mask = torch.zeros(ts_embeds.shape[0], ts_embeds.shape[1], dtype=torch.bool, device=device)
+            ts_embeds_valid = ts_embeds[~ts_pad_mask]  # [num_valid_ts_tokens, C]
+            ts_embeds_valid = ts_embeds_valid.to(inputs_embeds.device)
+
+            # flatten
+            input_ids = input_ids.reshape(B * N)
+            inputs_embeds = inputs_embeds.reshape(B * N, C)
+
+            # replace ts_token in input_embeds and attention_mask
+            selected = (input_ids == self.ts_context_token_id)
+            num_context_tokens = selected.sum().item()
+            num_ts_tokens = ts_embeds_valid.size(0)
+            assert num_context_tokens == num_ts_tokens, \
+                f'[ERROR]: Mismatch: <TS_CONTEXT> tokens={num_context_tokens}, ts_embeds_valid={num_ts_tokens}'
+
+            try:
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + ts_embeds_valid
+            except Exception as e:
+                print(f'warning: {e}, input_embeds[selected].shape={inputs_embeds[selected].shape}, \
+                        ts_embeds_valid.shape={ts_embeds_valid.shape}')
+                inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + ts_embeds_valid[:num_context_tokens]
+
+            inputs_embeds = inputs_embeds.reshape(B, N, C)
+            input_ids = input_ids.reshape(B, N)
 
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError('You must specify exactly one of input_ids or inputs_embeds')
@@ -618,6 +731,7 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         context: StepContext = None,
     ):
         """Prepare input."""
+        # FIXME, should modify this to support audio model
         input_ids = context.input_ids
         position_ids = context.position_ids
         attn_metadata = context.attn_metadata

@@ -168,6 +168,29 @@ class VisonModel(ABC):
             }) for x in content if x['type'] == 'image'])
         return images
 
+    @staticmethod
+    def collect_audios(messages):
+        # FIXME, hack for now, might need to isolate from VisionModel
+        # FIXME, also we might correct the name here, for example, what if not called 'audio' in user inputs?
+        # should check and follow OpenAI formats
+        """Gather all audio along with their respective parameters from the
+        messages and compile them into a single list.
+
+        Args:
+            messages (List[Tuple[Audio, Dict]]): a list of audios with their
+                corresponding parameters
+        """  # noqa
+        audios = []
+        for message in messages:
+            content = message['content']
+            if not isinstance(content, List):
+                continue
+            audios.extend([(x['audio'], {
+                k: v
+                for k, v in x.items() if k not in {'type', 'audio'}
+            }) for x in content if x['type'] == 'audio'])
+        return audios
+
     def to_pytorch_aux(self, messages, prompt, IMAGE_TOKEN, tokenizer, sequence_start):
         """Auxiliary function to pack the preprocessing results in a format
         compatible with what is required by pytorch engine.

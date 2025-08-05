@@ -5,11 +5,11 @@ from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import PIL
 
-from lmdeploy.messages import PytorchEngineConfig, TurbomindEngineConfig, VisionConfig
+from lmdeploy.messages import MultiModalConfig, PytorchEngineConfig, TurbomindEngineConfig
 from lmdeploy.model import BaseChatTemplate
 from lmdeploy.serve.async_engine import AsyncEngine
 from lmdeploy.utils import get_logger, try_import_deeplink
-from lmdeploy.vl.engine import ImageEncoder
+from lmdeploy.vl.engine import MultiModalEncoder
 from lmdeploy.vl.utils import load_image
 
 logger = get_logger('lmdeploy')
@@ -24,11 +24,11 @@ class VLAsyncEngine(AsyncEngine):
                  model_path: str,
                  backend: Literal['turbomind', 'pytorch'] = 'turbomind',
                  backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
-                 vision_config: Optional[VisionConfig] = None,
+                 mm_config: Optional[MultiModalConfig] = None,
                  **kwargs) -> None:
         if backend == 'pytorch':
             try_import_deeplink(backend_config.device_type)
-        self.vl_encoder = ImageEncoder(model_path, backend, vision_config, backend_config=backend_config)
+        self.mm_encoder = MultiModalEncoder(model_path, backend, mm_config, backend_config=backend_config)
         super().__init__(model_path, backend=backend, backend_config=backend_config, **kwargs)
         if self.model_name == 'base':
             raise RuntimeError(
@@ -70,7 +70,7 @@ class VLAsyncEngine(AsyncEngine):
                                                    **kwargs)
         elif isinstance(messages, List):
             has_multimodal_input = any(
-                isinstance(message['content'], list) and any(item['type'] in ['image_url', 'image_data']
+                isinstance(message['content'], list) and any(item['type'] in ['image_url', 'image_data', 'audio_url']
                                                              for item in message['content']) for message in messages)
             if not has_multimodal_input:
                 return await super()._get_prompt_input(messages,
@@ -84,16 +84,18 @@ class VLAsyncEngine(AsyncEngine):
             raise RuntimeError(f'unsupported messages {messages}')
 
         chat_template = self.chat_template if do_preprocess else BaseChatTemplate()
+        # NOTE: ok, we get the chat template here
+        # FIXME: need to adapt this for audio inputs, not convert to pil images
         messages = await self.async_convert_to_pil_images(messages)
-        results = await self.vl_encoder.preprocess(messages)
+        results = await self.mm_encoder.preprocess(messages)
         if self.backend == 'turbomind':
             # for tm engine, this module perform vision embedding after image
             # preprocessing. It utilizes the hf model's vision embeddings
             # functions and returns the input_ids, input_embeddings,
             # embedding_ranges and so on. All the returned values are passed
             # to tm engine for token generation
-            results = await self.vl_encoder.async_infer(results)
-            results = await self.vl_encoder.wrap_for_turbomind(results,
+            results = await self.mm_encoder.async_infer(results)
+            results = await self.mm_encoder.wrap_for_turbomind(results,
                                                                chat_template,
                                                                self.tokenizer,
                                                                sequence_start,
@@ -102,7 +104,7 @@ class VLAsyncEngine(AsyncEngine):
         elif self.backend == 'pytorch':
             # for pt engine, this module only conduct the image preprocessing
             # It leaves the vision embedding to the pt engine
-            results = await self.vl_encoder.wrap_for_pytorch(results,
+            results = await self.mm_encoder.wrap_for_pytorch(results,
                                                              chat_template,
                                                              self.tokenizer,
                                                              sequence_start,
@@ -193,6 +195,10 @@ class VLAsyncEngine(AsyncEngine):
                         message['content'].append(data)
                     except KeyError:
                         logger.error(f'invalid format {message}')
+                elif item['type'] == 'audio_url':
+                    print('??? encounter Audio')
+                    message['content'].append(item)  # FIXME: handle audio specially?
+                    pass
                 elif item['type'] == 'text':
                     message['content'].append(item)
                 else:
@@ -222,8 +228,8 @@ class VLAsyncEngine(AsyncEngine):
         return super().__call__(prompts, *args, **kwargs)
 
     def close(self):
-        if hasattr(self, 'vl_encoder'):
-            del self.vl_encoder
+        if hasattr(self, 'mm_encoder'):
+            del self.mm_encoder
             super().close()
 
     def chat(self, prompts: VLPromptType, *args, **kwargs):

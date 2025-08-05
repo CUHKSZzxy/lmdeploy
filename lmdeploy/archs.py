@@ -95,6 +95,9 @@ def autoget_backend_config(
 
 def check_vl_llm(config: dict) -> bool:
     """Check if the model is a vl model from model config."""
+    # FIXME, hack
+    return True
+
     if 'auto_map' in config:
         for _, v in config['auto_map'].items():
             if 'InternLMXComposer2ForCausalLM' in v:
@@ -165,6 +168,7 @@ def get_model_arch(model_path: str):
             cfg = PretrainedConfig.from_pretrained(model_path, trust_remote_code=True)
 
         _cfg = cfg.to_dict()
+        # FIXME: maybe we should modify here for audio models
         if _cfg.get('architectures', None):
             arch = _cfg['architectures'][0]
             if _cfg.get('auto_map'):

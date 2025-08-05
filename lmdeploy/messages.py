@@ -500,8 +500,8 @@ class EngineOutput:
 
 
 @dataclass
-class VisionConfig:
-    """Vison model configs.
+class MultiModalConfig:
+    """MultiModal model configs.
 
     Args:
         max_batch_size (int): the max image size passed to the model, since

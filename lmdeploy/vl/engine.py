@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from lmdeploy.messages import PytorchEngineConfig, TurbomindEngineConfig, VisionConfig
+from lmdeploy.messages import MultiModalConfig, PytorchEngineConfig, TurbomindEngineConfig
 from lmdeploy.utils import get_logger
 from lmdeploy.vl.model.builder import load_vl_model
 
@@ -23,21 +23,21 @@ def _raise_exception_on_finish(task: asyncio.Task) -> None:
         raise e
 
 
-class ImageEncoder:
-    """Image encoder."""
+class MultiModalEncoder:
+    """Multimodal encoders."""
 
     def __init__(
         self,
         model_path: str,
         backend: str,
-        vision_config: VisionConfig = None,
+        mm_config: MultiModalConfig = None,
         backend_config: Optional[Union[TurbomindEngineConfig, PytorchEngineConfig]] = None,
     ):
         self.model = load_vl_model(model_path, backend, backend_config=backend_config)
-        if vision_config is None:
-            vision_config = VisionConfig()
-        self.vision_config = vision_config
-        self.max_batch_size = vision_config.max_batch_size
+        if mm_config is None:
+            mm_config = MultiModalConfig()
+        self.mm_config = mm_config
+        self.max_batch_size = mm_config.max_batch_size
         self.executor = ThreadPoolExecutor(max_workers=1)
         torch.cuda.empty_cache()
 
