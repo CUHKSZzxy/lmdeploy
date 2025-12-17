@@ -499,19 +499,7 @@ class InternS1TimeSeriesEncoder(nn.Module):
             mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
         return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
-    def _expand_mask(self, mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-        """Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1,
-        tgt_seq_len, src_seq_len]`."""
-        bsz, src_len = mask.size()
-        tgt_len = tgt_len if tgt_len is not None else src_len
-
-        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
-
-        inverted_mask = 1.0 - expanded_mask
-
-        return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+    def _prepare_decoder_attention_mask(self, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
@@ -524,18 +512,9 @@ class InternS1TimeSeriesEncoder(nn.Module):
                 past_key_values_length=past_key_values_length,
             )
 
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = self._expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
-            combined_attention_mask = (expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask +
-                                       combined_attention_mask)
         return combined_attention_mask
 
-    def forward(
-        self,
-        input_features,
-        attention_mask=None,
-    ):
+    def forward(self, input_features):
         # (N, T, C) -> (T, N, C) -> (N, C, T)
         input_features = input_features.permute(1, 0, 2)
         input_features = self.adapt_in(input_features)
@@ -546,8 +525,8 @@ class InternS1TimeSeriesEncoder(nn.Module):
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
 
         # (N, C, T) -> (N, T, C)
-        inputs_embeds = inputs_embeds.permute(0, 2, 1)  # torch.Size([1, 100, 768])
-        embed_pos = self.embed_positions.weight  # torch.Size([1500, 768])
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        embed_pos = self.embed_positions.weight
 
         if inputs_embeds.shape[1] > embed_pos.shape[0]:
             target_len = inputs_embeds.shape[1]
@@ -560,8 +539,7 @@ class InternS1TimeSeriesEncoder(nn.Module):
 
         input_shape = inputs_embeds.size()[:-1]
         past_key_values_length = 0
-        attention_mask = self._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds,
-                                                              past_key_values_length)
+        attention_mask = self._prepare_decoder_attention_mask(input_shape, inputs_embeds, past_key_values_length)
 
         for idx, encoder_layer in enumerate(self.layers):
             layer_outputs = encoder_layer(hidden_states, attention_mask)
@@ -704,7 +682,7 @@ class InternS1TimeSeriesModel(nn.Module):
         if time_series_signals is None and time_series_embeds is None:
             raise ValueError('You have to specify time_series_signals or time_series_embeds')
 
-        # embedded values can be passed in directly, but the dimensions must match.
+        # embedded values can be passed in directly, but the dimensions must match
         if time_series_embeds is not None and len(
                 time_series_embeds.shape) == 3 and time_series_embeds.shape[-1] == self.config.ts_adapt_in_dim:
             time_series_embeds = time_series_embeds
@@ -716,7 +694,7 @@ class InternS1TimeSeriesModel(nn.Module):
                 raise ValueError(f'wrong time_series_signals size: {time_series_signals[0].shape}')
 
         # [B, 64000, 1] -> [B, 200, 256] -> [B, 100, 1024]
-        last_hidden_state = self.encoder(input_features=time_series_embeds, )
+        last_hidden_state = self.encoder(input_features=time_series_embeds)
 
         # ts_lens after encoder
         ts_lens = (ts_lens + 1) // 2
