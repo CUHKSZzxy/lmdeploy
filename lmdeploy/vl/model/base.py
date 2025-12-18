@@ -243,6 +243,41 @@ class VisionModel(ABC):
 
         return dict(prompt=None, input_ids=input_ids, multimodal=preps)
 
+    def to_pytorch_aux(self, messages, prompt, IMAGE_TOKEN, tokenizer, sequence_start):
+        """Auxiliary function to pack the preprocessing results in a format
+        compatible with what is required by pytorch engine.
+
+        Args:
+            messages(List[Dict]): the output of `preprocess`
+            prompt(str): the prompt after applying chat template
+            IMAGE_TOKEN(str): a placeholder where image tokens will be
+                inserted
+            tokenzer: the tokenizer model
+            sequence_start: starting flag of a sequence
+        """
+        # collect all preprocessing result from messages
+        preps = [x['content'] for x in messages if x['role'] == 'preprocess']
+        assert len(preps) == 1
+        preps = preps[0]
+
+        # split prompt into segments and validate data
+        segs = prompt.split(IMAGE_TOKEN)
+        assert len(segs) == len(preps) + 1, (f'the number of {IMAGE_TOKEN} is not equal '
+                                             f'to input images, {len(segs) - 1} vs {len(preps)}')
+
+        # calculate the image token offset for each image
+        input_ids = []
+        for i, seg in enumerate(segs):
+            if i > 0 and i <= len(preps):
+                preps[i - 1].update(offset=len(input_ids))
+                image_tokens = preps[i - 1]['image_tokens']
+                assert self.image_token_id == preps[i - 1]['image_token_id']
+                input_ids.extend([self.image_token_id] * image_tokens)
+            token_ids = tokenizer.encode(seg, add_bos=((i == 0) and sequence_start))
+            input_ids.extend(token_ids)
+
+        return dict(prompt=prompt, input_ids=input_ids, multimodal=preps)
+
     def to_turbomind_aux(self, messages, prompt, IMAGE_TOKEN, tokenizer, sequence_start):
         """Auxiliary function to pack the forwarding results in a format
         compatible with what is required by turbomind engine.
