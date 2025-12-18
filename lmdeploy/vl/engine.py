@@ -49,15 +49,11 @@ class ImageEncoder:
 
     async def preprocess(self,
                          messages: List[Dict],
-                         mm_processor_kwargs: Optional[Dict[str, Any]] = None,
-                         time_series_inputs: Optional[Dict[str, Any]] = None) -> List[Dict]:
+                         mm_processor_kwargs: Optional[Dict[str, Any]] = None) -> List[Dict]:
         """Preprocess multimodal data in the messages."""
         if _accepts_arg(self.model.preprocess, 'mm_processor_kwargs'):
             future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.preprocess, messages,
                                                               mm_processor_kwargs)
-        elif _accepts_arg(self.model.preprocess, 'time_series_inputs'):
-            future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.preprocess, messages,
-                                                              time_series_inputs)
         else:
             future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.preprocess, messages)
         future.add_done_callback(_raise_exception_on_finish)

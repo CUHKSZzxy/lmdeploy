@@ -91,13 +91,9 @@ class VLAsyncEngine(AsyncEngine):
             raise RuntimeError(f'unsupported messages {messages}')
 
         chat_template = self.chat_template if do_preprocess else BaseChatTemplate()
-        # currently, image and time series data will not appear in the same message
-        if has_time_series_input:
-            time_series_inputs = self.time_series_preprocessor(messages)
-            results = await self.vl_encoder.preprocess(messages, mm_processor_kwargs, time_series_inputs)
-        else:
+        if not has_time_series_input:
             messages = await self.async_convert_to_pil_images(messages)
-            results = await self.vl_encoder.preprocess(messages, mm_processor_kwargs)
+        results = await self.vl_encoder.preprocess(messages, mm_processor_kwargs)
         if self.backend == 'turbomind':
             # for tm engine, this module perform vision embedding after image
             # preprocessing. It utilizes the hf model's vision embeddings
@@ -216,37 +212,6 @@ class VLAsyncEngine(AsyncEngine):
             for i in range(len(messages))
         ])
         return out_messages
-
-    @classmethod
-    def time_series_preprocessor(self, conversation):
-        # FIXME: zhouxinyu. this function only extract time series paths and sampling rates
-        # should move it to other place, and do not pass those into apply_chat_template
-        if (isinstance(conversation, (list, tuple))
-                and (isinstance(conversation[0], (list, tuple)) or hasattr(conversation[0], 'content'))):
-            conversations = conversation
-        else:
-            conversations = [conversation]
-
-        batch_time_series = []
-        batch_time_series_metadata = []
-        for conversation in conversations:
-            for message in conversation:
-                time_series_fnames = [
-                    content['data'] for content in message['content']
-                    if content.get('type') == 'time_series' and 'data' in content
-                ]
-                time_series_rates = [
-                    content.get('sampling_rate', None) for content in message['content']
-                    if content.get('type') == 'time_series'
-                ]
-                for path, rate in zip(time_series_fnames, time_series_rates):
-                    batch_time_series.append(path)
-                    batch_time_series_metadata.append(rate)
-
-        return {
-            'time_series_paths': batch_time_series if batch_time_series else None,
-            'time_series_sampling_rates': batch_time_series_metadata if batch_time_series_metadata else None
-        }
 
     def batch_infer(self, prompts: Union[VLPromptType, List[Dict], List[VLPromptType], List[List[Dict]]], *args,
                     **kwargs):
