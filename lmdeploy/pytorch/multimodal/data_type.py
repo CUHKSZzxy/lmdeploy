@@ -4,13 +4,6 @@ from typing import Any, Dict, List, Union
 
 from torch import Tensor
 
-
-class MultiModalData:
-    pass
-
-
-MultiModalDataList = List[MultiModalData]
-
 NestedTensor = Union[Tensor, List[Tensor]]
 
 

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -21,6 +22,7 @@ from lmdeploy.pytorch.weight_loader.model_weight_loader import load_weight
 from .patch import build_model_from_hf_config
 from .utils.cudagraph import CudaGraphMixin
 from .utils.model import DeployModelMixin, vlm_model
+from .whisper import WhisperEncoderLayer
 
 
 @torch.compile(dynamic=True)
@@ -439,6 +441,293 @@ class InternVLMultiModalProjector(nn.Module):
         return hidden_states
 
 
+class InternS1TimeSeriesEncoder(nn.Module):
+
+    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+        super().__init__()
+        self.config = config
+        self.layerdrop = config.encoder_layerdrop
+
+        self.embed_dim = config.d_model
+        self.num_mel_bins = config.num_mel_bins
+        self.padding_idx = config.pad_token_id
+        self.max_source_positions = config.max_source_positions
+        self.embed_scale = math.sqrt(self.embed_dim) if config.scale_embedding else 1.0
+
+        self.conv1 = nn.Conv1d(self.num_mel_bins, self.embed_dim, kernel_size=3, padding=1, dtype=dtype, device=device)
+        self.conv2 = nn.Conv1d(self.embed_dim,
+                               self.embed_dim,
+                               kernel_size=3,
+                               stride=2,
+                               padding=1,
+                               dtype=dtype,
+                               device=device)
+        self.embed_positions = nn.Embedding(self.max_source_positions, self.embed_dim, dtype=dtype, device=device)
+
+        self.layers = nn.ModuleList(
+            [WhisperEncoderLayer(config, dtype=dtype, device=device) for _ in range(config.encoder_layers)])
+        self.layer_norm = LayerNorm(config.d_model, eps=1e-5, dtype=dtype, device=device)
+
+        self.adapt_in = build_colwise_linear(
+            in_features=config.ts_adapt_in_dim,
+            out_features=80,
+            bias=True,
+            dtype=dtype,
+            device=device,
+        )
+        self.adapt_out = build_rowwise_linear(
+            in_features=self.embed_dim,
+            out_features=config.ts_adapt_out_dim,
+            bias=True,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _make_causal_mask(self,
+                          input_ids_shape: torch.Size,
+                          dtype: torch.dtype,
+                          device: torch.device,
+                          past_key_values_length: int = 0):
+        """Make causal mask used for bi-directional self-attention."""
+        bsz, tgt_len = input_ids_shape
+        mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
+        mask_cond = torch.arange(mask.size(-1), device=device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(dtype)
+
+        if past_key_values_length > 0:
+            mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+    def _prepare_decoder_attention_mask(self, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+
+        if input_shape[-1] > 1:
+            combined_attention_mask = self._make_causal_mask(
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+
+        return combined_attention_mask
+
+    def forward(self, input_features):
+        # (N, T, C) -> (T, N, C) -> (N, C, T)
+        input_features = input_features.permute(1, 0, 2)
+        input_features = self.adapt_in(input_features)
+        input_features = input_features.permute(1, 2, 0)
+
+        # (N, C, T) -> (N, C, T//2)
+        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
+        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+
+        # (N, C, T) -> (N, T, C)
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        embed_pos = self.embed_positions.weight
+
+        if inputs_embeds.shape[1] > embed_pos.shape[0]:
+            target_len = inputs_embeds.shape[1]
+            padding = [0, 0, 0, target_len - embed_pos.shape[0]]
+
+            embed_pos = nn.functional.pad(embed_pos, pad=padding, mode='constant', value=0)
+            hidden_states = inputs_embeds[:, :embed_pos.shape[0], :] + embed_pos
+        else:
+            hidden_states = inputs_embeds + embed_pos[:inputs_embeds.shape[1], :]
+
+        input_shape = inputs_embeds.size()[:-1]
+        past_key_values_length = 0
+        attention_mask = self._prepare_decoder_attention_mask(input_shape, inputs_embeds, past_key_values_length)
+
+        for idx, encoder_layer in enumerate(self.layers):
+            layer_outputs = encoder_layer(hidden_states, attention_mask)
+            hidden_states = layer_outputs
+
+        # (N, T, C) -> (T, N, C)
+        hidden_states = hidden_states.permute(1, 0, 2)
+        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.adapt_out(hidden_states)
+
+        # (T, N, C) -> (N, T, C)
+        hidden_states = hidden_states.permute(1, 0, 2)
+
+        return hidden_states
+
+
+class InternS1TimeSeriesConcatSubsampling(nn.Module):
+
+    def __init__(self, in_channels: int, concat_size: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels * concat_size
+
+    def forward(self, ts_signals: torch.Tensor, ts_lens: torch.Tensor):
+        if ts_signals.shape[1] % 2 != 0:
+            ts_signals = ts_signals[:, :-1, :]
+        even_frames = ts_signals[:, ::2, :]
+        odd_frames = ts_signals[:, 1::2, :]
+        ts_signals = torch.cat((even_frames, odd_frames), dim=2)
+        ts_lens = ts_lens // 2
+        return ts_signals, ts_lens
+
+
+class InternS1TimeSeriesFixPositionalEncoding(nn.Module):
+
+    def __init__(self, d_model, max_len=20000, dtype: torch.dtype = None, device: torch.device = None):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model, dtype=torch.float)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        # TODO: zhouxinyu, hf forces float32 during init, but becomes bf16 during forward
+        pe = pe.unsqueeze(0).transpose(0, 1).to(dtype=dtype, device=device)  # (max_len, 1, d_model)
+        self.register_buffer('pe', pe, persistent=True)
+
+    def forward(self, x):
+        # x: (seq_len, batch_size, d_model)
+        x = x + self.pe[:x.size(0), :]
+        return x.clone()
+
+
+class InternS1TimeSeriesMultiChannelAdaptiveSubsampling(nn.Module):
+
+    def __init__(self,
+                 hidden_dim=128,
+                 nhead=8,
+                 num_encoder_layers=1,
+                 dtype: torch.dtype = None,
+                 device: torch.device = None):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels=1,
+                              out_channels=hidden_dim,
+                              kernel_size=5,
+                              stride=1,
+                              padding=2,
+                              dtype=dtype,
+                              device=device)
+        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dtype=dtype, device=device)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_encoder_layers)
+        self.pos_encoder = InternS1TimeSeriesFixPositionalEncoding(d_model=hidden_dim, dtype=dtype, device=device)
+        self.subsampling = InternS1TimeSeriesConcatSubsampling(128, 2)
+
+    def forward(self, inputs, input_lens, sr):
+        sr = torch.as_tensor(sr, dtype=torch.float32)
+        strides = torch.floor(160 / ((1 + torch.exp(-sr / 100))**6))
+        patch_sizes = strides * 2
+        patched_outputs = []
+        output_lens = []
+
+        for i in range(len(inputs)):
+            seq = inputs[i]  # [seq_len, num_channel]
+            ps = patch_sizes[i].item()
+            st = strides[i].item()
+            le = input_lens[i]
+
+            output_len = torch.ceil((le - ps) / st) + 1
+            pad_len = ((output_len - 1) * st + ps - le).long().item()
+            if seq.ndim == 1:
+                seq = seq.unsqueeze(-1)
+            seq = nn.functional.pad(seq, (0, 0, 0, pad_len), 'constant', 0)
+            assert output_len > 0, (seq.shape, ps, st, le, output_len)
+            output_lens.append(output_len)
+            indices = (torch.arange(0, output_len * st, st).unsqueeze(1) + torch.arange(ps)).long()
+            patched = seq[indices]
+
+            output = self.forward_encoder(patched)  # [num_patch, D]
+            patched_outputs.append(output)
+
+        outputs = nn.utils.rnn.pad_sequence(patched_outputs, batch_first=True)
+        output_lens = torch.tensor(output_lens).squeeze().to(outputs.device).long()
+        if output_lens.ndim == 0:
+            output_lens = output_lens.unsqueeze(0)
+
+        outputs, output_lens = self.subsampling(outputs.clone(), output_lens.clone())
+        return outputs, output_lens
+
+    def forward_encoder(self, x):
+        num_patch, patch_len, C = x.shape
+        # conv1
+        # treat each channel as an independent sample and feed it into conv1
+        x = x.reshape(num_patch * C, 1, patch_len)
+        x = nn.functional.relu((self.conv(x)))  # [B*C, D1, L]
+        x = x.permute(2, 0, 1)  # [L, B*C, D1]
+
+        x = self.pos_encoder(x)  # [L, B*C, D1]
+        x = self.transformer_encoder(x)
+        x = x.mean(0)
+
+        x = x.reshape(num_patch, C, -1)
+
+        return x.mean(1)
+
+
+class InternS1TimeSeriesModel(nn.Module):
+
+    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+        super().__init__()
+        self.config = config
+        self.encoder_embed = InternS1TimeSeriesMultiChannelAdaptiveSubsampling(dtype=dtype, device=device)
+        self.encoder = InternS1TimeSeriesEncoder(config, dtype=dtype, device=device)
+
+    def forward(
+        self,
+        time_series_signals: Optional[torch.FloatTensor] = None,
+        ts_lens: Optional[torch.Tensor] = None,
+        sr: Optional[torch.Tensor] = None,
+        time_series_embeds: Optional[torch.FloatTensor] = None,
+    ) -> Union[Tuple]:
+        if time_series_signals is None and time_series_embeds is None:
+            raise ValueError('You have to specify time_series_signals or time_series_embeds')
+
+        # embedded values can be passed in directly, but the dimensions must match
+        if time_series_embeds is not None and len(
+                time_series_embeds.shape) == 3 and time_series_embeds.shape[-1] == self.config.ts_adapt_in_dim:
+            time_series_embeds = time_series_embeds
+        else:
+            if ((isinstance(time_series_signals, list) and len(time_series_signals[0].shape) == 2)
+                    or (isinstance(time_series_signals, torch.Tensor) and len(time_series_signals.shape) == 3)):
+                time_series_embeds, ts_lens = self.encoder_embed(time_series_signals, ts_lens, sr)
+            else:
+                raise ValueError(f'wrong time_series_signals size: {time_series_signals[0].shape}')
+
+        # [B, 64000, 1] -> [B, 200, 256] -> [B, 100, 1024]
+        last_hidden_state = self.encoder(input_features=time_series_embeds)
+
+        # ts_lens after encoder
+        ts_lens = (ts_lens + 1) // 2
+        assert torch.all(ts_lens > 0), f'The length of time_series_embeds is so small. ts_lens: {ts_lens}'
+
+        return last_hidden_state
+
+
+class InternS1TimeSeriesProjector(nn.Module):
+
+    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+        super().__init__()
+        self.layer_norm = LayerNorm(config.ts_config.ts_hidden_dim, eps=1e-5, dtype=dtype, device=device)
+        self.linear_1 = build_colwise_linear(in_features=config.ts_config.ts_hidden_dim,
+                                             out_features=config.text_config.hidden_size,
+                                             bias=True,
+                                             dtype=dtype,
+                                             device=device)
+        self.act = ACT2FN[config.projector_hidden_act]
+        self.linear_2 = build_rowwise_linear(in_features=config.text_config.hidden_size,
+                                             out_features=config.text_config.hidden_size,
+                                             bias=True,
+                                             dtype=dtype,
+                                             device=device)
+
+    def forward(self, ts_features):
+        hidden_states = self.layer_norm(ts_features)
+        hidden_states = self.linear_1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+
 class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMixin):
 
     def __init__(self,
@@ -451,7 +740,9 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         self.ctx_mgr = ctx_mgr
 
         self.vision_tower = InternVLVisionModel(config.vision_config, dtype=dtype, device=device)
+        self.ts_tower = InternS1TimeSeriesModel(config.ts_config, dtype=dtype, device=device)
         self.multi_modal_projector = InternVLMultiModalProjector(config, dtype=dtype, device=device)
+        self.time_series_projector = InternS1TimeSeriesProjector(config, dtype=dtype, device=device)
         self.language_model = build_model_from_hf_config(config.text_config, dtype=dtype, device=device)
         self.vision_feature_layer = config.vision_feature_layer
         self.vision_feature_select_strategy = config.vision_feature_select_strategy
@@ -573,6 +864,11 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
 
         return vision_features
 
+    def get_ts_feature(self, ts_values, ts_lens, sr):
+        ts_embeds = self.ts_tower(time_series_signals=ts_values, ts_lens=ts_lens, sr=sr)
+        ts_embeds = self.time_series_projector(ts_embeds)
+        return ts_embeds
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -581,6 +877,10 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         attn_metadata: Any = None,
         pixel_values: torch.Tensor = None,
         image_mask: torch.Tensor = None,
+        ts_values: torch.Tensor = None,
+        ts_lens: torch.Tensor = None,
+        ts_sr: torch.Tensor = None,
+        ts_mask: torch.Tensor = None,
         inputs_embeds: torch.Tensor = None,
         **kwargs,
     ):
@@ -594,6 +894,13 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
             )
             lang_embeds = self.get_input_embeddings()(input_ids)
             lang_embeds.masked_scatter_(image_mask[..., None], vit_embeds)
+
+            inputs_embeds = lang_embeds
+            input_ids = None
+        elif inputs_embeds is None and ts_values is not None:
+            ts_features = self.get_ts_feature(ts_values, ts_lens, ts_sr)  # [B, T, C]
+            lang_embeds = self.get_input_embeddings()(input_ids)
+            lang_embeds.masked_scatter_(ts_mask[..., None], ts_features)
 
             inputs_embeds = lang_embeds
             input_ids = None
@@ -627,17 +934,29 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         # vision inputs
         pixel_values = None
         image_mask = None
+        ts_values = None
+        ts_lens = None
+        ts_sr = None
+        ts_mask = None
         if context.input_multimodals is not None:
-            pixel_values = [input_mm.get('image', []) for input_mm in context.input_multimodals]
+            mm_values = [input_mm.get('image', []) for input_mm in context.input_multimodals]
             # flatten batch
-            pixel_values = [data for im_data in pixel_values for data in im_data]
-            if len(pixel_values) > 0:
-                image_token_id = pixel_values[0].meta['image_token_id']
-                image_mask = input_ids == image_token_id
-                pixel_values = torch.cat([data.data for data in pixel_values])
-            else:
-                pixel_values = None
-                image_mask = None
+            mm_values = [data for im_data in mm_values for data in im_data]
+
+            if len(mm_values) > 0:
+                is_time_series = mm_values[0].meta.get('ts_token_id', False)
+                if is_time_series:
+                    ts_values = mm_values
+                    ts_token_id = ts_values[0].meta['ts_token_id']
+                    ts_lens = ts_values[0].meta['ts_lens']
+                    ts_sr = ts_values[0].meta['ts_sr']
+                    ts_mask = input_ids == ts_token_id
+                    ts_values = torch.cat([data.data for data in ts_values])
+                else:
+                    pixel_values = mm_values
+                    image_token_id = pixel_values[0].meta['image_token_id']
+                    image_mask = input_ids == image_token_id
+                    pixel_values = torch.cat([data.data for data in pixel_values])
 
         # get inputs from context
         if vision_embeddings is not None and len(vision_embeddings) > 0:
@@ -653,6 +972,10 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
             attn_metadata=attn_metadata,
             pixel_values=pixel_values,
             image_mask=image_mask,
+            ts_values=ts_values,
+            ts_lens=ts_lens,
+            ts_sr=ts_sr,
+            ts_mask=ts_mask,
             inputs_embeds=inputs_embeds,
         )
 
@@ -683,12 +1006,14 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
         lang_prefix_length = len(lang_prefix)
         new_weights = dict()
         params_dict = dict(self.named_parameters())
+        buffers_dict = dict(self.named_buffers())
         vision_stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ('.qkv_proj', '.q_proj', 'q'),
             ('.qkv_proj', '.k_proj', 'k'),
             ('.qkv_proj', '.v_proj', 'v'),
         ]
+
         for name, loaded_weight in weights:
 
             if name.startswith(lang_prefix):
@@ -704,8 +1029,14 @@ class InternVLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphMix
                 load_weight(param, loaded_weight, shard_id=shard_id)
                 break
             else:
-                param = params_dict[name]
-                load_weight(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    load_weight(param, loaded_weight)
+                    continue
+                elif name in buffers_dict:
+                    param = buffers_dict[name]
+                    load_weight(param, loaded_weight)
+                    continue
 
         self.language_model.load_weights(new_weights.items())
 
@@ -731,17 +1062,30 @@ class InternVLProcessor(BaseModelInputProcessor):
 
         input_imgs = []
         for input_mm in input_multimodals:
-            pixel_values = input_mm['pixel_values'].to(self.dtype)
-            offset = input_mm['offset']
-            image_token_id = input_mm['image_token_id']
-            num_pad = input_mm['image_tokens']
-            if isinstance(num_pad, torch.Tensor):
-                num_pad = num_pad.item()
+            if 'ts_values' in input_mm:
+                ts_values = input_mm['ts_values'].to(self.dtype)
+                offset = input_mm['offset']
+                ts_token_id = input_mm['ts_token_id']
+                ts_lens = input_mm['ts_lens']
+                ts_sr = input_mm['ts_sr']
+                num_pad = input_mm['num_ts_tokens']
 
-            mm_data = MultiModalTensor(data=pixel_values,
-                                       start=offset,
-                                       end=offset + num_pad,
-                                       meta=dict(image_token_id=image_token_id))
+                mm_data = MultiModalTensor(data=ts_values,
+                                           start=offset,
+                                           end=offset + num_pad,
+                                           meta=dict(ts_token_id=ts_token_id, ts_lens=ts_lens, ts_sr=ts_sr))
+            else:
+                pixel_values = input_mm['pixel_values'].to(self.dtype)
+                offset = input_mm['offset']
+                image_token_id = input_mm['image_token_id']
+                num_pad = input_mm['image_tokens']
+                if isinstance(num_pad, torch.Tensor):
+                    num_pad = num_pad.item()
+
+                mm_data = MultiModalTensor(data=pixel_values,
+                                           start=offset,
+                                           end=offset + num_pad,
+                                           meta=dict(image_token_id=image_token_id))
             input_imgs.append(mm_data)
 
         result = PreprocessInputResult(
