@@ -45,6 +45,7 @@ class ImageEncoder:
         self.vision_config = vision_config
         self.max_batch_size = vision_config.max_batch_size
         self.executor = ThreadPoolExecutor(max_workers=1)
+        # Gate VL executor submissions so waiters yield instead of queueing.
         self.executor_lock = asyncio.Lock()
         self._uses_new_preprocess = self._is_new_preprocess_api(self.model)
         torch.cuda.empty_cache()

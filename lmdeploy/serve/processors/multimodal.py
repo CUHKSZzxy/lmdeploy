@@ -38,6 +38,7 @@ class MultimodalProcessor:
         self.chat_template = chat_template
         self.vl_encoder = vl_encoder
         self.backend = backend
+        # Gate CPU-heavy prompt prep so waiters yield to the server loop.
         self.prompt_lock = asyncio.Lock()
 
     @staticmethod
