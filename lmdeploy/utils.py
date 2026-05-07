@@ -15,6 +15,33 @@ from transformers import PretrainedConfig
 logger_initialized = {}
 
 
+async def await_executor_future(future: asyncio.Future):
+    """Await executor work without releasing a lock before cancellation
+    ends."""
+    cancelled = False
+    while not future.done():
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            if cancelled:
+                raise asyncio.CancelledError
+            raise
+        else:
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+
+    if cancelled:
+        try:
+            future.exception()
+        except BaseException:
+            pass
+        raise asyncio.CancelledError
+    return future.result()
+
+
 class _ASNI_COLOR:
     BRIGHT_RED = '\033[91m'
     RED = '\033[31m'

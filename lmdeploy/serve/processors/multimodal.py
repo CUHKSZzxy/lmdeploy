@@ -7,7 +7,7 @@ import PIL
 
 from lmdeploy.model import MODELS, BaseChatTemplate
 from lmdeploy.tokenizer import Tokenizer
-from lmdeploy.utils import get_logger
+from lmdeploy.utils import await_executor_future, get_logger
 from lmdeploy.vl.constants import Modality
 from lmdeploy.vl.media.connection import load_from_url
 from lmdeploy.vl.media.image import ImageMediaIO
@@ -347,7 +347,7 @@ class MultimodalProcessor:
         """Process text-only prompt and return prompt string and input_ids."""
         loop = asyncio.get_event_loop()
         async with self.prompt_lock:
-            return await loop.run_in_executor(
+            future = loop.run_in_executor(
                 None,
                 partial(self._get_text_prompt_input_sync,
                         prompt=prompt,
@@ -358,6 +358,7 @@ class MultimodalProcessor:
                         reasoning_effort=reasoning_effort,
                         chat_template_kwargs=chat_template_kwargs,
                         **kwargs))
+            return await await_executor_future(future)
 
     def _get_text_prompt_input_sync(self,
                                     prompt: str | list[dict],
@@ -420,13 +421,14 @@ class MultimodalProcessor:
             if self.vl_encoder._uses_new_preprocess:
                 loop = asyncio.get_event_loop()
                 async with self.prompt_lock:
-                    input_prompt = await loop.run_in_executor(
+                    future = loop.run_in_executor(
                         None,
                         partial(self.vl_encoder.model.get_input_prompt,
                                 messages=messages,
                                 chat_template=chat_template,
                                 sequence_start=sequence_start,
                                 chat_template_kwargs=chat_template_kwargs))
+                    input_prompt = await await_executor_future(future)
                 results = await self.vl_encoder.preprocess(messages, input_prompt, mm_processor_kwargs)
             else:
                 results = await self.vl_encoder.preprocess(messages, mm_processor_kwargs)

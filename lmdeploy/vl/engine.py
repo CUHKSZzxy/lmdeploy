@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from lmdeploy.messages import PytorchEngineConfig, TurbomindEngineConfig, VisionConfig
-from lmdeploy.utils import get_logger
+from lmdeploy.utils import await_executor_future, get_logger
 from lmdeploy.vl.model.builder import load_vl_model
 
 logger = get_logger('lmdeploy')
@@ -70,7 +70,7 @@ class ImageEncoder:
             else:
                 future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.preprocess, messages)
             future.add_done_callback(_raise_exception_on_finish)
-            outputs = await future
+            outputs = await await_executor_future(future)
         return outputs
 
     async def async_infer(self, messages: list[dict]) -> list[dict]:
@@ -84,7 +84,7 @@ class ImageEncoder:
             future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.forward, messages,
                                                               self.max_batch_size)
             future.add_done_callback(_raise_exception_on_finish)
-            outputs = await future
+            outputs = await await_executor_future(future)
         return outputs
 
     async def wrap_for_pytorch(
@@ -118,7 +118,7 @@ class ImageEncoder:
         loop = asyncio.get_event_loop()
         async with self.executor_lock:
             if not has_input_ids:
-                result = await loop.run_in_executor(
+                future = loop.run_in_executor(
                     self.executor,
                     partial(self.model.to_pytorch,
                             messages,
@@ -128,7 +128,8 @@ class ImageEncoder:
                             tools=tools,
                             chat_template_kwargs=chat_template_kwargs))
             else:
-                result = await loop.run_in_executor(self.executor, self.model.to_pytorch_with_input_ids, messages)
+                future = loop.run_in_executor(self.executor, self.model.to_pytorch_with_input_ids, messages)
+            result = await await_executor_future(future)
         # clear data
         for i, message in enumerate(messages):
             if isinstance(message['content'], list):
@@ -163,7 +164,7 @@ class ImageEncoder:
         """
         loop = asyncio.get_event_loop()
         async with self.executor_lock:
-            result = await loop.run_in_executor(
+            future = loop.run_in_executor(
                 self.executor,
                 partial(self.model.to_turbomind,
                         messages,
@@ -172,6 +173,7 @@ class ImageEncoder:
                         sequence_start,
                         tools=tools,
                         chat_template_kwargs=chat_template_kwargs))
+            result = await await_executor_future(future)
         # clear data
         for i, message in enumerate(messages):
             if isinstance(message['content'], list):
