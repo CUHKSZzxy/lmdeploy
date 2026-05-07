@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
+from functools import partial
 from typing import Any, Literal
 
 import PIL
@@ -37,6 +38,7 @@ class MultimodalProcessor:
         self.chat_template = chat_template
         self.vl_encoder = vl_encoder
         self.backend = backend
+        self.prompt_lock = asyncio.Lock()
 
     @staticmethod
     def merge_message_content(msg: dict) -> dict:
@@ -343,6 +345,30 @@ class MultimodalProcessor:
                                      chat_template_kwargs: dict | None = None,
                                      **kwargs):
         """Process text-only prompt and return prompt string and input_ids."""
+        loop = asyncio.get_event_loop()
+        async with self.prompt_lock:
+            return await loop.run_in_executor(
+                None,
+                partial(self._get_text_prompt_input_sync,
+                        prompt=prompt,
+                        do_preprocess=do_preprocess,
+                        sequence_start=sequence_start,
+                        adapter_name=adapter_name,
+                        tools=tools,
+                        reasoning_effort=reasoning_effort,
+                        chat_template_kwargs=chat_template_kwargs,
+                        **kwargs))
+
+    def _get_text_prompt_input_sync(self,
+                                    prompt: str | list[dict],
+                                    do_preprocess: bool,
+                                    sequence_start: bool,
+                                    adapter_name: str,
+                                    tools: list[object] | None = None,
+                                    reasoning_effort: Literal['low', 'medium', 'high'] | None = None,
+                                    chat_template_kwargs: dict | None = None,
+                                    **kwargs):
+        """Render and tokenize a text prompt."""
         # Change multimodal data to openai text messages
         if isinstance(prompt, list):
             prompt = [self.merge_message_content(msg) for msg in prompt]
@@ -392,10 +418,15 @@ class MultimodalProcessor:
                                                                chat_template_kwargs=chat_template_kwargs)
         elif self.backend == 'pytorch':
             if self.vl_encoder._uses_new_preprocess:
-                input_prompt = self.vl_encoder.model.get_input_prompt(messages=messages,
-                                                                      chat_template=chat_template,
-                                                                      sequence_start=sequence_start,
-                                                                      chat_template_kwargs=chat_template_kwargs)
+                loop = asyncio.get_event_loop()
+                async with self.prompt_lock:
+                    input_prompt = await loop.run_in_executor(
+                        None,
+                        partial(self.vl_encoder.model.get_input_prompt,
+                                messages=messages,
+                                chat_template=chat_template,
+                                sequence_start=sequence_start,
+                                chat_template_kwargs=chat_template_kwargs))
                 results = await self.vl_encoder.preprocess(messages, input_prompt, mm_processor_kwargs)
             else:
                 results = await self.vl_encoder.preprocess(messages, mm_processor_kwargs)

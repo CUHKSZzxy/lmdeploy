@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any
 
 import torch
@@ -44,6 +45,7 @@ class ImageEncoder:
         self.vision_config = vision_config
         self.max_batch_size = vision_config.max_batch_size
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor_lock = asyncio.Lock()
         self._uses_new_preprocess = self._is_new_preprocess_api(self.model)
         torch.cuda.empty_cache()
 
@@ -61,14 +63,14 @@ class ImageEncoder:
                          input_prompt: str | list[int] | None = None,
                          mm_processor_kwargs: dict[str, Any] | None = None) -> list[dict]:
         """Preprocess multimodal data in the messages."""
-        if self._uses_new_preprocess:
-            future = asyncio.get_event_loop().run_in_executor(
-                self.executor, self.model.preprocess, messages, input_prompt, mm_processor_kwargs)
-        else:
-            future = asyncio.get_event_loop().run_in_executor(
-                self.executor, self.model.preprocess, messages)
-        future.add_done_callback(_raise_exception_on_finish)
-        outputs = await future
+        async with self.executor_lock:
+            if self._uses_new_preprocess:
+                future = asyncio.get_event_loop().run_in_executor(
+                    self.executor, self.model.preprocess, messages, input_prompt, mm_processor_kwargs)
+            else:
+                future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.preprocess, messages)
+            future.add_done_callback(_raise_exception_on_finish)
+            outputs = await future
         return outputs
 
     async def async_infer(self, messages: list[dict]) -> list[dict]:
@@ -78,10 +80,11 @@ class ImageEncoder:
             messages (list[dict]): a list of message, which is the output
             of `preprocess()`
         """
-        future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.forward, messages,
-                                                          self.max_batch_size)
-        future.add_done_callback(_raise_exception_on_finish)
-        outputs = await future
+        async with self.executor_lock:
+            future = asyncio.get_event_loop().run_in_executor(self.executor, self.model.forward, messages,
+                                                              self.max_batch_size)
+            future.add_done_callback(_raise_exception_on_finish)
+            outputs = await future
         return outputs
 
     async def wrap_for_pytorch(
@@ -112,15 +115,20 @@ class ImageEncoder:
                     }
         """
         has_input_ids = self.model.has_input_ids(messages)
-        if not has_input_ids:
-            result = self.model.to_pytorch(messages,
-                                           chat_template,
-                                           tokenizer,
-                                           sequence_start,
-                                           tools=tools,
-                                           chat_template_kwargs=chat_template_kwargs)
-        else:
-            result = self.model.to_pytorch_with_input_ids(messages)
+        loop = asyncio.get_event_loop()
+        async with self.executor_lock:
+            if not has_input_ids:
+                result = await loop.run_in_executor(
+                    self.executor,
+                    partial(self.model.to_pytorch,
+                            messages,
+                            chat_template,
+                            tokenizer,
+                            sequence_start,
+                            tools=tools,
+                            chat_template_kwargs=chat_template_kwargs))
+            else:
+                result = await loop.run_in_executor(self.executor, self.model.to_pytorch_with_input_ids, messages)
         # clear data
         for i, message in enumerate(messages):
             if isinstance(message['content'], list):
@@ -153,12 +161,17 @@ class ImageEncoder:
                         ...
                     }
         """
-        result = self.model.to_turbomind(messages,
-                                         chat_template,
-                                         tokenizer,
-                                         sequence_start,
-                                         tools=tools,
-                                         chat_template_kwargs=chat_template_kwargs)
+        loop = asyncio.get_event_loop()
+        async with self.executor_lock:
+            result = await loop.run_in_executor(
+                self.executor,
+                partial(self.model.to_turbomind,
+                        messages,
+                        chat_template,
+                        tokenizer,
+                        sequence_start,
+                        tools=tools,
+                        chat_template_kwargs=chat_template_kwargs))
         # clear data
         for i, message in enumerate(messages):
             if isinstance(message['content'], list):
