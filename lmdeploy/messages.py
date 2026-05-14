@@ -673,9 +673,17 @@ class VisionConfig:
         thread_safe: Specifies whether the engine instance is
             thread-safe. Please set it to True when using the pipeline
             in a multi-threaded environment.
+        max_preprocess_workers: the max number of concurrent multimodal
+            requests allowed to prepare large vision payloads before engine
+            handoff.
     """
     max_batch_size: int = 1
     thread_safe: bool = False
+    max_preprocess_workers: int = 1
+
+    def __post_init__(self):
+        if self.max_preprocess_workers < 1:
+            raise ValueError('max_preprocess_workers should be >= 1')
 
 
 @dataclass

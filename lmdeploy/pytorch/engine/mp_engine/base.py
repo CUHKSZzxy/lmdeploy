@@ -39,7 +39,12 @@ class MPEngine(EngineBase):
         """Collective rpc call."""
         raise NotImplementedError('This method has not been implemented yet.')
 
-    async def _collective_rpc_streaming_async(self, func: str, sess_event: asyncio.Event, *args, **kwargs):
+    async def _collective_rpc_streaming_async(self,
+                                             func: str,
+                                             sess_event: asyncio.Event,
+                                             *args,
+                                             notify_add_msg_func=None,
+                                             **kwargs):
         """Collective rpc call."""
         raise NotImplementedError('This method has not been implemented yet.')
 
@@ -126,6 +131,7 @@ class MPEngineInstance(EngineInstanceBase):
 
     async def async_stream_infer(self, session_id: int, *args, **kwargs):
         """Send stream inference request."""
+        notify_add_msg_func = kwargs.pop('notify_add_msg_func', None)
         state = self.session_states[session_id]
         if state.cancelled or session_id in self.engine.pending_cancel_sessions:
             state.is_exists.set()
@@ -136,7 +142,10 @@ class MPEngineInstance(EngineInstanceBase):
         generator = self.engine._collective_rpc_streaming_async('instance_async_stream_infer',
                                                                 state.is_exists,
                                                                 *args,
+                                                                notify_add_msg_func=notify_add_msg_func,
                                                                 **kwargs)
+        args = ()
+        kwargs = None
 
         async for result in generator:
             yield result

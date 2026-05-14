@@ -174,9 +174,18 @@ class ZMQMPEngine(MPEngine):
         """Collective rpc call."""
         return await self.rpc_client.async_call(func, *args, **kwargs)
 
-    async def _collective_rpc_streaming_async(self, func: str, sess_event: asyncio.Event,  *args, **kwargs):
+    async def _collective_rpc_streaming_async(self,
+                                             func: str,
+                                             sess_event: asyncio.Event,
+                                             *args,
+                                             notify_add_msg_func=None,
+                                             **kwargs):
         """Collective rpc call."""
-        async for out in self.rpc_client.async_stream_call(func, sess_event, *args, **kwargs):
+        async for out in self.rpc_client.async_stream_call(func,
+                                                           sess_event,
+                                                           *args,
+                                                           notify_add_msg_func=notify_add_msg_func,
+                                                           **kwargs):
             yield out
 
     def close(self) -> None:

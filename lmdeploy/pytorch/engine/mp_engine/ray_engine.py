@@ -161,10 +161,19 @@ class RayMPEngine(MPEngine):
         method = getattr(self.worker, func)
         return await method.remote(*args, **kwargs)
 
-    async def _collective_rpc_streaming_async(self, func: str, sess_event: asyncio.Event, *args, **kwargs):
+    async def _collective_rpc_streaming_async(self,
+                                             func: str,
+                                             sess_event: asyncio.Event,
+                                             *args,
+                                             notify_add_msg_func=None,
+                                             **kwargs):
         """Collective rpc call."""
         # ray generator would try cache every result, which is too verbose.
         stream_id = await self._collective_rpc_async('create_stream_task', func, *args, **kwargs)
+        args = ()
+        kwargs = None
+        if notify_add_msg_func is not None:
+            notify_add_msg_func()
         sess_event.set()
         stopped = False
         while not stopped:

@@ -161,6 +161,7 @@ class SubCliServe:
         # vlm args
         vision_group = parser.add_argument_group('Vision model arguments')
         ArgumentHelper.vision_max_batch_size(vision_group)
+        ArgumentHelper.vision_max_preprocess_workers(vision_group)
 
         # spec decode
         ArgumentHelper.add_spec_group(parser)
@@ -280,7 +281,8 @@ class SubCliServe:
         speculative_config = get_speculative_config(args)
 
         from lmdeploy.messages import VisionConfig
-        vision_config = VisionConfig(args.vision_max_batch_size)
+        vision_config = VisionConfig(max_batch_size=args.vision_max_batch_size,
+                                     max_preprocess_workers=args.vision_max_preprocess_workers)
         if args.dp == 1 or backend == 'turbomind':
             from lmdeploy.serve.openai.api_server import serve as run_api_server
 

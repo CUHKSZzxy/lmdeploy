@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
+from concurrent.futures import Executor, ThreadPoolExecutor
 from typing import Any, Literal
 
 import PIL
@@ -37,6 +38,36 @@ class MultimodalProcessor:
         self.chat_template = chat_template
         self.vl_encoder = vl_encoder
         self.backend = backend
+        vision_config = getattr(vl_encoder, 'vision_config', None)
+        max_preprocess_workers = getattr(vision_config, 'max_preprocess_workers', 1)
+        self.max_preprocess_workers = max(1, max_preprocess_workers)
+        self._multimodal_request_sem = asyncio.Semaphore(self.max_preprocess_workers)
+        self._multimodal_parse_executor = ThreadPoolExecutor(max_workers=self.max_preprocess_workers)
+
+    def close(self):
+        """Close processor-owned resources."""
+        self._multimodal_parse_executor.shutdown(wait=False, cancel_futures=True)
+
+    def is_multimodal_request(self, prompt: str | list[dict] | None) -> bool:
+        """Check whether a prompt needs multimodal preparation."""
+        return isinstance(prompt, list) and self.vl_encoder is not None and self._has_multimodal_input(prompt)
+
+    async def acquire_multimodal_request(self, prompt: str | list[dict] | None):
+        """Acquire a bounded VLM preprocessing slot when needed."""
+        if not self.is_multimodal_request(prompt):
+            return None
+
+        await self._multimodal_request_sem.acquire()
+        released = False
+
+        def release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._multimodal_request_sem.release()
+
+        return release
 
     @staticmethod
     def merge_message_content(msg: dict) -> dict:
@@ -160,7 +191,8 @@ class MultimodalProcessor:
 
     @staticmethod
     async def async_parse_multimodal_item(messages: list[dict],
-                                          media_io_kwargs: dict[str, Any] | None = None) -> list[dict]:
+                                          media_io_kwargs: dict[str, Any] | None = None,
+                                          executor: Executor | None = None) -> list[dict]:
         """Convert user-input multimodal data into GPT4V message format."""
         if isinstance(messages, dict):
             messages = [messages]
@@ -171,7 +203,7 @@ class MultimodalProcessor:
         loop = asyncio.get_event_loop()
 
         await asyncio.gather(*[
-            loop.run_in_executor(None, MultimodalProcessor._parse_multimodal_item, i, messages, out_messages,
+            loop.run_in_executor(executor, MultimodalProcessor._parse_multimodal_item, i, messages, out_messages,
                                  media_io_kwargs) for i in range(len(messages))
         ])
         return out_messages
@@ -379,7 +411,9 @@ class MultimodalProcessor:
         """Process multimodal prompt and return processed data for inference
         engines."""
         chat_template = self.chat_template if do_preprocess else BaseChatTemplate()
-        messages = await self.async_parse_multimodal_item(messages, media_io_kwargs)
+        messages = await self.async_parse_multimodal_item(messages,
+                                                          media_io_kwargs,
+                                                          executor=self._multimodal_parse_executor)
 
         if self.backend == 'turbomind':
             results = await self.vl_encoder.preprocess(messages, mm_processor_kwargs)

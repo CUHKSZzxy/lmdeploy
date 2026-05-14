@@ -303,9 +303,13 @@ class AsyncRPCClient:
         """Async call."""
         return await self._async_call_impl(method, False, *args, **kwargs)
 
-    async def async_stream_call(self, method, sess_event: asyncio.Event, *args, **kwargs):
+    async def async_stream_call(self, method, sess_event: asyncio.Event, *args, notify_add_msg_func=None, **kwargs):
         """Streaming call."""
         stream_id = await self._async_call_impl(method, True, *args, **kwargs)
+        args = ()
+        kwargs = None
+        if notify_add_msg_func is not None:
+            notify_add_msg_func()
         sess_event.set()
         stopped = False
         while not stopped:

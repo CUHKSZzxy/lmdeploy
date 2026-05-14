@@ -662,6 +662,7 @@ class TurboMindInstance:
             stream_output (bool): indicator for stream output
             kwargs (dict): kwargs for backward compatibility
         """
+        notify_add_msg_func = kwargs.pop('notify_add_msg_func', None)
         logger.info(f'[async_stream_infer] session {session_id} start')
         gen_cfg = self._get_generation_config(gen_config)
 
@@ -715,6 +716,8 @@ class TurboMindInstance:
 
         outputs, shared_state, metrics = self.model_inst.forward(inputs, session, gen_cfg, stream_output,
                                                                  self.tm_model.engine_config.enable_metrics, signal_cb)
+        if notify_add_msg_func is not None:
+            notify_add_msg_func()
 
         outputs = _tm_dict_to_torch_dict(outputs)
 

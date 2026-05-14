@@ -609,6 +609,14 @@ class ArgumentHelper:
         return parser.add_argument('--vision-max-batch-size', type=int, default=1, help='the vision model batch size')
 
     @staticmethod
+    def vision_max_preprocess_workers(parser):
+        return parser.add_argument('--vision-max-preprocess-workers',
+                                   type=int,
+                                   default=1,
+                                   help='the max number of concurrent multimodal requests allowed to prepare '
+                                   'large vision payloads before engine handoff')
+
+    @staticmethod
     def max_log_len(parser):
         return parser.add_argument('--max-log-len',
                                    type=int,

@@ -166,6 +166,8 @@ class AsyncEngine:
 
     def close(self):
         self.session_mgr.clear()
+        if hasattr(self, 'prompt_processor'):
+            self.prompt_processor.close()
         self.engine.close()
 
     def __enter__(self):
@@ -311,8 +313,11 @@ class AsyncEngine:
         return gen_config
 
     @asynccontextmanager
-    async def safe_run(self, handle, session, **kwargs):
+    async def safe_run(self, handle, session, notify_add_msg_func=None, **kwargs):
+        if notify_add_msg_func is not None:
+            kwargs['notify_add_msg_func'] = notify_add_msg_func
         generator = handle.async_stream_infer(session.session_id, **kwargs)
+        kwargs = None
         try:
             metrics_processor.increase_api_routed_requests()
             yield generator
@@ -341,6 +346,8 @@ class AsyncEngine:
             # state, causing a second CancelledError at the next await point.
             raise SafeRunException(f'Safe run exception for session {session.session_id}') from e
         finally:
+            if notify_add_msg_func is not None:
+                notify_add_msg_func()
             await generator.aclose()
             metrics_processor.decrease_api_routed_requests()
 
@@ -397,6 +404,14 @@ class AsyncEngine:
             else:
                 logger.warning('chat_template_kwargs["enable_thinking"] is already set, '
                                'the value will not be overwritten by enable_thinking')
+        release_multimodal_request = await self.prompt_processor.acquire_multimodal_request(messages)
+
+        def _release_multimodal_request():
+            nonlocal release_multimodal_request
+            if release_multimodal_request is not None:
+                release_multimodal_request()
+                release_multimodal_request = None
+
         if messages:
             try:
                 prompt = messages
@@ -418,7 +433,11 @@ class AsyncEngine:
                                             prompt_token_ids=input_ids,
                                             gen_config=gen_config,
                                             adapter_name=adapter_name)
+            except asyncio.CancelledError:
+                _release_multimodal_request()
+                raise
             except Exception:
+                _release_multimodal_request()
                 logger.exception('[generate] error in prompt processing')
                 metrics_processor.increase_failed_requests('error')
                 yield GenOut(response='in prompt processing error',
@@ -433,11 +452,16 @@ class AsyncEngine:
             # Figure out a graceful way to handle the invalid input
             prompt_input = dict(input_ids=input_ids)
 
-        gen_config = self._determine_gen_config(session, input_ids, gen_config=gen_config)
+        try:
+            gen_config = self._determine_gen_config(session, input_ids, gen_config=gen_config)
+        except BaseException:
+            _release_multimodal_request()
+            raise
 
         if gen_config.max_new_tokens == 0:
             logger.info(f'run out of tokens. session={session_id}.')
             metrics_processor.increase_failed_requests('error')
+            _release_multimodal_request()
             yield GenOut(response='',
                          history_token_len=session.step,
                          input_token_len=len(input_ids),
@@ -453,6 +477,7 @@ class AsyncEngine:
             errmsg = ('lmdeploy does not support outputting all token\'s logits or last_hidden_state '
                       'when prefix caching is ON')
             metrics_processor.increase_failed_requests('error')
+            _release_multimodal_request()
             yield GenOut(response=errmsg,
                          history_token_len=session.step,
                          input_token_len=len(input_ids),
@@ -478,6 +503,7 @@ class AsyncEngine:
         stale = self._if_session_stale(session, len(prompt_input['input_ids']))
         if stale is not None:
             metrics_processor.increase_failed_requests('abort')
+            _release_multimodal_request()
             yield stale
             if sequence_end:
                 self.session_mgr.remove(session)
@@ -487,6 +513,7 @@ class AsyncEngine:
                 logger.info(f'[generate] session {session_id} got aborted before starting inference, '
                                f'session.epoch={session.epoch}, async_engine.epoch={self.epoch}')
                 metrics_processor.increase_failed_requests('abort')
+                _release_multimodal_request()
                 yield GenOut(response='',
                              history_token_len=0,
                              input_token_len=len(input_ids),
@@ -511,7 +538,9 @@ class AsyncEngine:
                                      stream_output=stream_response,
                                      sequence_start=sequence_start,
                                      sequence_end=sequence_end,
-                                     step=history_len) as gen:
+                                     step=history_len,
+                                     notify_add_msg_func=_release_multimodal_request) as gen:
+                prompt_input = None
                 logger.debug(f'[generate] session {session_id} started')
                 hit_stop_token = 0
                 req_stats = RequestStats(prompt_tokens=input_len)  # per-request stats
