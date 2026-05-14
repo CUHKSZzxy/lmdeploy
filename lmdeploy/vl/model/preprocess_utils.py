@@ -86,6 +86,7 @@ def get_expanded_mm_items(collected_mm_items, mm_tokens: 'MultimodalSpecialToken
         # non-bundled case
         if not is_bundled:
             if modality == Modality.IMAGE:
+                cache_keys = item.get('cache_keys')
                 expanded_mm_items.append(
                     dict(
                         modality=modality,
@@ -93,6 +94,7 @@ def get_expanded_mm_items(collected_mm_items, mm_tokens: 'MultimodalSpecialToken
                         image_grid_thw=item['image_grid_thw'][0],
                         offset=item['offset'][0],
                         image_token_id=token_id,
+                        cache_key=cache_keys[0] if cache_keys and len(cache_keys) > 0 else None,
                     ))
             elif modality == Modality.TIME_SERIES:
                 expanded_mm_items.append(
@@ -110,6 +112,7 @@ def get_expanded_mm_items(collected_mm_items, mm_tokens: 'MultimodalSpecialToken
         num_items = len(item['offset'])
         if modality == Modality.IMAGE:
             image_grid_thw = item['image_grid_thw']
+            cache_keys = item.get('cache_keys')
 
             patches_per_item = []
             for grid in image_grid_thw:
@@ -129,6 +132,7 @@ def get_expanded_mm_items(collected_mm_items, mm_tokens: 'MultimodalSpecialToken
                         image_grid_thw=image_grid_thw[i],
                         offset=item['offset'][i],
                         image_token_id=token_id,
+                        cache_key=cache_keys[i] if cache_keys and i < len(cache_keys) else None,
                     ))
         elif modality == Modality.VIDEO:
             video_grid_thw = item['video_grid_thw']

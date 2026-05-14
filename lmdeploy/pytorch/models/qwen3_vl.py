@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from functools import lru_cache
 from typing import Any
@@ -723,6 +724,8 @@ class Qwen3VLInputProcessor(BaseModelInputProcessor):
     def __init__(self, config: PretrainedConfig, dtype: torch.dtype) -> None:
         self.config = config
         self.dtype = dtype
+        self._mm_payload_cache = OrderedDict()
+        self._mm_payload_cache_size = 128
 
     @classmethod
     def _get_multimodal_pos_ids(cls, grid_thw: Sequence[int]) -> np.ndarray:
@@ -742,21 +745,53 @@ class Qwen3VLInputProcessor(BaseModelInputProcessor):
         img_pos_ids = cls._get_multimodal_pos_ids(grid_thw)
         return img_pos_ids
 
+    def _get_mm_payload_cache_key(self, input_mm: dict[str, Any]):
+        """Return a stable key for reusable multimodal tensor payloads."""
+        cache_key = input_mm.get('cache_key')
+        if cache_key is None:
+            return None
+        modality = input_mm.get('modality')
+        grid_thw = input_mm.get('image_grid_thw')
+        if grid_thw is None:
+            grid_thw = input_mm.get('video_grid_thw')
+        grid_key = None
+        if grid_thw is not None:
+            grid_key = tuple(torch.as_tensor(grid_thw).reshape(-1).tolist())
+        token_id = input_mm.get('image_token_id', input_mm.get('video_token_id'))
+        modality_value = modality.value if isinstance(modality, Modality) else modality
+        return (modality_value, cache_key, grid_key, token_id, str(self.dtype))
+
+    def _get_or_build_mm_payload(self, input_mm: dict[str, Any], builder):
+        cache_key = self._get_mm_payload_cache_key(input_mm)
+        if cache_key is None:
+            return builder(input_mm)
+        cached = self._mm_payload_cache.get(cache_key)
+        if cached is not None:
+            self._mm_payload_cache.move_to_end(cache_key)
+            return cached
+        payload = builder(input_mm)
+        self._mm_payload_cache[cache_key] = payload
+        if len(self._mm_payload_cache) > self._mm_payload_cache_size:
+            self._mm_payload_cache.popitem(last=False)
+        return payload
+
+    def _build_image_mm_payload(self, input_mm: dict[str, Any]):
+        image_grid_thw = input_mm['image_grid_thw']
+        image_token_id = input_mm['image_token_id']
+        mrope_pos_ids = self.make_mrope(image_grid_thw)
+        return input_mm['pixel_values'], mrope_pos_ids, dict(grid_thw=image_grid_thw, image_token_id=image_token_id)
+
     def _make_image_mm_data(self, input_mm: dict[str, Any]) -> MultiModalData:
         """Make image MultiModalData."""
-        pixel_values = input_mm['pixel_values']
-        image_grid_thw = input_mm['image_grid_thw']
         offset = input_mm['offset']
-        image_token_id = input_mm['image_token_id']
-
-        mrope_pos_ids = self.make_mrope(image_grid_thw)
+        pixel_values, mrope_pos_ids, meta = self._get_or_build_mm_payload(input_mm, self._build_image_mm_payload)
 
         mm_data = MultiModalData(modality=Modality.IMAGE,
                                  data=pixel_values,
                                  start=offset[0],
                                  end=offset[1],
                                  mrope_pos_ids=mrope_pos_ids,
-                                 meta=dict(grid_thw=image_grid_thw, image_token_id=image_token_id))
+                                 meta=meta)
         return mm_data
 
     def _make_video_mm_data(self, input_mm: dict[str, Any]) -> MultiModalData:

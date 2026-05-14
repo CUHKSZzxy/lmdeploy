@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
+import hashlib
 from concurrent.futures import Executor, ThreadPoolExecutor
 from typing import Any, Literal
 
@@ -170,6 +171,7 @@ class MultimodalProcessor:
                 if isinstance(data_src, PIL.Image.Image):
                     data = data_src
                 elif isinstance(data_src, str):
+                    item_params['cache_key'] = hashlib.sha1(data_src.encode()).hexdigest()
                     data = load_from_url(data_src, ImageMediaIO(**media_io_kwargs.get('image', {})))
                 else:
                     raise ValueError(f'Invalid multimodal image item at index {i}: {item}. '

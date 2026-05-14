@@ -1,10 +1,13 @@
 import asyncio
 
 import pytest
+import torch
 
 from lmdeploy.messages import VisionConfig
 from lmdeploy.pytorch.engine.mp_engine.zmq_rpc import AsyncRPCClient
+from lmdeploy.pytorch.models.qwen3_vl import Qwen3VLInputProcessor
 from lmdeploy.serve.processors import MultimodalProcessor
+from lmdeploy.vl.constants import Modality
 
 
 def test_vision_config_rejects_invalid_preprocess_workers():
@@ -78,6 +81,32 @@ def test_multimodal_parse_uses_supplied_executor(monkeypatch):
         assert seen_executors == [executor, executor, executor]
 
     asyncio.run(run_case())
+
+
+def test_qwen3_vl_input_processor_reuses_cached_mm_payload():
+    processor = Qwen3VLInputProcessor(config=None, dtype=torch.float32)
+    image_grid_thw = torch.tensor([1, 2, 2])
+    first_pixels = torch.ones((4, 3), dtype=torch.float32)
+    second_pixels = torch.zeros((4, 3), dtype=torch.float32)
+
+    first = processor._make_image_mm_data(
+        dict(modality=Modality.IMAGE,
+             pixel_values=first_pixels,
+             image_grid_thw=image_grid_thw,
+             offset=(10, 14),
+             image_token_id=99,
+             cache_key='same-image'))
+    second = processor._make_image_mm_data(
+        dict(modality=Modality.IMAGE,
+             pixel_values=second_pixels,
+             image_grid_thw=image_grid_thw,
+             offset=(20, 24),
+             image_token_id=99,
+             cache_key='same-image'))
+
+    assert second.data is first.data
+    assert second.start == 20
+    assert second.end == 24
 
 
 def test_zmq_stream_notify_runs_after_stream_creation(monkeypatch):

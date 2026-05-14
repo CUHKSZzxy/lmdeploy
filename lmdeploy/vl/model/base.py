@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import dataclasses
+import hashlib
 from abc import ABC, abstractmethod
 from itertools import groupby
 from typing import Any
@@ -104,10 +105,12 @@ class VisionModel(ABC):
         mm_items = self.collect_multimodal_items(messages)
 
         raw_images, raw_videos, video_metadatas = [], [], []
+        raw_image_cache_keys = []
         raw_time_series, sampling_rates = [], []
         for modality, data, params in mm_items:
             if modality == Modality.IMAGE:
                 raw_images.append(data)
+                raw_image_cache_keys.append(params.get('cache_key'))
             elif modality == Modality.VIDEO:
                 raw_videos.append(data)
                 video_metadatas.append(params.get('video_metadata', None))
@@ -175,6 +178,12 @@ class VisionModel(ABC):
                     attr_name = 'feature'
 
                 collected_mm_items[current_modality][attr_name] = value
+
+        if raw_image_cache_keys and Modality.IMAGE in collected_mm_items:
+            processor_kwargs_key = hashlib.sha1(repr(mm_processor_kwargs).encode()).hexdigest()
+            collected_mm_items[Modality.IMAGE]['cache_keys'] = [
+                f'{key}:{processor_kwargs_key}' if key is not None else None for key in raw_image_cache_keys
+            ]
 
         # get input_ids, expand multimodal tokens only when we receive input ids from /generate endpoint
         if isinstance(input_prompt, str):
