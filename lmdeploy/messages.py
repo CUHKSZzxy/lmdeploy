@@ -375,7 +375,7 @@ class PytorchEngineConfig:
         enable_eplb: enable eplb for specified model
         enable_metrics: enable metrics system
         role: role of engin, options: ['Hybrid', 'Prefill',
-            'Decode']. Default to `EngineRole.Hybrid`.
+            'Decode', 'Encoder']. Default to `EngineRole.Hybrid`.
         migration_backend: migration backend. options: ['DLSlime'].
             Default to `MigrationBackend.DLSlime`.
         enable_mp_engine: run engine in multi-process mode.

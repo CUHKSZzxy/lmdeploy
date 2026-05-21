@@ -2,13 +2,14 @@ import asyncio
 
 import numpy as np
 import pytest
+import torch
 
 from lmdeploy.messages import GenerationConfig, ResponseType
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
 from lmdeploy.pytorch.engine.request import RequestType, Response
 from lmdeploy.pytorch.messages import InputEmbeddings
-from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input
+from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input, prompt_input_to_encoder_cache_ref
 
 
 def test_encoder_cache_ref_round_trip():
@@ -71,6 +72,47 @@ def test_encoder_cache_ref_converts_inline_embeddings_to_prompt_input():
     assert embedding.end == 3
     assert embedding.embeddings.dtype == np.float32
     np.testing.assert_allclose(embedding.embeddings, np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
+
+
+def test_prompt_input_converts_to_inline_encoder_cache_ref():
+    prompt_input = {
+        'input_ids': [10, 11, 12, 13],
+        'input_embeddings': [torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)],
+        'input_embedding_ranges': [[1, 3]],
+    }
+
+    ref = prompt_input_to_encoder_cache_ref(
+        prompt_input,
+        remote_engine_id='http://encoder',
+        remote_session_id=5,
+        protocol=MigrationProtocol.TCP,
+    )
+
+    assert ref.token_ids == [10, 11, 12, 13]
+    assert ref.backend == 'inline'
+    assert ref.remote_engine_id == 'http://encoder'
+    assert ref.remote_session_id == 5
+    assert ref.dtype == 'float32'
+    assert ref.shape == [[2, 2]]
+    assert ref.input_embedding_ranges == [[1, 3]]
+    assert ref.input_embeddings[0].start == 1
+    assert ref.input_embeddings[0].end == 3
+    assert ref.input_embeddings[0].data == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_prompt_input_rejects_pixel_value_multimodal_without_embeddings():
+    prompt_input = {
+        'input_ids': [10, 11],
+        'multimodal': [{'pixel_values': torch.ones((1, 2)), 'offset': 1}],
+    }
+
+    with pytest.raises(ValueError, match='precomputed input_embeddings'):
+        prompt_input_to_encoder_cache_ref(
+            prompt_input,
+            remote_engine_id='http://encoder',
+            remote_session_id=5,
+            protocol=MigrationProtocol.TCP,
+        )
 
 
 def test_encoder_cache_ref_rejects_mismatched_inline_embedding_range():

@@ -672,10 +672,11 @@ class ArgumentHelper:
         return parser.add_argument('--role',
                                    type=str,
                                    default='Hybrid',
-                                   choices=['Hybrid', 'Prefill', 'Decode'],
+                                   choices=['Hybrid', 'Prefill', 'Decode', 'Encoder'],
                                    help='Hybrid for Non-Disaggregated Engine; '
                                    'Prefill for Disaggregated Prefill Engine; '
-                                   'Decode for Disaggregated Decode Engine')
+                                   'Decode for Disaggregated Decode Engine; '
+                                   'Encoder for EPD Encoder Engine')
 
     @staticmethod
     def migration_backend(parser):

@@ -47,6 +47,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine
+from lmdeploy.serve.epd import prompt_input_to_encoder_cache_ref
 from lmdeploy.serve.openai.protocol import (
     AbortRequest,
     ChatCompletionRequest,
@@ -626,6 +627,56 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         response['remote_token_ids'] = remote_token_ids
 
     return response
+
+
+@router.post('/v1/chat/encoder', dependencies=[Depends(validate_json_request)])
+async def chat_encoder_v1(request: ChatCompletionRequest, raw_request: Request = None):
+    """Internal EPD endpoint that returns encoder output references."""
+    error_check_ret = check_request(request)
+    if error_check_ret is not None:
+        return error_check_ret
+
+    model_name = request.model
+    adapter_name = None
+    if model_name != VariableInterface.async_engine.model_name:
+        adapter_name = model_name
+
+    do_preprocess = False if isinstance(request.messages, str) else request.do_preprocess
+    chat_template_kwargs = request.chat_template_kwargs or {}
+    if request.enable_thinking is not None:
+        logger.warning('`enable_thinking` will be deprecated in the future, '
+                       'please use `chat_template_kwargs` instead.')
+        if chat_template_kwargs.get('enable_thinking') is None:
+            chat_template_kwargs['enable_thinking'] = request.enable_thinking
+        else:
+            logger.warning('`enable_thinking` in `chat_template_kwargs` will override the value in request.')
+
+    try:
+        prompt_input = await VariableInterface.async_engine.prompt_processor.get_prompt_input(
+            prompt=request.messages,
+            do_preprocess=do_preprocess,
+            sequence_start=True,
+            adapter_name=adapter_name,
+            tools=request.tools,
+            reasoning_effort=request.reasoning_effort,
+            chat_template_kwargs=chat_template_kwargs or None,
+            media_io_kwargs=request.media_io_kwargs,
+            mm_processor_kwargs=request.mm_processor_kwargs)
+        session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
+        encoder_result = prompt_input_to_encoder_cache_ref(
+            prompt_input,
+            remote_engine_id=VariableInterface.api_server_url or 'local',
+            remote_session_id=session_id,
+        )
+    except ValueError as exc:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+
+    return {
+        'id': str(request.session_id),
+        'object': 'encoder_result',
+        'model': model_name,
+        'encoder_result': encoder_result.model_dump(mode='json'),
+    }
 
 
 @router.post('/v1/completions', dependencies=[Depends(validate_json_request)])

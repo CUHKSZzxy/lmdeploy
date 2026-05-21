@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
-from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol, MigrationRequest
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
 from lmdeploy.serve.openai.api_server import create_error_response
@@ -134,6 +134,10 @@ class NodeManager:
     @property
     def decode_nodes(self):
         return self.get_nodes(EngineRole.Decode)
+
+    @property
+    def encoder_nodes(self):
+        return self.get_nodes(EngineRole.Encoder)
 
     def update_config_file(self):
         """Update the config file."""
@@ -460,6 +464,53 @@ class NodeManager:
         return headers
 
 
+_MULTIMODAL_CONTENT_TYPES = {
+    'image',
+    'image_data',
+    'image_url',
+    'time_series',
+    'time_series_url',
+    'video',
+    'video_url',
+}
+
+
+def _has_multimodal_chat_messages(messages) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get('type') in _MULTIMODAL_CONTENT_TYPES:
+                return True
+    return False
+
+
+def _build_epd_language_request(request_dict: dict, encoder_result: dict | EncoderCacheRef) -> dict:
+    request_dict = copy.deepcopy(request_dict)
+    encoder_result = EncoderCacheRef.model_validate(encoder_result)
+    request_dict['encoder_result'] = encoder_result.model_dump(mode='json')
+    return request_dict
+
+
+def _extract_epd_encoder_result(response_text: str | bytes) -> dict:
+    try:
+        response = json.loads(response_text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError('encoder node returned a non-JSON response') from exc
+    if 'encoder_result' not in response:
+        error = response.get('error')
+        if error:
+            message = error.get('message') if isinstance(error, dict) else str(error)
+            raise ValueError(f'encoder node error: {message}')
+        raise ValueError('encoder node response does not contain encoder_result')
+    return EncoderCacheRef.model_validate(response['encoder_result']).model_dump(mode='json')
+
+
 app = FastAPI(docs_url='/')
 app.add_middleware(
     CORSMiddleware,
@@ -655,6 +706,35 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         node_url = node_manager.get_node_url(request.model)
         if not node_url:
             return node_manager.handle_unavailable_model(request.model)
+
+        if node_manager.encoder_nodes and _has_multimodal_chat_messages(request.messages):
+            encoder_url = node_manager.get_node_url(request.model, EngineRole.Encoder)
+            if not encoder_url:
+                return node_manager.handle_unavailable_model(request.model)
+
+            request_dict = await raw_request.json()
+            if request_dict.get('encoder_result') is None:
+                encoder_request = copy.deepcopy(request_dict)
+                encoder_request['stream'] = False
+                logger.info(f'An Encoder request is dispatched to {encoder_url}')
+                start = node_manager.pre_call(encoder_url)
+                encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/encoder')
+                node_manager.post_call(encoder_url, start)
+                try:
+                    encoder_result = _extract_epd_encoder_result(encoder_response)
+                except ValueError as exc:
+                    return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+                request_dict = _build_epd_language_request(request_dict, encoder_result)
+
+            logger.info(f'An EPD language request is dispatched to {node_url}')
+            start = node_manager.pre_call(node_url)
+            if request.stream is True:
+                response = node_manager.stream_generate(request_dict, node_url, '/v1/chat/completions')
+                background_task = node_manager.create_background_tasks(node_url, start)
+                return ProxyStreamingResponse(response, background=background_task, media_type='text/event-stream')
+            response = await node_manager.generate(request_dict, node_url, '/v1/chat/completions')
+            node_manager.post_call(node_url, start)
+            return JSONResponse(json.loads(response))
 
         logger.info(f'A request is dispatched to {node_url}')
         start = node_manager.pre_call(node_url)

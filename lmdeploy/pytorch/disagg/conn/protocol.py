@@ -2,7 +2,7 @@
 import enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from lmdeploy.pytorch.disagg.config import (
     DistServeEngineConfig,
@@ -124,6 +124,17 @@ class EncoderCacheRef(BaseModel):
     modality: str | list[str] | None = None
     cache_key: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator('protocol', mode='before')
+    @classmethod
+    def _validate_protocol(cls, value):
+        if isinstance(value, str):
+            return MigrationProtocol[value]
+        return value
+
+    @field_serializer('protocol')
+    def _serialize_protocol(self, protocol: MigrationProtocol):
+        return protocol.name
 
 
 class DistServeCacheFreeRequest(BaseModel):
