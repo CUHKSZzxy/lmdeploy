@@ -53,25 +53,64 @@ def _embedding_range(embedding, ranges, index: int) -> list[int]:
     raise ValueError('input_embedding_ranges are required to serialize encoder embeddings.')
 
 
+def _unwrap_encoder_model(model, _visited=None):
+    if _visited is None:
+        _visited = set()
+    if model is None or id(model) in _visited:
+        return None
+    _visited.add(id(model))
+
+    if hasattr(model, 'get_input_embeddings') and hasattr(model, 'get_input_processor'):
+        return model
+
+    get_model = getattr(model, 'get_model', None)
+    if callable(get_model):
+        unwrapped = _unwrap_encoder_model(get_model(), _visited)
+        if unwrapped is not None:
+            return unwrapped
+
+    for attr in ('model', 'module', 'patched_model'):
+        unwrapped = _unwrap_encoder_model(getattr(model, attr, None), _visited)
+        if unwrapped is not None:
+            return unwrapped
+
+    return None
+
+
 def _resolve_encoder_model(model_or_engine):
-    if hasattr(model_or_engine, 'get_input_embeddings'):
-        return model_or_engine
-    engine = getattr(model_or_engine, 'engine', model_or_engine)
-    executor = getattr(engine, 'executor', None)
+    candidates = [model_or_engine]
+    engine = getattr(model_or_engine, 'engine', None)
+    if engine is not None:
+        candidates.append(engine)
+    executor = getattr(engine or model_or_engine, 'executor', None)
     model_agent = getattr(executor, 'model_agent', None)
-    model = getattr(model_agent, 'patched_model', None)
-    if model is None:
-        raise ValueError('EPD encoder materialization currently requires a local PyTorch model.')
-    return model
+    candidates.append(getattr(model_agent, 'patched_model', None))
+
+    for candidate in candidates:
+        model = _unwrap_encoder_model(candidate)
+        if model is not None:
+            return model
+
+    raise ValueError('EPD encoder materialization currently requires a local PyTorch model.')
 
 
-def _get_visual_module(model):
-    inner_model = getattr(model, 'model', None)
-    visual = getattr(inner_model, 'visual', None)
+def _get_visual_module(model, _visited=None):
+    if _visited is None:
+        _visited = set()
+    if model is None or id(model) in _visited:
+        return None
+    _visited.add(id(model))
+
+    visual = getattr(model, 'visual', None)
     if visual is None:
-        visual = getattr(model, 'visual', None)
+        for attr in ('model', 'module', 'patched_model'):
+            visual = _get_visual_module(getattr(model, attr, None), _visited)
+            if visual is not None:
+                break
     if visual is None:
         raise ValueError('EPD encoder materialization requires a model visual encoder.')
+    if not all(hasattr(visual, attr) for attr in ('rot_pos_emb', 'fast_pos_embed_interpolate')):
+        raise ValueError('EPD encoder materialization requires a Qwen3.5-style visual encoder.')
     return visual
 
 

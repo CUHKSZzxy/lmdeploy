@@ -157,13 +157,14 @@ class _FakeVisual(nn.Module):
 
 class _FakeQwen35Model(nn.Module):
 
-    def __init__(self, deepstack_visual_indexes=None):
+    def __init__(self, deepstack_visual_indexes=None, nested_visual=False):
         super().__init__()
         vision_config = type('VisionConfig', (), {
             'deepstack_visual_indexes': deepstack_visual_indexes or [],
         })()
         self.config = type('Config', (), {'vision_config': vision_config})()
-        self.model = type('InnerModel', (), {'visual': _FakeVisual()})()
+        visual_owner = type('InnerModel', (), {'visual': _FakeVisual()})()
+        self.model = type('OuterModel', (), {'model': visual_owner})() if nested_visual else visual_owner
         self.input_processor = _FakeInputProcessor()
         self.embed_tokens = nn.Embedding(128, 2)
 
@@ -176,6 +177,18 @@ class _FakeQwen35Model(nn.Module):
     def get_multimodal_mask(self, input_ids, mm_inputs):
         image_token_id = mm_inputs[0].meta['image_token_id']
         return input_ids == image_token_id
+
+
+class _FakeGraphRunner:
+
+    def __init__(self, model):
+        self.model = model
+
+    def get_model(self):
+        return self.model
+
+    def get_input_processor(self):
+        return self.model.get_input_processor()
 
 
 def test_materialize_encoder_prompt_input_runs_non_deepstack_visual_path():
@@ -201,6 +214,42 @@ def test_materialize_encoder_prompt_input_runs_non_deepstack_visual_path():
     assert embedding.start == 1
     assert embedding.end == 3
     np.testing.assert_allclose(embedding.embeddings, np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
+
+
+def test_materialize_encoder_prompt_input_finds_nested_visual_module():
+    prompt_input = {
+        'input_ids': [1, 99, 99, 2],
+        'multimodal': [{
+            'modality': Modality.IMAGE,
+            'pixel_values': torch.ones((2, 1)),
+            'image_grid_thw': torch.tensor([1, 1, 2]),
+            'offset': (1, 3),
+            'image_token_id': 99,
+        }],
+    }
+
+    materialized = materialize_encoder_prompt_input(prompt_input, _FakeQwen35Model(nested_visual=True))
+
+    np.testing.assert_allclose(materialized['input_embeddings'][0].embeddings,
+                               np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
+
+
+def test_materialize_encoder_prompt_input_unwraps_graph_runner_model():
+    prompt_input = {
+        'input_ids': [1, 99, 99, 2],
+        'multimodal': [{
+            'modality': Modality.IMAGE,
+            'pixel_values': torch.ones((2, 1)),
+            'image_grid_thw': torch.tensor([1, 1, 2]),
+            'offset': (1, 3),
+            'image_token_id': 99,
+        }],
+    }
+
+    materialized = materialize_encoder_prompt_input(prompt_input, _FakeGraphRunner(_FakeQwen35Model()))
+
+    np.testing.assert_allclose(materialized['input_embeddings'][0].embeddings,
+                               np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
 def test_materialize_encoder_prompt_input_rejects_deepstack_visual_model():
