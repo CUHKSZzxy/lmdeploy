@@ -1,6 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """Helpers for the first EPD language-side receive path."""
 
+import inspect
+
 import numpy as np
 import torch
 
@@ -214,6 +216,18 @@ def materialize_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dic
     prompt_input['input_embeddings'] = input_embeddings
     prompt_input['input_embedding_ranges'] = input_embedding_ranges
     return prompt_input
+
+
+async def materialize_encoder_prompt_input_for_engine(prompt_input: dict, model_or_engine) -> dict:
+    """Materialize encoder prompt input, delegating to MP worker if needed."""
+    engine = getattr(model_or_engine, 'engine', None)
+    remote_materializer = getattr(engine, 'materialize_encoder_prompt_input', None)
+    if callable(remote_materializer):
+        materialized = remote_materializer(prompt_input)
+        if inspect.isawaitable(materialized):
+            materialized = await materialized
+        return materialized
+    return materialize_encoder_prompt_input(prompt_input, model_or_engine)
 
 
 def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:

@@ -15,6 +15,7 @@ from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.serve.epd import (
     encoder_cache_ref_to_prompt_input,
     materialize_encoder_prompt_input,
+    materialize_encoder_prompt_input_for_engine,
     prompt_input_to_encoder_cache_ref,
 )
 from lmdeploy.vl.constants import Modality
@@ -250,6 +251,32 @@ def test_materialize_encoder_prompt_input_unwraps_graph_runner_model():
 
     np.testing.assert_allclose(materialized['input_embeddings'][0].embeddings,
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
+
+
+def test_materialize_encoder_prompt_input_for_engine_uses_mp_worker_materializer():
+    class _FakeRemoteEngine:
+
+        def __init__(self):
+            self.received = None
+
+        async def materialize_encoder_prompt_input(self, prompt_input):
+            self.received = prompt_input
+            return {
+                'input_ids': prompt_input['input_ids'],
+                'input_embeddings': ['remote-embedding'],
+            }
+
+    remote_engine = _FakeRemoteEngine()
+    async_engine = type('FakeAsyncEngine', (), {'engine': remote_engine})()
+    prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
+
+    materialized = asyncio.run(materialize_encoder_prompt_input_for_engine(prompt_input, async_engine))
+
+    assert remote_engine.received is prompt_input
+    assert materialized == {
+        'input_ids': [1, 2],
+        'input_embeddings': ['remote-embedding'],
+    }
 
 
 def test_materialize_encoder_prompt_input_rejects_deepstack_visual_model():

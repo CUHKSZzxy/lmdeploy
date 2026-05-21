@@ -47,7 +47,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine
-from lmdeploy.serve.epd import materialize_encoder_prompt_input, prompt_input_to_encoder_cache_ref
+from lmdeploy.serve.epd import materialize_encoder_prompt_input_for_engine, prompt_input_to_encoder_cache_ref
 from lmdeploy.serve.openai.protocol import (
     AbortRequest,
     ChatCompletionRequest,
@@ -662,7 +662,7 @@ async def chat_encoder_v1(request: ChatCompletionRequest, raw_request: Request =
             chat_template_kwargs=chat_template_kwargs or None,
             media_io_kwargs=request.media_io_kwargs,
             mm_processor_kwargs=request.mm_processor_kwargs)
-        prompt_input = materialize_encoder_prompt_input(prompt_input, VariableInterface.async_engine)
+        prompt_input = await materialize_encoder_prompt_input_for_engine(prompt_input, VariableInterface.async_engine)
         session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
         encoder_result = prompt_input_to_encoder_cache_ref(
             prompt_input,
