@@ -3,13 +3,21 @@ import asyncio
 import numpy as np
 import pytest
 import torch
+from torch import nn
 
 from lmdeploy.messages import GenerationConfig, ResponseType
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
+from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
 from lmdeploy.pytorch.messages import InputEmbeddings
-from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input, prompt_input_to_encoder_cache_ref
+from lmdeploy.pytorch.multimodal.data_type import MultiModalData
+from lmdeploy.serve.epd import (
+    encoder_cache_ref_to_prompt_input,
+    materialize_encoder_prompt_input,
+    prompt_input_to_encoder_cache_ref,
+)
+from lmdeploy.vl.constants import Modality
 
 
 def test_encoder_cache_ref_round_trip():
@@ -113,6 +121,93 @@ def test_prompt_input_rejects_pixel_value_multimodal_without_embeddings():
             remote_session_id=5,
             protocol=MigrationProtocol.TCP,
         )
+
+
+class _FakeInputProcessor:
+
+    def preprocess_input(self, input_ids, input_multimodals):
+        mm_data = [
+            MultiModalData(
+                modality=Modality.IMAGE,
+                data=torch.tensor([[1.0], [2.0]], dtype=torch.float32),
+                start=1,
+                end=3,
+                meta={
+                    'grid_thw': torch.tensor([1, 1, 2]),
+                    'image_token_id': 99,
+                },
+            )
+        ]
+        return PreprocessInputResult(input_ids=input_ids, input_multimodals={'mm_data': mm_data})
+
+
+class _FakeVisual(nn.Module):
+
+    spatial_merge_size = 1
+
+    def rot_pos_emb(self, grid_thw):
+        return torch.zeros((int(grid_thw.prod().item()), 2), dtype=torch.float32)
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        return torch.zeros((int(grid_thw.prod().item()), 2), dtype=torch.float32)
+
+    def forward(self, pixel_values, cu_seqlens, rotary_pos_emb, pos_embeds):
+        return torch.tensor([[10.0, 11.0], [12.0, 13.0]], dtype=torch.float32)
+
+
+class _FakeQwen35Model(nn.Module):
+
+    def __init__(self, deepstack_visual_indexes=None):
+        super().__init__()
+        vision_config = type('VisionConfig', (), {
+            'deepstack_visual_indexes': deepstack_visual_indexes or [],
+        })()
+        self.config = type('Config', (), {'vision_config': vision_config})()
+        self.model = type('InnerModel', (), {'visual': _FakeVisual()})()
+        self.input_processor = _FakeInputProcessor()
+        self.embed_tokens = nn.Embedding(128, 2)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def get_input_processor(self):
+        return self.input_processor
+
+    def get_multimodal_mask(self, input_ids, mm_inputs):
+        image_token_id = mm_inputs[0].meta['image_token_id']
+        return input_ids == image_token_id
+
+
+def test_materialize_encoder_prompt_input_runs_non_deepstack_visual_path():
+    prompt_input = {
+        'input_ids': [1, 99, 99, 2],
+        'multimodal': [{
+            'modality': Modality.IMAGE,
+            'pixel_values': torch.ones((2, 1)),
+            'image_grid_thw': torch.tensor([1, 1, 2]),
+            'offset': (1, 3),
+            'image_token_id': 99,
+        }],
+    }
+
+    materialized = materialize_encoder_prompt_input(prompt_input, _FakeQwen35Model())
+
+    assert materialized['input_ids'] == [1, 99, 99, 2]
+    assert 'multimodal' not in materialized
+    assert materialized['input_embedding_ranges'] == [[1, 3]]
+    assert len(materialized['input_embeddings']) == 1
+    embedding = materialized['input_embeddings'][0]
+    assert isinstance(embedding, InputEmbeddings)
+    assert embedding.start == 1
+    assert embedding.end == 3
+    np.testing.assert_allclose(embedding.embeddings, np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
+
+
+def test_materialize_encoder_prompt_input_rejects_deepstack_visual_model():
+    prompt_input = {'input_ids': [1, 99], 'multimodal': [{'modality': Modality.IMAGE}]}
+
+    with pytest.raises(ValueError, match='DeepStack'):
+        materialize_encoder_prompt_input(prompt_input, _FakeQwen35Model(deepstack_visual_indexes=[5]))
 
 
 def test_encoder_cache_ref_rejects_mismatched_inline_embedding_range():

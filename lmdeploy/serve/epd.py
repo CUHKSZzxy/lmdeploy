@@ -2,6 +2,7 @@
 """Helpers for the first EPD language-side receive path."""
 
 import numpy as np
+import torch
 
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
@@ -50,6 +51,130 @@ def _embedding_range(embedding, ranges, index: int) -> list[int]:
     if hasattr(embedding, 'start') and hasattr(embedding, 'end'):
         return [int(embedding.start), int(embedding.end)]
     raise ValueError('input_embedding_ranges are required to serialize encoder embeddings.')
+
+
+def _resolve_encoder_model(model_or_engine):
+    if hasattr(model_or_engine, 'get_input_embeddings'):
+        return model_or_engine
+    engine = getattr(model_or_engine, 'engine', model_or_engine)
+    executor = getattr(engine, 'executor', None)
+    model_agent = getattr(executor, 'model_agent', None)
+    model = getattr(model_agent, 'patched_model', None)
+    if model is None:
+        raise ValueError('EPD encoder materialization currently requires a local PyTorch model.')
+    return model
+
+
+def _get_visual_module(model):
+    inner_model = getattr(model, 'model', None)
+    visual = getattr(inner_model, 'visual', None)
+    if visual is None:
+        visual = getattr(model, 'visual', None)
+    if visual is None:
+        raise ValueError('EPD encoder materialization requires a model visual encoder.')
+    return visual
+
+
+def _reject_deepstack_model(model):
+    config = getattr(model, 'config', None)
+    vision_config = getattr(config, 'vision_config', None)
+    deepstack_indexes = getattr(vision_config, 'deepstack_visual_indexes', None)
+    if deepstack_indexes:
+        raise ValueError('DeepStack visual embeddings are not supported by the first EPD encoder producer.')
+
+
+def _module_device_and_dtype(module, fallback_device=None, fallback_dtype=None):
+    parameter = next(module.parameters(), None)
+    device = getattr(parameter, 'device', fallback_device)
+    dtype = getattr(parameter, 'dtype', fallback_dtype)
+    return device or torch.device('cpu'), dtype or torch.float32
+
+
+def _is_visual_modality(mm_input) -> bool:
+    modality = getattr(mm_input, 'modality', None)
+    modality_name = getattr(modality, 'name', str(modality))
+    return modality_name in ('IMAGE', 'VIDEO', 'Modality.IMAGE', 'Modality.VIDEO')
+
+
+def _has_deepstack_payload(payload) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, (list, tuple)):
+        return len(payload) > 0
+    return True
+
+
+def materialize_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dict:
+    """Run the non-DeepStack visual path and attach final image embeddings.
+
+    This turns the PyTorch Qwen3.5-style ``input_ids + multimodal`` prompt
+    input into ``input_ids + input_embeddings`` so the existing inline
+    ``EncoderCacheRef`` transport can carry the encoder output.
+    """
+    if prompt_input.get('input_embeddings') or not prompt_input.get('multimodal'):
+        return prompt_input
+
+    model = _resolve_encoder_model(model_or_engine)
+    _reject_deepstack_model(model)
+    visual = _get_visual_module(model)
+    input_processor = model.get_input_processor()
+    if input_processor is None:
+        raise ValueError('EPD encoder materialization requires a model input processor.')
+
+    input_ids = _to_int_list(prompt_input['input_ids'])
+    processed = input_processor.preprocess_input(input_ids, prompt_input['multimodal'])
+    input_ids = _to_int_list(processed.input_ids)
+    input_multimodals = processed.input_multimodals or {}
+    mm_inputs = input_multimodals.get('mm_data', [])
+    if not mm_inputs:
+        return dict(prompt_input, input_ids=input_ids)
+    if any(not _is_visual_modality(mm_input) for mm_input in mm_inputs):
+        raise ValueError('EPD encoder materialization currently supports image/video visual inputs only.')
+
+    embedding_layer = model.get_input_embeddings()
+    embed_device, embed_dtype = _module_device_and_dtype(embedding_layer)
+    visual_device, _ = _module_device_and_dtype(visual, fallback_device=embed_device, fallback_dtype=embed_dtype)
+    pixel_values = torch.cat([mm_input.data for mm_input in mm_inputs]).to(device=visual_device, dtype=embed_dtype)
+    grid_thw = torch.stack([torch.as_tensor(mm_input.meta['grid_thw'], dtype=torch.long) for mm_input in mm_inputs])
+
+    vis_pos_emb = visual.rot_pos_emb(grid_thw)
+    pos_embeds = visual.fast_pos_embed_interpolate(grid_thw)
+    vis_cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).to(pixel_values.device)
+    vis_cu_seqlens = vis_cu_seqlens.cumsum(dim=0, dtype=torch.int32)
+    vis_pos_emb = vis_pos_emb.repeat(1, 2)
+    vis_pos_emb = (vis_pos_emb.cos().to(pixel_values.device), vis_pos_emb.sin().to(pixel_values.device))
+
+    with torch.inference_mode():
+        image_embeds = visual(pixel_values,
+                              cu_seqlens=vis_cu_seqlens,
+                              rotary_pos_emb=vis_pos_emb,
+                              pos_embeds=pos_embeds)
+    if isinstance(image_embeds, tuple):
+        if len(image_embeds) > 1 and _has_deepstack_payload(image_embeds[1]):
+            raise ValueError('DeepStack visual embeddings are not supported by the first EPD encoder producer.')
+        image_embeds = image_embeds[0]
+
+    merge_size = getattr(visual, 'spatial_merge_size', 1)
+    split_sizes = (grid_thw.prod(-1) // merge_size**2).tolist()
+    split_embeddings = torch.split(image_embeds, split_sizes)
+
+    input_embeddings = []
+    input_embedding_ranges = []
+    for embedding, mm_input in zip(split_embeddings, mm_inputs):
+        start, end = int(mm_input.start), int(mm_input.end)
+        if end - start != embedding.shape[0]:
+            raise ValueError(f'encoder embedding range [{start}, {end}) does not match embedding rows '
+                             f'{embedding.shape[0]}')
+        embedding = embedding.to(device=embed_device, dtype=embed_dtype).detach().float().cpu().numpy()
+        input_embeddings.append(InputEmbeddings(embedding, start=start, end=end))
+        input_embedding_ranges.append([start, end])
+
+    prompt_input = dict(prompt_input)
+    prompt_input.pop('multimodal', None)
+    prompt_input['input_ids'] = input_ids
+    prompt_input['input_embeddings'] = input_embeddings
+    prompt_input['input_embedding_ranges'] = input_embedding_ranges
+    return prompt_input
 
 
 def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
