@@ -1,0 +1,162 @@
+import asyncio
+
+import numpy as np
+import pytest
+
+from lmdeploy.messages import GenerationConfig, ResponseType
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
+from lmdeploy.pytorch.engine.engine_instance import EngineInstance
+from lmdeploy.pytorch.engine.request import RequestType, Response
+from lmdeploy.pytorch.messages import InputEmbeddings
+from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input
+
+
+def test_encoder_cache_ref_round_trip():
+    ref = EncoderCacheRef(
+        token_ids=[1, 2, 3],
+        mm_mask=[0, 1, 0],
+        input_embeddings=[
+            EncoderInlineEmbedding(
+                data=[[0.5, 1.5], [2.5, 3.5]],
+                start=1,
+                end=3,
+                dtype='float32',
+            )
+        ],
+        protocol=MigrationProtocol.TCP,
+        backend='inline',
+        remote_engine_id='encoder-0',
+        remote_session_id=7,
+        remote_block_ids=[11, 12],
+        dtype='float32',
+        shape=[2, 2],
+        modality='image',
+    )
+
+    dumped = ref.model_dump(mode='json')
+    loaded = EncoderCacheRef.model_validate(dumped)
+
+    assert loaded.token_ids == [1, 2, 3]
+    assert loaded.protocol is MigrationProtocol.TCP
+    assert loaded.input_embeddings[0].start == 1
+    assert loaded.input_embeddings[0].end == 3
+
+
+def test_encoder_cache_ref_converts_inline_embeddings_to_prompt_input():
+    ref = EncoderCacheRef(
+        token_ids=[101, 102, 103, 104],
+        input_embeddings=[
+            EncoderInlineEmbedding(
+                data=[[1.0, 2.0], [3.0, 4.0]],
+                start=1,
+                end=3,
+                dtype='float32',
+            )
+        ],
+        protocol=MigrationProtocol.TCP,
+        backend='inline',
+        remote_engine_id='encoder-0',
+        remote_session_id=9,
+        remote_block_ids=[],
+    )
+
+    prompt_input = encoder_cache_ref_to_prompt_input(ref)
+
+    assert prompt_input['prompt'] is None
+    assert prompt_input['input_ids'] == [101, 102, 103, 104]
+    assert len(prompt_input['input_embeddings']) == 1
+    embedding = prompt_input['input_embeddings'][0]
+    assert isinstance(embedding, InputEmbeddings)
+    assert embedding.start == 1
+    assert embedding.end == 3
+    assert embedding.embeddings.dtype == np.float32
+    np.testing.assert_allclose(embedding.embeddings, np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
+
+
+def test_encoder_cache_ref_rejects_mismatched_inline_embedding_range():
+    ref = EncoderCacheRef(
+        token_ids=[101, 102, 103],
+        input_embeddings=[
+            EncoderInlineEmbedding(
+                data=[[1.0, 2.0], [3.0, 4.0]],
+                start=1,
+                end=2,
+                dtype='float32',
+            )
+        ],
+        protocol=MigrationProtocol.TCP,
+        backend='inline',
+        remote_engine_id='encoder-0',
+        remote_session_id=9,
+        remote_block_ids=[],
+    )
+
+    with pytest.raises(ValueError, match='does not match embedding rows'):
+        encoder_cache_ref_to_prompt_input(ref)
+
+
+def test_generation_config_carries_encoder_result():
+    ref = EncoderCacheRef(
+        token_ids=[1],
+        protocol=MigrationProtocol.TCP,
+        backend='inline',
+        remote_engine_id='encoder-0',
+        remote_session_id=1,
+        remote_block_ids=[],
+    )
+
+    config = GenerationConfig(encoder_result=ref)
+
+    assert config.encoder_result is ref
+
+
+def test_engine_instance_forwards_input_embeddings_to_add_message():
+    class FakeSender:
+        sender_id = 0
+
+        def __init__(self):
+            self.sent = []
+
+        def send_async(self, request_type, data):
+            self.sent.append((request_type, data))
+            return object()
+
+        async def async_recv(self, resp, wait_main=True):
+            return Response(
+                type=ResponseType.FINISH,
+                sender_id=self.sender_id,
+                event=asyncio.Event(),
+                data={'token_ids': np.array([4], dtype=np.int64)},
+            )
+
+    async def run_case():
+        fake_sender = FakeSender()
+        fake_engine = type('FakeEngine', (), {
+            'req_manager': type('FakeReqManager', (), {
+                'senders': {
+                    fake_sender.sender_id: fake_sender,
+                },
+            })(),
+        })()
+        instance = EngineInstance.__new__(EngineInstance)
+        instance.engine = fake_engine
+        instance.req_sender = fake_sender
+        instance.max_input_len = 16
+        instance._enable_transfer_obj_ref = False
+
+        embeddings = [InputEmbeddings(np.ones((1, 2), dtype=np.float32), start=1, end=2)]
+        outputs = [
+            output async for output in instance.async_stream_infer(
+                session_id=99,
+                input_ids=[1, 2],
+                gen_config=GenerationConfig(max_new_tokens=1),
+                input_embeddings=embeddings,
+            )
+        ]
+
+        assert len(outputs) == 1
+        assert fake_sender.sent[0][0] is RequestType.ADD_SESSION
+        assert fake_sender.sent[1][0] is RequestType.ADD_MESSAGE
+        assert fake_sender.sent[1][1]['input_embeddings'] is embeddings
+
+    asyncio.run(run_case())

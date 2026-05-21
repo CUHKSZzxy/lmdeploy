@@ -9,7 +9,7 @@ import torch
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
-from lmdeploy.pytorch.disagg.conn.protocol import MigrationRequest
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationRequest
 
 from .tokenizer import Tokenizer
 from .utils import get_logger
@@ -138,6 +138,7 @@ class GenerationConfig:
     with_cache: bool = False
     preserve_cache: bool = False
     migration_request: MigrationRequest | None = None
+    encoder_result: EncoderCacheRef | None = None
 
     # router replay
     return_routed_experts: bool = False

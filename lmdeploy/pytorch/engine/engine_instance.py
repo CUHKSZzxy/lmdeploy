@@ -206,6 +206,7 @@ class EngineInstance(EngineInstanceBase):
             sampling_param=sampling_param,
             adapter_name=adapter_name,
             input_multimodals=multimodal,
+            input_embeddings=kwargs.get('input_embeddings'),
             migration_request=gen_config.migration_request,
             with_cache=gen_config.with_cache,
             preserve_cache=gen_config.preserve_cache,

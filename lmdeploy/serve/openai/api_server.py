@@ -14,9 +14,8 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
-
     from lmdeploy.serve.parsers import ResponseParser
+    from transformers import PreTrainedTokenizerBase
 
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
@@ -43,6 +42,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeConnectionRequest,
     DistServeDropConnectionRequest,
     DistServeInitRequest,
+    EncoderCacheRef,
     MigrationRequest,
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
@@ -380,9 +380,12 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     session = VariableInterface.create_session(request.session_id)
 
     json_request = await raw_request.json()
+    encoder_result = json_request.pop('encoder_result', None)
     migration_request = json_request.pop('migration_request', None)
     with_cache = json_request.pop('with_cache', False)
     preserve_cache = json_request.pop('preserve_cache', False)
+    if encoder_result:
+        encoder_result = EncoderCacheRef.model_validate(encoder_result)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
@@ -438,6 +441,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         min_p=request.min_p,
         random_seed=random_seed,
         spaces_between_special_tokens=request.spaces_between_special_tokens,
+        encoder_result=encoder_result,
         migration_request=migration_request,
         with_cache=with_cache,
         preserve_cache=preserve_cache,
@@ -684,9 +688,12 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
     if error_check_ret is not None:
         return error_check_ret
     json_request = await raw_request.json()
+    encoder_result = json_request.pop('encoder_result', None)
     migration_request = json_request.pop('migration_request', None)
     with_cache = json_request.pop('with_cache', False)
     preserve_cache = json_request.pop('preserve_cache', False)
+    if encoder_result:
+        encoder_result = EncoderCacheRef.model_validate(encoder_result)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
@@ -722,6 +729,7 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
         min_p=request.min_p,
         random_seed=random_seed,
         spaces_between_special_tokens=request.spaces_between_special_tokens,
+        encoder_result=encoder_result,
         migration_request=migration_request,
         with_cache=with_cache,
         preserve_cache=preserve_cache,

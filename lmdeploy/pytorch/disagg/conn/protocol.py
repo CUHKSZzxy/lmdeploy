@@ -1,7 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import enum
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from lmdeploy.pytorch.disagg.config import (
     DistServeEngineConfig,
@@ -89,6 +90,40 @@ class MigrationRequest(BaseModel):
     remote_block_ids: list[int]
 
     is_dummy_prefill: bool = False
+
+
+class EncoderInlineEmbedding(BaseModel):
+    """Inline encoder embedding payload for the first EPD receive path.
+
+    This is intentionally a small bring-up format. A production transfer backend should replace the inline data with
+    backend-specific cache handles.
+    """
+
+    data: list[list[float]]
+    start: int
+    end: int
+    dtype: str | None = None
+
+
+class EncoderCacheRef(BaseModel):
+    """Reference to encoder outputs produced by an EPD encoder node."""
+
+    token_ids: list[int]
+    mm_mask: list[int] | None = None
+    input_embedding_ranges: list[list[int]] | None = None
+    input_embeddings: list[EncoderInlineEmbedding] | None = None
+
+    protocol: MigrationProtocol
+    backend: str = 'inline'
+    remote_engine_id: str
+    remote_session_id: int
+    remote_block_ids: list[int] = Field(default_factory=list)
+
+    dtype: str | None = None
+    shape: list[int] | list[list[int]] | None = None
+    modality: str | list[str] | None = None
+    cache_key: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class DistServeCacheFreeRequest(BaseModel):

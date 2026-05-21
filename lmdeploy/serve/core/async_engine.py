@@ -29,6 +29,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeDropConnectionRequest,
     DistServeInitRequest,
 )
+from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input
 from lmdeploy.serve.managers import Session, SessionManager
 from lmdeploy.serve.processors import MultimodalProcessor
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer
@@ -380,8 +381,12 @@ class AsyncEngine:
         """
         metrics_processor.increase_total_requests()
 
-        if (messages is not None) ^ (input_ids is None):
-            raise ValueError('You must specify exactly one of messages or input_ids')
+        encoder_result = gen_config.encoder_result if gen_config is not None else None
+        if encoder_result is None:
+            if (messages is not None) ^ (input_ids is None):
+                raise ValueError('You must specify exactly one of messages or input_ids')
+        elif input_ids is not None:
+            raise ValueError('input_ids cannot be specified together with encoder_result')
         if isinstance(session_id, Session):
             session = session_id
         elif isinstance(session_id, int):
@@ -397,7 +402,27 @@ class AsyncEngine:
             else:
                 logger.warning('chat_template_kwargs["enable_thinking"] is already set, '
                                'the value will not be overwritten by enable_thinking')
-        if messages:
+        if encoder_result is not None:
+            try:
+                prompt = messages
+                prompt_input = encoder_cache_ref_to_prompt_input(encoder_result)
+                input_ids = prompt_input['input_ids']
+                self.request_logger.log_inputs(session,
+                                               prompt=prompt,
+                                               prompt_token_ids=input_ids,
+                                               gen_config=gen_config,
+                                               adapter_name=adapter_name)
+            except Exception:
+                logger.exception('[generate] error in encoder_result processing')
+                metrics_processor.increase_failed_requests('error')
+                yield GenOut(response='in encoder_result processing error',
+                             history_token_len=session.step,
+                             input_token_len=len(input_ids) if input_ids is not None else 0,
+                             generate_token_len=0,
+                             finish_reason='error',
+                             token_ids=[])
+                return
+        elif messages:
             try:
                 prompt = messages
                 self.request_logger.log_prompt(session, prompt=prompt)
