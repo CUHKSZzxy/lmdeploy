@@ -103,6 +103,10 @@ class ExecutorBase:
         """Get input processor."""
         raise NotImplementedError('Not Implemented.')
 
+    async def materialize_encoder_prompt_input(self, prompt_input: dict):
+        """Materialize EPD encoder embeddings."""
+        raise NotImplementedError('Not Implemented.')
+
     def start(self, forward_event: asyncio.Event):
         """Start engine loop."""
         raise NotImplementedError('Not Implemented.')

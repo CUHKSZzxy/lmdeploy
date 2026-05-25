@@ -384,6 +384,11 @@ class RayExecutor(ExecutorBase):
         """Build cache engine."""
         return ray.get(self.workers[0].get_input_processor.remote())
 
+    async def materialize_encoder_prompt_input(self, prompt_input: dict):
+        """Materialize EPD encoder embeddings across TP workers."""
+        outputs = await self.collective_rpc_async('materialize_encoder_prompt_input', (prompt_input, ))
+        return outputs[0]
+
     def _prefetch_task_callback(self, task: asyncio.Task):
         try:
             task.result()

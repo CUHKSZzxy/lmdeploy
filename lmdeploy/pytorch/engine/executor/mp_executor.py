@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 
 from lmdeploy.pytorch.backends.selector import init_backend
 from lmdeploy.pytorch.config import BackendConfig, CacheConfig, DistConfig, MiscConfig, ModelConfig, SpecDecodeConfig
+from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.utils import get_logger, try_import_deeplink
 
 from .base import ExecutorBase
@@ -394,12 +395,17 @@ class MPExecutor(ExecutorBase):
         self.collective_rpc('start')
 
         self.remote_outs = asyncio.Queue()
+        if self.cache_config.role == EngineRole.Encoder:
+            self._prefetch_task = None
+            return
         event_loop = asyncio.get_event_loop()
         self._prefetch_task = event_loop.create_task(self._prefetch_outputs())
 
     async def wait_tasks(self):
         """Wait tasks."""
         # we don't need a complex wait tasks since MPExecutor will be deprecated soon.
+        if self._prefetch_task is None:
+            return
         await self._prefetch_task
 
     async def forward_async(self, inputs):
@@ -413,6 +419,13 @@ class MPExecutor(ExecutorBase):
     def get_input_processor(self):
         """Get input processor."""
         return self.collective_rpc('get_input_processor', receiver_mask=1, return_mask=1)[0]
+
+    async def materialize_encoder_prompt_input(self, prompt_input: dict):
+        """Materialize EPD encoder embeddings across TP workers."""
+        outputs = await self.collective_rpc_async('materialize_encoder_prompt_input',
+                                                 args=(prompt_input, ),
+                                                 return_mask=1)
+        return outputs[0]
 
     def stop(self):
         """Stop engine loop."""

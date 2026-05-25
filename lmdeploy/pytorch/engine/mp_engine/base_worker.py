@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
+import inspect
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -86,6 +87,13 @@ class EngineWorkerBase:
 
     async def materialize_encoder_prompt_input(self, prompt_input: dict):
         """Materialize EPD encoder embeddings in the worker-owned model."""
+        materializer = getattr(self.engine, 'materialize_encoder_prompt_input', None)
+        if callable(materializer):
+            materialized = materializer(prompt_input)
+            if inspect.isawaitable(materialized):
+                materialized = await materialized
+            return materialized
+
         from lmdeploy.serve.epd import materialize_encoder_prompt_input
         return materialize_encoder_prompt_input(prompt_input, self.engine)
 

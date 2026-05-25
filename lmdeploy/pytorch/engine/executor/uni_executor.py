@@ -123,6 +123,13 @@ class UniExecutor(ExecutorBase):
         """Get input processor."""
         return self.model_agent.get_input_processor()
 
+    async def materialize_encoder_prompt_input(self, prompt_input: dict):
+        """Materialize EPD encoder embeddings in the local model."""
+        from lmdeploy.serve.epd import materialize_encoder_prompt_input
+
+        with self.model_agent.all_context():
+            return materialize_encoder_prompt_input(prompt_input, self.model_agent.patched_model)
+
     """ PD Disaggregation API Begin """
 
     def p2p_initialize(self, init_request: DistServeInitRequest):

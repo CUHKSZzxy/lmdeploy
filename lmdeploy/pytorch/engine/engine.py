@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
 import gc
+import inspect
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -601,6 +602,18 @@ class Engine(EngineBase):
             self.scheduler.end_session(session_id)
             return True
         return False
+
+    async def materialize_encoder_prompt_input(self, prompt_input: dict):
+        """Materialize EPD encoder embeddings through the executor."""
+        materializer = getattr(self.executor, 'materialize_encoder_prompt_input', None)
+        if callable(materializer):
+            materialized = materializer(prompt_input)
+            if inspect.isawaitable(materialized):
+                materialized = await materialized
+            return materialized
+
+        from lmdeploy.serve.epd import materialize_encoder_prompt_input
+        return materialize_encoder_prompt_input(prompt_input, self)
 
     def get_engine_config(self):
         return self.engine_config

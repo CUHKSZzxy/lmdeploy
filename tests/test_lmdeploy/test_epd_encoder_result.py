@@ -305,6 +305,81 @@ def test_materialize_encoder_prompt_input_for_engine_uses_mp_worker_materializer
     }
 
 
+def test_pytorch_engine_materializer_delegates_to_executor():
+    from lmdeploy.pytorch.engine.engine import Engine
+
+    class _FakeExecutor:
+
+        def __init__(self):
+            self.received = None
+
+        async def materialize_encoder_prompt_input(self, prompt_input):
+            self.received = prompt_input
+            return {
+                'input_ids': prompt_input['input_ids'],
+                'input_embeddings': ['executor-embedding'],
+            }
+
+    executor = _FakeExecutor()
+    engine = Engine.__new__(Engine)
+    engine.executor = executor
+    prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
+
+    materialized = asyncio.run(engine.materialize_encoder_prompt_input(prompt_input))
+
+    assert executor.received is prompt_input
+    assert materialized == {
+        'input_ids': [1, 2],
+        'input_embeddings': ['executor-embedding'],
+    }
+
+
+def test_mp_executor_materializer_runs_all_workers_and_returns_rank0():
+    from lmdeploy.pytorch.engine.executor.mp_executor import MPExecutor
+
+    executor = MPExecutor.__new__(MPExecutor)
+    captured = {}
+
+    async def fake_collective_rpc_async(method, args=None, kwargs=None, receiver_mask=0xff, return_mask=0xff):
+        captured.update(
+            method=method,
+            args=args,
+            kwargs=kwargs,
+            receiver_mask=receiver_mask,
+            return_mask=return_mask,
+        )
+        return ['rank0-materialized', None]
+
+    executor.collective_rpc_async = fake_collective_rpc_async
+    prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
+
+    materialized = asyncio.run(executor.materialize_encoder_prompt_input(prompt_input))
+
+    assert materialized == 'rank0-materialized'
+    assert captured['method'] == 'materialize_encoder_prompt_input'
+    assert captured['args'] == (prompt_input, )
+    assert captured['receiver_mask'] == 0xff
+    assert captured['return_mask'] == 1
+
+
+def test_mp_executor_encoder_role_start_skips_output_prefetch():
+    from lmdeploy.pytorch.disagg.config import EngineRole
+    from lmdeploy.pytorch.engine.executor.mp_executor import MPExecutor
+
+    executor = MPExecutor.__new__(MPExecutor)
+    executor.cache_config = type('FakeCacheConfig', (), {'role': EngineRole.Encoder})()
+    called = []
+
+    def fake_collective_rpc(method, *args, **kwargs):
+        called.append((method, args, kwargs))
+
+    executor.collective_rpc = fake_collective_rpc
+    executor.start(None)
+
+    assert called == [('start', (), {})]
+    assert executor._prefetch_task is None
+
+
 def test_materialize_encoder_prompt_input_rejects_deepstack_visual_model():
     prompt_input = {'input_ids': [1, 99], 'multimodal': [{'modality': Modality.IMAGE}]}
 
