@@ -1,8 +1,10 @@
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
+from lmdeploy.serve.epd_channel import EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,
+    _build_epd_encoder_request,
     _build_epd_language_request,
     _has_multimodal_chat_messages,
 )
@@ -64,3 +66,24 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_resul
     assert language_request['stream'] is True
     assert language_request['encoder_result']['token_ids'] == [1, 2]
     assert language_request['encoder_result']['protocol'] == 'TCP'
+
+
+def test_build_epd_encoder_request_uses_language_channel():
+    request_dict = {
+        'model': 'm',
+        'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}}]}],
+        'stream': True,
+    }
+    language_status = Status(
+        role=EngineRole.Hybrid,
+        models=['m'],
+        epd_transfer_backend=EPD_BACKEND_ZMQ_IPC,
+        epd_channel_address='ipc:///tmp/lmdeploy_epd_test.sock',
+    )
+
+    encoder_request = _build_epd_encoder_request(request_dict, language_status)
+
+    assert encoder_request['stream'] is False
+    assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_ZMQ_IPC
+    assert encoder_request['epd_channel_address'] == 'ipc:///tmp/lmdeploy_epd_test.sock'
+    assert encoder_request['epd_transfer_id'].startswith('epd-')

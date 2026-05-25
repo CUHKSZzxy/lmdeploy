@@ -8,6 +8,15 @@ import torch
 
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
+from lmdeploy.serve.epd_channel import (
+    EPD_BACKEND_INLINE,
+    EPD_BACKEND_ZMQ_IPC,
+    EPD_TRANSFER_BACKENDS,
+    EncoderTransferEmbedding,
+    EncoderTransferPayload,
+    recv_epd_payload,
+    send_epd_payload,
+)
 
 _NUMPY_DTYPES = {
     None: np.float32,
@@ -45,6 +54,31 @@ def _embedding_array_and_dtype(embedding) -> tuple[np.ndarray, str]:
         data = np.asarray(data)
         dtype = str(data.dtype)
     return np.asarray(data), dtype
+
+
+def _embedding_payloads(prompt_input: dict) -> tuple[list[EncoderTransferEmbedding], list[list[int]], list[list[int]],
+                                                    list[str]]:
+    input_embeddings = prompt_input.get('input_embeddings') or []
+    input_embedding_ranges = prompt_input.get('input_embedding_ranges')
+    payload_embeddings: list[EncoderTransferEmbedding] = []
+    shapes: list[list[int]] = []
+    dtypes: list[str] = []
+
+    for index, embedding in enumerate(input_embeddings):
+        start, end = _embedding_range(embedding, input_embedding_ranges, index)
+        data, _ = _embedding_array_and_dtype(embedding)
+        if data.ndim != 2:
+            raise ValueError(f'encoder embedding must be 2-D, got shape {data.shape}')
+        if end - start != data.shape[0]:
+            raise ValueError(f'encoder embedding range [{start}, {end}) does not match embedding rows {data.shape[0]}')
+        data = np.ascontiguousarray(data)
+        dtype = str(data.dtype)
+        payload_embeddings.append(EncoderTransferEmbedding(data=data, start=start, end=end, dtype=dtype))
+        shapes.append(list(data.shape))
+        dtypes.append(dtype)
+
+    ranges = [[emb.start, emb.end] for emb in payload_embeddings]
+    return payload_embeddings, ranges, shapes, dtypes
 
 
 def _embedding_range(embedding, ranges, index: int) -> list[int]:
@@ -237,6 +271,9 @@ def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
     can exercise the existing ``input_embeddings`` model-input plumbing before
     a real remote cache-transfer backend is added.
     """
+    if encoder_result.backend != EPD_BACKEND_INLINE:
+        raise ValueError(f'EPD backend {encoder_result.backend!r} requires async channel receive.')
+
     prompt_input = dict(prompt=None, input_ids=list(encoder_result.token_ids))
 
     if not encoder_result.input_embeddings:
@@ -259,10 +296,57 @@ def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
     return prompt_input
 
 
+async def encoder_cache_ref_to_prompt_input_async(encoder_result: EncoderCacheRef) -> dict:
+    """Convert an encoder cache ref into prompt input, receiving channel data if needed."""
+    if encoder_result.backend == EPD_BACKEND_INLINE:
+        return encoder_cache_ref_to_prompt_input(encoder_result)
+    if encoder_result.backend != EPD_BACKEND_ZMQ_IPC:
+        raise ValueError(f'unsupported EPD encoder transfer backend: {encoder_result.backend}')
+    if not encoder_result.transfer_id:
+        raise ValueError('EPD channel encoder_result requires transfer_id')
+
+    payload = await recv_epd_payload(encoder_result.transfer_id)
+    if payload.token_ids and payload.token_ids != list(encoder_result.token_ids):
+        raise ValueError('EPD channel payload token_ids do not match encoder_result')
+
+    prompt_input = dict(prompt=None, input_ids=list(encoder_result.token_ids))
+    embeddings = []
+    for embedding in payload.embeddings:
+        expected_rows = embedding.end - embedding.start
+        if expected_rows != embedding.data.shape[0]:
+            raise ValueError(
+                f'EPD channel embedding range [{embedding.start}, {embedding.end}) '
+                f'does not match embedding rows {embedding.data.shape[0]}')
+        embeddings.append(InputEmbeddings(embedding.data, start=embedding.start, end=embedding.end))
+    if embeddings:
+        prompt_input['input_embeddings'] = embeddings
+    return prompt_input
+
+
+async def send_prompt_input_via_channel(prompt_input: dict, transfer_id: str, channel_address: str):
+    """Send materialized encoder embeddings through the configured EPD channel."""
+    if not transfer_id:
+        raise ValueError('EPD channel transfer requires transfer_id')
+    if not channel_address:
+        raise ValueError('EPD channel transfer requires channel_address')
+    embeddings, _, _, _ = _embedding_payloads(prompt_input)
+    if not embeddings:
+        raise ValueError('EPD channel transfer requires precomputed input_embeddings')
+    payload = EncoderTransferPayload(
+        transfer_id=transfer_id,
+        token_ids=_to_int_list(prompt_input.get('input_ids') or []),
+        embeddings=embeddings,
+    )
+    await send_epd_payload(channel_address, payload)
+
+
 def prompt_input_to_encoder_cache_ref(prompt_input: dict,
                                       remote_engine_id: str,
                                       remote_session_id: int,
-                                      protocol: MigrationProtocol = MigrationProtocol.TCP) -> EncoderCacheRef:
+                                      protocol: MigrationProtocol = MigrationProtocol.TCP,
+                                      backend: str = EPD_BACKEND_INLINE,
+                                      transfer_id: str | None = None,
+                                      channel_address: str | None = None) -> EncoderCacheRef:
     """Serialize prompt-side inline embeddings into an EPD encoder cache ref.
 
     This is a bring-up producer for encoder outputs that already exist as
@@ -270,40 +354,41 @@ def prompt_input_to_encoder_cache_ref(prompt_input: dict,
     pixel-value multimodal data need a model-specific vision-forward producer
     before they can use this helper.
     """
+    if backend not in EPD_TRANSFER_BACKENDS:
+        raise ValueError(f'unsupported EPD encoder transfer backend: {backend}')
     input_ids = _to_int_list(prompt_input.get('input_ids') or [])
     input_embeddings = prompt_input.get('input_embeddings')
     if not input_embeddings:
         if prompt_input.get('multimodal') or prompt_input.get('input_multimodals'):
-            raise ValueError('EPD inline encoder producer requires precomputed input_embeddings.')
+            raise ValueError('EPD encoder producer requires precomputed input_embeddings.')
         return EncoderCacheRef(token_ids=input_ids,
                                protocol=protocol,
-                               backend='inline',
+                               backend=backend,
+                               transfer_id=transfer_id,
+                               channel_address=channel_address,
                                remote_engine_id=remote_engine_id,
                                remote_session_id=remote_session_id,
                                remote_block_ids=[])
 
-    input_embedding_ranges = prompt_input.get('input_embedding_ranges')
-    inline_embeddings: list[EncoderInlineEmbedding] = []
-    shapes: list[list[int]] = []
-    dtypes: list[str] = []
-
-    for index, embedding in enumerate(input_embeddings):
-        start, end = _embedding_range(embedding, input_embedding_ranges, index)
-        data, dtype = _embedding_array_and_dtype(embedding)
-        if data.ndim != 2:
-            raise ValueError(f'encoder embedding must be 2-D, got shape {data.shape}')
-        if end - start != data.shape[0]:
-            raise ValueError(f'encoder embedding range [{start}, {end}) does not match embedding rows {data.shape[0]}')
-        inline_embeddings.append(
-            EncoderInlineEmbedding(data=data.astype(np.float32).tolist(), start=start, end=end, dtype=dtype))
-        shapes.append(list(data.shape))
-        dtypes.append(dtype)
+    payload_embeddings, ranges, shapes, dtypes = _embedding_payloads(prompt_input)
+    inline_embeddings = None
+    if backend == EPD_BACKEND_INLINE:
+        inline_embeddings = [
+            EncoderInlineEmbedding(data=embedding.data.astype(np.float32).tolist(),
+                                   start=embedding.start,
+                                   end=embedding.end,
+                                   dtype=embedding.dtype) for embedding in payload_embeddings
+        ]
+    elif not transfer_id:
+        raise ValueError('non-inline EPD encoder_result requires transfer_id')
 
     return EncoderCacheRef(token_ids=input_ids,
-                           input_embedding_ranges=[[emb.start, emb.end] for emb in inline_embeddings],
+                           input_embedding_ranges=ranges,
                            input_embeddings=inline_embeddings,
                            protocol=protocol,
-                           backend='inline',
+                           backend=backend,
+                           transfer_id=transfer_id,
+                           channel_address=channel_address,
                            remote_engine_id=remote_engine_id,
                            remote_session_id=remote_session_id,
                            remote_block_ids=[],

@@ -108,6 +108,7 @@ class LongContextChunker:
         max_prefill_num = self.max_prefill_token_num
         mm = seq.get_input_multimodals()
         self.multimodals = defaultdict(list)
+        self.embeddings = sorted(seq.input_embeddings, key=lambda x: x.start)
 
         has_multimodal = False
         for key, value in mm.items():
@@ -119,8 +120,10 @@ class LongContextChunker:
 
             has_multimodal = has_multimodal or len(value) > 0
 
+        max_embedding_size = max([emb.end - emb.start for emb in self.embeddings], default=0)
+        max_prefill_num = max(max_prefill_num, max_embedding_size)
         self.max_prefill_num = max_prefill_num
-        self.has_multimodal = has_multimodal
+        self.has_multimodal = has_multimodal or len(self.embeddings) > 0
 
     def multimodal_iter(self):
         """Multimodal iterator."""
@@ -134,38 +137,53 @@ class LongContextChunker:
         for modal_type, data in multimodal_data:
             yield modal_type, data
 
+    def embedding_iter(self):
+        """Embedding iterator."""
+        for embedding in self.embeddings:
+            yield embedding
+
     def next_chunk_size(self):
         """Get chunk size."""
         seq = self.seq
         if seq is None:
-            return 0, None
+            return 0, None, None
 
         llm_chunk_size = min(seq.num_token_ids, self.max_prefill_num)
 
-        if len(self.multimodals) == 0:
+        if len(self.multimodals) == 0 and len(self.embeddings) == 0:
             # no vlm inputs found
-            return llm_chunk_size, None
+            return llm_chunk_size, None, None
 
         start = seq.num_history_ids
         end = start + llm_chunk_size
         out_multimodals: MultiModalInputs = defaultdict(list)
-        for modal_type, mm in self.multimodal_iter():
-            assert mm.start >= start, 'multimodal data should be sorted by start'
-            if mm.start >= end:
+        range_items = [(data.start, data.end, 'multimodal', modal_type, data)
+                       for modal_type, data in self.multimodal_iter()]
+        range_items += [(data.start, data.end, 'embedding', None, data) for data in self.embedding_iter()]
+        range_items = sorted(range_items, key=lambda x: x[0])
+        out_embeddings = []
+        for item_start, item_end, item_kind, modal_type, data in range_items:
+            if item_end <= start:
+                continue
+            assert item_start >= start, 'multimodal data should be sorted by start'
+            if item_start >= end:
                 # | start ... end ... mm.start ... mm.end |
                 # if start is beyond threshold, stop
                 break
 
-            if mm.end > end:
+            if item_end > end:
                 # | start ... mm.start ... end ... mm.end |
                 # assume multimodals not overlap
-                end = mm.start
+                end = item_start
                 break
 
             # | start ... mm.start ... mm.end ... end |
-            out_multimodals[modal_type].append(mm)
+            if item_kind == 'multimodal':
+                out_multimodals[modal_type].append(data)
+            else:
+                out_embeddings.append(data)
 
-        return end - start, out_multimodals
+        return end - start, out_multimodals, out_embeddings
 
     def is_last_chunk(self):
         """Is last chunk."""
@@ -177,6 +195,7 @@ class LongContextChunker:
         """Clear."""
         self.seq: SchedulerSequence = None
         self.multimodals: MultiModalInputs = defaultdict(list)
+        self.embeddings = []
         self.next_step: int = 0
         self.max_prefill_num: int = self.max_prefill_token_num
         self.has_multimodal = False
@@ -198,6 +217,8 @@ class LongContextChunker:
             while len(mms) > 0 and mms[0].end <= self.next_step:
                 mms.pop(0)
         self.multimodals = dict((k, v) for k, v in self.multimodals.items() if len(v) > 0)
+        while len(self.embeddings) > 0 and self.embeddings[0].end <= self.next_step:
+            self.embeddings.pop(0)
 
     def check_enable(self):
         if not self.enabled():
@@ -439,7 +460,8 @@ class InputsMakerAsync:
     def create_model_inputs_long_context(self,
                                          seq: 'SchedulerSequence',
                                          chunk_size: int,
-                                         multimodals: 'MultiModalInputs|None' = None):
+                                         multimodals: 'MultiModalInputs|None' = None,
+                                         embeddings: list | None = None):
         """Create model inputs for long context messages."""
         token_ids = seq.token_ids[:chunk_size]
         input_ids = torch.as_tensor(token_ids)[None]
@@ -479,10 +501,31 @@ class InputsMakerAsync:
         self._set_adapter_ids(model_inputs, [seq])
 
         # vision inputs
-        if multimodals is not None and len(multimodals) > 0:
+        has_embeddings = embeddings is not None and len(embeddings) > 0
+        has_multimodals = multimodals is not None and len(multimodals) > 0
+        if has_multimodals or has_embeddings:
+            input_embeddings = None
+            input_embedding_ranges = None
+            input_embedding_indexing = None
+            if has_embeddings:
+                input_embeddings = [[
+                    emb.embeddings if isinstance(emb.embeddings, torch.Tensor) else torch.as_tensor(emb.embeddings)
+                    for emb in embeddings
+                ]]
+                input_embedding_ranges = [torch.tensor([[emb.start, emb.end] for emb in embeddings])]
+                input_embedding_indexing = torch.zeros((1, chunk_size), dtype=torch.bool)
+                history_len = history_lens.item()
+                for emb in embeddings:
+                    emb_start = max(emb.start, history_len) - history_len
+                    emb_end = min(emb.end, history_len + chunk_size) - history_len
+                    if 0 <= emb_start < emb_end:
+                        input_embedding_indexing[0][emb_start:emb_end] = True
             vision_model_inputs = VisionModelInputs(
                 history_lengths=model_inputs.history_lengths,
-                input_multimodals=[multimodals],
+                input_embeddings=input_embeddings,
+                input_embedding_indexing=input_embedding_indexing,
+                input_embedding_ranges=input_embedding_ranges,
+                input_multimodals=[multimodals] if has_multimodals else None,
             )
             model_inputs.vision_inputs = vision_model_inputs
 
@@ -638,8 +681,8 @@ class InputsMakerAsync:
             return inputs, delta, extra_inputs
 
         def __create_inputs_chunk(running: 'SeqList'):
-            chunk_size, multimodals = self.long_context_chunker.next_chunk_size()
-            inputs = self.create_model_inputs_long_context(running[0], chunk_size, multimodals)
+            chunk_size, multimodals, embeddings = self.long_context_chunker.next_chunk_size()
+            inputs = self.create_model_inputs_long_context(running[0], chunk_size, multimodals, embeddings)
             extra_inputs = self.model_agent_strategy.make_extra_inputs(running, inputs)
             return inputs, extra_inputs
 

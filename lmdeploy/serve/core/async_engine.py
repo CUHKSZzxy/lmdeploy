@@ -29,7 +29,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeDropConnectionRequest,
     DistServeInitRequest,
 )
-from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input
+from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input_async
 from lmdeploy.serve.managers import Session, SessionManager
 from lmdeploy.serve.processors import MultimodalProcessor
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer
@@ -405,7 +405,7 @@ class AsyncEngine:
         if encoder_result is not None:
             try:
                 prompt = messages
-                prompt_input = encoder_cache_ref_to_prompt_input(encoder_result)
+                prompt_input = await encoder_cache_ref_to_prompt_input_async(encoder_result)
                 input_ids = prompt_input['input_ids']
                 self.request_logger.log_inputs(session,
                                                prompt=prompt,

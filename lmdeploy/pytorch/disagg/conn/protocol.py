@@ -112,9 +112,11 @@ class EncoderCacheRef(BaseModel):
     mm_mask: list[int] | None = None
     input_embedding_ranges: list[list[int]] | None = None
     input_embeddings: list[EncoderInlineEmbedding] | None = None
+    transfer_id: str | None = None
 
     protocol: MigrationProtocol
     backend: str = 'inline'
+    channel_address: str | None = None
     remote_engine_id: str
     remote_session_id: int
     remote_block_ids: list[int] = Field(default_factory=list)

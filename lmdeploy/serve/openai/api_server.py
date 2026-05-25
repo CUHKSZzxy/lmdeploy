@@ -36,7 +36,7 @@ from lmdeploy.messages import (
 )
 from lmdeploy.metrics.metrics_processor import metrics_processor
 from lmdeploy.model import ChatTemplateConfig
-from lmdeploy.pytorch.disagg.config import DistServeEngineConfig
+from lmdeploy.pytorch.disagg.config import DistServeEngineConfig, EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeCacheFreeRequest,
     DistServeConnectionRequest,
@@ -47,7 +47,20 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine
-from lmdeploy.serve.epd import materialize_encoder_prompt_input_for_engine, prompt_input_to_encoder_cache_ref
+from lmdeploy.serve.epd import (
+    materialize_encoder_prompt_input_for_engine,
+    prompt_input_to_encoder_cache_ref,
+    send_prompt_input_via_channel,
+)
+from lmdeploy.serve.epd_channel import (
+    EPD_BACKEND_INLINE,
+    EPD_BACKEND_ZMQ_IPC,
+    EPD_TRANSFER_BACKENDS,
+    close_epd_senders,
+    default_epd_channel_address,
+    start_epd_receiver,
+    stop_epd_receiver,
+)
 from lmdeploy.serve.openai.protocol import (
     AbortRequest,
     ChatCompletionRequest,
@@ -99,6 +112,8 @@ class VariableInterface:
     # following are for registering to proxy server
     proxy_url: str | None = None
     api_server_url: str | None = None
+    epd_transfer_backend: str = EPD_BACKEND_INLINE
+    epd_channel_address: str | None = None
     allow_terminate_by_client: bool = False
     enable_abort_handling: bool = False
     response_parser_cls: type[ResponseParser] | None = None
@@ -635,6 +650,13 @@ async def chat_encoder_v1(request: ChatCompletionRequest, raw_request: Request =
     error_check_ret = check_request(request)
     if error_check_ret is not None:
         return error_check_ret
+    json_request = await raw_request.json()
+    transfer_backend = json_request.get('encoder_transfer_backend', VariableInterface.epd_transfer_backend)
+    transfer_id = json_request.get('epd_transfer_id')
+    channel_address = json_request.get('epd_channel_address')
+    if transfer_backend not in EPD_TRANSFER_BACKENDS:
+        return create_error_response(HTTPStatus.BAD_REQUEST,
+                                     f'unsupported EPD encoder transfer backend: {transfer_backend}')
 
     model_name = request.model
     adapter_name = None
@@ -663,14 +685,22 @@ async def chat_encoder_v1(request: ChatCompletionRequest, raw_request: Request =
             media_io_kwargs=request.media_io_kwargs,
             mm_processor_kwargs=request.mm_processor_kwargs)
         prompt_input = await materialize_encoder_prompt_input_for_engine(prompt_input, VariableInterface.async_engine)
+        if transfer_backend == EPD_BACKEND_ZMQ_IPC:
+            await send_prompt_input_via_channel(prompt_input, transfer_id, channel_address)
         session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
         encoder_result = prompt_input_to_encoder_cache_ref(
             prompt_input,
             remote_engine_id=VariableInterface.api_server_url or 'local',
             remote_session_id=session_id,
+            backend=transfer_backend,
+            transfer_id=transfer_id,
+            channel_address=channel_address,
         )
     except ValueError as exc:
         return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+    except Exception as exc:
+        logger.exception('EPD encoder transfer failed')
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
     return {
         'id': str(request.session_id),
@@ -1264,8 +1294,16 @@ async def startup_event():
         import requests
         engine_config = VariableInterface.async_engine.backend_config
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
+        epd_channel_address = None if getattr(engine_config, 'role', None) == EngineRole.Encoder \
+            else VariableInterface.epd_channel_address
         url = f'{VariableInterface.proxy_url}/nodes/add'
-        data = {'url': VariableInterface.api_server_url, 'status': {'models': get_model_list(), 'role': engine_role}}
+        status = {
+            'models': get_model_list(),
+            'role': engine_role,
+            'epd_transfer_backend': VariableInterface.epd_transfer_backend,
+            'epd_channel_address': epd_channel_address,
+        }
+        data = {'url': VariableInterface.api_server_url, 'status': status}
         headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
         response = requests.post(url, headers=headers, json=data)
 
@@ -1339,7 +1377,14 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
     @asynccontextmanager
     async def lifespan_handler(app: FastAPI):
         task = None
+        epd_receiver_started = False
         try:
+            role = getattr(backend_config, 'role', None)
+            if (VariableInterface.epd_transfer_backend == EPD_BACKEND_ZMQ_IPC
+                    and role != EngineRole.Encoder):
+                await start_epd_receiver(VariableInterface.epd_channel_address)
+                epd_receiver_started = True
+
             if getattr(backend_config, 'enable_metrics', False):
                 metrics_processor.start_metrics_handler(enable_metrics=True)
                 log_interval = 10.
@@ -1360,6 +1405,9 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
         finally:
             if task:
                 task.cancel()
+            if epd_receiver_started:
+                await stop_epd_receiver()
+            close_epd_senders()
             await metrics_processor.stop_metrics_handler()
 
     return lifespan_handler
@@ -1388,6 +1436,8 @@ def serve(model_path: str,
           tool_call_parser: str | None = None,
           allow_terminate_by_client: bool = False,
           enable_abort_handling: bool = False,
+          epd_transfer_backend: str = EPD_BACKEND_INLINE,
+          epd_channel_address: str | None = None,
           speculative_config: SpeculativeConfig | None = None,
           **kwargs):
     """An example to perform model inference through the command line
@@ -1448,6 +1498,10 @@ def serve(model_path: str,
 
     VariableInterface.allow_terminate_by_client = allow_terminate_by_client
     VariableInterface.enable_abort_handling = enable_abort_handling
+    if epd_transfer_backend not in EPD_TRANSFER_BACKENDS:
+        raise ValueError(f'unsupported EPD encoder transfer backend: {epd_transfer_backend}')
+    VariableInterface.epd_transfer_backend = epd_transfer_backend
+    VariableInterface.epd_channel_address = epd_channel_address
 
     ssl_keyfile, ssl_certfile, http_or_https = None, None, 'http'
     if ssl:
@@ -1510,6 +1564,8 @@ def serve(model_path: str,
     if proxy_url is not None:
         VariableInterface.proxy_url = proxy_url
         VariableInterface.api_server_url = f'{http_or_https}://{server_name}:{server_port}'  # noqa
+    if VariableInterface.epd_transfer_backend == EPD_BACKEND_ZMQ_IPC and VariableInterface.epd_channel_address is None:
+        VariableInterface.epd_channel_address = default_epd_channel_address(server_port)
     for i in range(3):
         print(f'HINT:    Please open \033[93m\033[1m{http_or_https}://'
               f'{server_name}:{server_port}\033[0m in a browser for detailed api'

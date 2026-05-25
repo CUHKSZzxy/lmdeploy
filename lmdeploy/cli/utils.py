@@ -687,6 +687,21 @@ class ArgumentHelper:
                                    help='kvcache migration management backend when PD disaggregation')
 
     @staticmethod
+    def encoder_transfer_backend(parser):
+        return parser.add_argument('--encoder-transfer-backend',
+                                   type=str,
+                                   default='inline',
+                                   choices=['inline', 'zmq_ipc'],
+                                   help='encoder embedding transfer backend for EPD')
+
+    @staticmethod
+    def epd_channel_address(parser):
+        return parser.add_argument('--epd-channel-address',
+                                   type=str,
+                                   default=None,
+                                   help='EPD encoder embedding channel address')
+
+    @staticmethod
     def disable_vision_encoder(parser):
         """Disable loading vision encoder."""
         return parser.add_argument('--disable-vision-encoder',

@@ -128,6 +128,8 @@ class SubCliServe:
         ArgumentHelper.enable_eplb(pt_group)
         ArgumentHelper.role(pt_group)
         ArgumentHelper.migration_backend(pt_group)
+        ArgumentHelper.encoder_transfer_backend(pt_group)
+        ArgumentHelper.epd_channel_address(pt_group)
         # multi-node serving args
         node_rank_act = ArgumentHelper.node_rank(pt_group)
         num_nodes_act = ArgumentHelper.num_nodes(pt_group)
@@ -309,6 +311,8 @@ class SubCliServe:
                 trust_remote_code=args.trust_remote_code,
                 reasoning_parser=args.reasoning_parser,
                 tool_call_parser=args.tool_call_parser,
+                epd_transfer_backend=args.encoder_transfer_backend,
+                epd_channel_address=args.epd_channel_address,
                 speculative_config=speculative_config,
             )
         else:
@@ -341,6 +345,8 @@ class SubCliServe:
                 trust_remote_code=args.trust_remote_code,
                 reasoning_parser=args.reasoning_parser,
                 tool_call_parser=args.tool_call_parser,
+                epd_transfer_backend=args.encoder_transfer_backend,
+                epd_channel_address=args.epd_channel_address,
                 speculative_config=speculative_config,
             )
 

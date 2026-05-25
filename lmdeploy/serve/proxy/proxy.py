@@ -8,6 +8,7 @@ import os.path as osp
 import random
 import threading
 import time
+import uuid
 from collections import deque
 from http import HTTPStatus
 from typing import Literal
@@ -25,6 +26,7 @@ from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMA
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
+from lmdeploy.serve.epd_channel import EPD_BACKEND_INLINE, EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
     ChatCompletionRequest,
@@ -50,6 +52,8 @@ class Status(BaseModel):
     unfinished: int = 0
     latency: deque = Field(default=deque(maxlen=LATENCY_DEQUE_LEN), examples=[[]])
     speed: int | None = Field(default=None, examples=[None])
+    epd_transfer_backend: str = EPD_BACKEND_INLINE
+    epd_channel_address: str | None = None
 
 
 class Node(BaseModel):
@@ -497,6 +501,19 @@ def _build_epd_language_request(request_dict: dict, encoder_result: dict | Encod
     return request_dict
 
 
+def _build_epd_encoder_request(request_dict: dict, language_status: Status) -> dict:
+    request_dict = copy.deepcopy(request_dict)
+    request_dict['stream'] = False
+    transfer_backend = language_status.epd_transfer_backend or EPD_BACKEND_INLINE
+    request_dict['encoder_transfer_backend'] = transfer_backend
+    if transfer_backend == EPD_BACKEND_ZMQ_IPC:
+        if not language_status.epd_channel_address:
+            raise ValueError('language node does not advertise an EPD channel address')
+        request_dict['epd_transfer_id'] = f'epd-{uuid.uuid4().hex}'
+        request_dict['epd_channel_address'] = language_status.epd_channel_address
+    return request_dict
+
+
 def _extract_epd_encoder_result(response_text: str | bytes) -> dict:
     try:
         response = json.loads(response_text)
@@ -714,8 +731,11 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
 
             request_dict = await raw_request.json()
             if request_dict.get('encoder_result') is None:
-                encoder_request = copy.deepcopy(request_dict)
-                encoder_request['stream'] = False
+                language_status = node_manager.nodes[node_url]
+                try:
+                    encoder_request = _build_epd_encoder_request(request_dict, language_status)
+                except ValueError as exc:
+                    return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
                 logger.info(f'An Encoder request is dispatched to {encoder_url}')
                 start = node_manager.pre_call(encoder_url)
                 encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/encoder')
