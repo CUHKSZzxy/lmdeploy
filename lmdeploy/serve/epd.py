@@ -6,10 +6,10 @@ import inspect
 import numpy as np
 import torch
 
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderHttpJsonEmbedding, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.serve.epd_channel import (
-    EPD_BACKEND_INLINE,
+    EPD_BACKEND_HTTP_JSON,
     EPD_BACKEND_ZMQ_IPC,
     EPD_TRANSFER_BACKENDS,
     EncoderTransferEmbedding,
@@ -29,7 +29,7 @@ _NUMPY_DTYPES = {
 def _as_numpy_dtype(dtype: str | None):
     """Map serialized embedding dtype names to numpy dtypes."""
     if dtype not in _NUMPY_DTYPES:
-        raise ValueError(f'unsupported inline encoder embedding dtype: {dtype}')
+        raise ValueError(f'unsupported HTTP JSON encoder embedding dtype: {dtype}')
     return _NUMPY_DTYPES[dtype]
 
 
@@ -127,7 +127,7 @@ def _resolve_encoder_model(model_or_engine):
         if model is not None:
             return model
 
-    raise ValueError('EPD encoder materialization currently requires a local PyTorch model.')
+    raise ValueError('EPD encoder embedding computation currently requires a local PyTorch model.')
 
 
 def _get_visual_module(model, _visited=None):
@@ -144,9 +144,9 @@ def _get_visual_module(model, _visited=None):
             if visual is not None:
                 break
     if visual is None:
-        raise ValueError('EPD encoder materialization requires a model visual encoder.')
+        raise ValueError('EPD encoder embedding computation requires a model visual encoder.')
     if not all(hasattr(visual, attr) for attr in ('rot_pos_emb', 'fast_pos_embed_interpolate')):
-        raise ValueError('EPD encoder materialization requires a Qwen3.5-style visual encoder.')
+        raise ValueError('EPD encoder embedding computation requires a Qwen3.5-style visual encoder.')
     return visual
 
 
@@ -179,11 +179,11 @@ def _has_deepstack_payload(payload) -> bool:
     return True
 
 
-def materialize_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dict:
+def compute_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dict:
     """Run the non-DeepStack visual path and attach final image embeddings.
 
     This turns the PyTorch Qwen3.5-style ``input_ids + multimodal`` prompt
-    input into ``input_ids + input_embeddings`` so the existing inline
+    input into ``input_ids + input_embeddings`` so the existing HTTP JSON
     ``EncoderCacheRef`` transport can carry the encoder output.
     """
     if prompt_input.get('input_embeddings') or not prompt_input.get('multimodal'):
@@ -194,7 +194,7 @@ def materialize_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dic
     visual = _get_visual_module(model)
     input_processor = model.get_input_processor()
     if input_processor is None:
-        raise ValueError('EPD encoder materialization requires a model input processor.')
+        raise ValueError('EPD encoder embedding computation requires a model input processor.')
 
     input_ids = _to_int_list(prompt_input['input_ids'])
     processed = input_processor.preprocess_input(input_ids, prompt_input['multimodal'])
@@ -204,7 +204,7 @@ def materialize_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dic
     if not mm_inputs:
         return dict(prompt_input, input_ids=input_ids)
     if any(not _is_visual_modality(mm_input) for mm_input in mm_inputs):
-        raise ValueError('EPD encoder materialization currently supports image/video visual inputs only.')
+        raise ValueError('EPD encoder embedding computation currently supports image/video visual inputs only.')
 
     embedding_layer = model.get_input_embeddings()
     embed_device, embed_dtype = _module_device_and_dtype(embedding_layer)
@@ -252,26 +252,26 @@ def materialize_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dic
     return prompt_input
 
 
-async def materialize_encoder_prompt_input_for_engine(prompt_input: dict, model_or_engine) -> dict:
-    """Materialize encoder prompt input, delegating to MP worker if needed."""
+async def compute_encoder_prompt_input_for_engine(prompt_input: dict, model_or_engine) -> dict:
+    """Compute encoder embeddings for a prompt input, delegating to MP worker if needed."""
     engine = getattr(model_or_engine, 'engine', None)
-    remote_materializer = getattr(engine, 'materialize_encoder_prompt_input', None)
-    if callable(remote_materializer):
-        materialized = remote_materializer(prompt_input)
-        if inspect.isawaitable(materialized):
-            materialized = await materialized
-        return materialized
-    return materialize_encoder_prompt_input(prompt_input, model_or_engine)
+    remote_compute = getattr(engine, 'compute_encoder_prompt_input', None)
+    if callable(remote_compute):
+        computed = remote_compute(prompt_input)
+        if inspect.isawaitable(computed):
+            computed = await computed
+        return computed
+    return compute_encoder_prompt_input(prompt_input, model_or_engine)
 
 
 def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
     """Convert an EPD encoder cache reference into AsyncEngine prompt input.
 
-    The first bring-up path supports inline embeddings so the language engine
+    The first bring-up path supports HTTP JSON embeddings so the language engine
     can exercise the existing ``input_embeddings`` model-input plumbing before
     a real remote cache-transfer backend is added.
     """
-    if encoder_result.backend != EPD_BACKEND_INLINE:
+    if encoder_result.backend != EPD_BACKEND_HTTP_JSON:
         raise ValueError(f'EPD backend {encoder_result.backend!r} requires async channel receive.')
 
     prompt_input = dict(prompt=None, input_ids=list(encoder_result.token_ids))
@@ -280,17 +280,17 @@ def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
         return prompt_input
 
     embeddings = []
-    for inline_embedding in encoder_result.input_embeddings:
-        dtype = _as_numpy_dtype(inline_embedding.dtype or encoder_result.dtype)
-        data = np.asarray(inline_embedding.data, dtype=dtype)
+    for http_json_embedding in encoder_result.input_embeddings:
+        dtype = _as_numpy_dtype(http_json_embedding.dtype or encoder_result.dtype)
+        data = np.asarray(http_json_embedding.data, dtype=dtype)
         if data.ndim != 2:
-            raise ValueError(f'inline encoder embedding must be 2-D, got shape {data.shape}')
-        expected_rows = inline_embedding.end - inline_embedding.start
+            raise ValueError(f'HTTP JSON encoder embedding must be 2-D, got shape {data.shape}')
+        expected_rows = http_json_embedding.end - http_json_embedding.start
         if expected_rows != data.shape[0]:
             raise ValueError(
-                f'inline encoder embedding range [{inline_embedding.start}, {inline_embedding.end}) '
+                f'HTTP JSON encoder embedding range [{http_json_embedding.start}, {http_json_embedding.end}) '
                 f'does not match embedding rows {data.shape[0]}')
-        embeddings.append(InputEmbeddings(data, start=inline_embedding.start, end=inline_embedding.end))
+        embeddings.append(InputEmbeddings(data, start=http_json_embedding.start, end=http_json_embedding.end))
 
     prompt_input['input_embeddings'] = embeddings
     return prompt_input
@@ -298,7 +298,7 @@ def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
 
 async def encoder_cache_ref_to_prompt_input_async(encoder_result: EncoderCacheRef) -> dict:
     """Convert an encoder cache ref into prompt input, receiving channel data if needed."""
-    if encoder_result.backend == EPD_BACKEND_INLINE:
+    if encoder_result.backend == EPD_BACKEND_HTTP_JSON:
         return encoder_cache_ref_to_prompt_input(encoder_result)
     if encoder_result.backend != EPD_BACKEND_ZMQ_IPC:
         raise ValueError(f'unsupported EPD encoder transfer backend: {encoder_result.backend}')
@@ -324,7 +324,7 @@ async def encoder_cache_ref_to_prompt_input_async(encoder_result: EncoderCacheRe
 
 
 async def send_prompt_input_via_channel(prompt_input: dict, transfer_id: str, channel_address: str):
-    """Send materialized encoder embeddings through the configured EPD channel."""
+    """Send computed encoder embeddings through the configured EPD channel."""
     if not transfer_id:
         raise ValueError('EPD channel transfer requires transfer_id')
     if not channel_address:
@@ -344,10 +344,10 @@ def prompt_input_to_encoder_cache_ref(prompt_input: dict,
                                       remote_engine_id: str,
                                       remote_session_id: int,
                                       protocol: MigrationProtocol = MigrationProtocol.TCP,
-                                      backend: str = EPD_BACKEND_INLINE,
+                                      backend: str = EPD_BACKEND_HTTP_JSON,
                                       transfer_id: str | None = None,
                                       channel_address: str | None = None) -> EncoderCacheRef:
-    """Serialize prompt-side inline embeddings into an EPD encoder cache ref.
+    """Serialize prompt-side embeddings into an EPD encoder cache ref.
 
     This is a bring-up producer for encoder outputs that already exist as
     ``input_embeddings``. PyTorch VLM prompt inputs that still contain raw
@@ -371,20 +371,20 @@ def prompt_input_to_encoder_cache_ref(prompt_input: dict,
                                remote_block_ids=[])
 
     payload_embeddings, ranges, shapes, dtypes = _embedding_payloads(prompt_input)
-    inline_embeddings = None
-    if backend == EPD_BACKEND_INLINE:
-        inline_embeddings = [
-            EncoderInlineEmbedding(data=embedding.data.astype(np.float32).tolist(),
-                                   start=embedding.start,
-                                   end=embedding.end,
-                                   dtype=embedding.dtype) for embedding in payload_embeddings
+    http_json_embeddings = None
+    if backend == EPD_BACKEND_HTTP_JSON:
+        http_json_embeddings = [
+            EncoderHttpJsonEmbedding(data=embedding.data.astype(np.float32).tolist(),
+                                     start=embedding.start,
+                                     end=embedding.end,
+                                     dtype=embedding.dtype) for embedding in payload_embeddings
         ]
     elif not transfer_id:
-        raise ValueError('non-inline EPD encoder_result requires transfer_id')
+        raise ValueError('non-http_json EPD encoder_result requires transfer_id')
 
     return EncoderCacheRef(token_ids=input_ids,
                            input_embedding_ranges=ranges,
-                           input_embeddings=inline_embeddings,
+                           input_embeddings=http_json_embeddings,
                            protocol=protocol,
                            backend=backend,
                            transfer_id=transfer_id,

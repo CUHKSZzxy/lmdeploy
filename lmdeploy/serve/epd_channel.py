@@ -17,9 +17,9 @@ from lmdeploy.utils import get_logger
 
 logger = get_logger('lmdeploy')
 
-EPD_BACKEND_INLINE = 'inline'
+EPD_BACKEND_HTTP_JSON = 'http_json'
 EPD_BACKEND_ZMQ_IPC = 'zmq_ipc'
-EPD_TRANSFER_BACKENDS = (EPD_BACKEND_INLINE, EPD_BACKEND_ZMQ_IPC)
+EPD_TRANSFER_BACKENDS = (EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC)
 
 
 @dataclass

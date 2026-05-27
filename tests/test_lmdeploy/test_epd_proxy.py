@@ -53,7 +53,7 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_resul
     encoder_result = {
         'token_ids': [1, 2],
         'protocol': MigrationProtocol.TCP.name,
-        'backend': 'inline',
+        'backend': 'http_json',
         'remote_engine_id': 'http://encoder',
         'remote_session_id': 3,
         'remote_block_ids': [],
@@ -87,3 +87,12 @@ def test_build_epd_encoder_request_uses_language_channel():
     assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_ZMQ_IPC
     assert encoder_request['epd_channel_address'] == 'ipc:///tmp/lmdeploy_epd_test.sock'
     assert encoder_request['epd_transfer_id'].startswith('epd-')
+
+
+def test_api_server_does_not_register_dedicated_encoder_chat_endpoint():
+    from lmdeploy.serve.openai.api_server import router
+
+    paths = {route.path for route in router.routes}
+
+    assert '/v1/chat/completions' in paths
+    assert '/v1/chat/encoder' not in paths

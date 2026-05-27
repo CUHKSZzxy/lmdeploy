@@ -134,12 +134,12 @@ class WorkerWrapperBase:
         """Build cache engine."""
         return self.model_agent.get_input_processor()
 
-    def materialize_encoder_prompt_input(self, prompt_input: dict):
-        """Materialize EPD encoder embeddings in the worker-owned model."""
-        from lmdeploy.serve.epd import materialize_encoder_prompt_input
+    def compute_encoder_prompt_input(self, prompt_input: dict):
+        """Compute EPD encoder embeddings in the worker-owned model."""
+        from lmdeploy.serve.epd import compute_encoder_prompt_input
 
         with self.model_agent.all_context():
-            return materialize_encoder_prompt_input(prompt_input, self.model_agent.patched_model)
+            return compute_encoder_prompt_input(prompt_input, self.model_agent.patched_model)
 
     def start(self):
         """Start engine loop."""

@@ -92,11 +92,12 @@ class MigrationRequest(BaseModel):
     is_dummy_prefill: bool = False
 
 
-class EncoderInlineEmbedding(BaseModel):
-    """Inline encoder embedding payload for the first EPD receive path.
+class EncoderHttpJsonEmbedding(BaseModel):
+    """HTTP JSON encoder embedding payload for the first EPD receive path.
 
-    This is intentionally a small bring-up format. A production transfer backend should replace the inline data with
-    backend-specific cache handles.
+    This is intentionally a small bring-up format. A production transfer
+    backend should replace the HTTP JSON data with backend-specific cache
+    handles.
     """
 
     data: list[list[float]]
@@ -111,11 +112,11 @@ class EncoderCacheRef(BaseModel):
     token_ids: list[int]
     mm_mask: list[int] | None = None
     input_embedding_ranges: list[list[int]] | None = None
-    input_embeddings: list[EncoderInlineEmbedding] | None = None
+    input_embeddings: list[EncoderHttpJsonEmbedding] | None = None
     transfer_id: str | None = None
 
     protocol: MigrationProtocol
-    backend: str = 'inline'
+    backend: str = 'http_json'
     channel_address: str | None = None
     remote_engine_id: str
     remote_session_id: int

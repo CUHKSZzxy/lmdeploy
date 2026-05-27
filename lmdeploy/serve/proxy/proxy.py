@@ -26,7 +26,7 @@ from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMA
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
-from lmdeploy.serve.epd_channel import EPD_BACKEND_INLINE, EPD_BACKEND_ZMQ_IPC
+from lmdeploy.serve.epd_channel import EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
     ChatCompletionRequest,
@@ -52,7 +52,7 @@ class Status(BaseModel):
     unfinished: int = 0
     latency: deque = Field(default=deque(maxlen=LATENCY_DEQUE_LEN), examples=[[]])
     speed: int | None = Field(default=None, examples=[None])
-    epd_transfer_backend: str = EPD_BACKEND_INLINE
+    epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
     epd_channel_address: str | None = None
 
 
@@ -504,7 +504,7 @@ def _build_epd_language_request(request_dict: dict, encoder_result: dict | Encod
 def _build_epd_encoder_request(request_dict: dict, language_status: Status) -> dict:
     request_dict = copy.deepcopy(request_dict)
     request_dict['stream'] = False
-    transfer_backend = language_status.epd_transfer_backend or EPD_BACKEND_INLINE
+    transfer_backend = language_status.epd_transfer_backend or EPD_BACKEND_HTTP_JSON
     request_dict['encoder_transfer_backend'] = transfer_backend
     if transfer_backend == EPD_BACKEND_ZMQ_IPC:
         if not language_status.epd_channel_address:
@@ -738,7 +738,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                     return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
                 logger.info(f'An Encoder request is dispatched to {encoder_url}')
                 start = node_manager.pre_call(encoder_url)
-                encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/encoder')
+                encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/completions')
                 node_manager.post_call(encoder_url, start)
                 try:
                     encoder_result = _extract_epd_encoder_result(encoder_response)

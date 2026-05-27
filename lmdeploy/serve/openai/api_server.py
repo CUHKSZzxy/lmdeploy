@@ -48,12 +48,12 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine
 from lmdeploy.serve.epd import (
-    materialize_encoder_prompt_input_for_engine,
+    compute_encoder_prompt_input_for_engine,
     prompt_input_to_encoder_cache_ref,
     send_prompt_input_via_channel,
 )
 from lmdeploy.serve.epd_channel import (
-    EPD_BACKEND_INLINE,
+    EPD_BACKEND_HTTP_JSON,
     EPD_BACKEND_ZMQ_IPC,
     EPD_TRANSFER_BACKENDS,
     close_epd_senders,
@@ -112,7 +112,7 @@ class VariableInterface:
     # following are for registering to proxy server
     proxy_url: str | None = None
     api_server_url: str | None = None
-    epd_transfer_backend: str = EPD_BACKEND_INLINE
+    epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
     epd_channel_address: str | None = None
     allow_terminate_by_client: bool = False
     enable_abort_handling: bool = False
@@ -273,6 +273,73 @@ async def terminate():
     return Response(status_code=200)
 
 
+def _is_epd_encoder_role() -> bool:
+    """Return whether this API server is an EPD encoder node."""
+    return getattr(VariableInterface.get_engine_config(), 'role', None) == EngineRole.Encoder
+
+
+async def _create_epd_encoder_response(request: ChatCompletionRequest, raw_request: Request):
+    """Compute encoder output references for an EPD encoder-role chat request."""
+    json_request = await raw_request.json()
+    transfer_backend = json_request.get('encoder_transfer_backend', VariableInterface.epd_transfer_backend)
+    transfer_id = json_request.get('epd_transfer_id')
+    channel_address = json_request.get('epd_channel_address')
+    if transfer_backend not in EPD_TRANSFER_BACKENDS:
+        return create_error_response(HTTPStatus.BAD_REQUEST,
+                                     f'unsupported EPD encoder transfer backend: {transfer_backend}')
+
+    model_name = request.model
+    adapter_name = None
+    if model_name != VariableInterface.async_engine.model_name:
+        adapter_name = model_name
+
+    do_preprocess = False if isinstance(request.messages, str) else request.do_preprocess
+    chat_template_kwargs = request.chat_template_kwargs or {}
+    if request.enable_thinking is not None:
+        logger.warning('`enable_thinking` will be deprecated in the future, '
+                       'please use `chat_template_kwargs` instead.')
+        if chat_template_kwargs.get('enable_thinking') is None:
+            chat_template_kwargs['enable_thinking'] = request.enable_thinking
+        else:
+            logger.warning('`enable_thinking` in `chat_template_kwargs` will override the value in request.')
+
+    try:
+        prompt_input = await VariableInterface.async_engine.prompt_processor.get_prompt_input(
+            prompt=request.messages,
+            do_preprocess=do_preprocess,
+            sequence_start=True,
+            adapter_name=adapter_name,
+            tools=request.tools,
+            reasoning_effort=request.reasoning_effort,
+            chat_template_kwargs=chat_template_kwargs or None,
+            media_io_kwargs=request.media_io_kwargs,
+            mm_processor_kwargs=request.mm_processor_kwargs)
+        prompt_input = await compute_encoder_prompt_input_for_engine(prompt_input, VariableInterface.async_engine)
+        if transfer_backend == EPD_BACKEND_ZMQ_IPC:
+            await send_prompt_input_via_channel(prompt_input, transfer_id, channel_address)
+        session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
+        encoder_result = prompt_input_to_encoder_cache_ref(
+            prompt_input,
+            remote_engine_id=VariableInterface.api_server_url or 'local',
+            remote_session_id=session_id,
+            backend=transfer_backend,
+            transfer_id=transfer_id,
+            channel_address=channel_address,
+        )
+    except ValueError as exc:
+        return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+    except Exception as exc:
+        logger.exception('EPD encoder transfer failed')
+        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    return {
+        'id': str(request.session_id),
+        'object': 'encoder_result',
+        'model': model_name,
+        'encoder_result': encoder_result.model_dump(mode='json'),
+    }
+
+
 # modified from https://github.com/vllm-project/vllm/blob/v0.5.4/vllm/entrypoints/openai/logits_processors.py#L51  # noqa
 def logit_bias_logits_processor(logit_bias: dict[int, float] | dict[str, float],
                                 tokenizer: PreTrainedTokenizerBase) -> LogitsProcessor:
@@ -393,6 +460,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     error_check_ret = check_request(request)
     if error_check_ret is not None:
         return error_check_ret
+    if _is_epd_encoder_role():
+        return await _create_epd_encoder_response(request, raw_request)
     session = VariableInterface.create_session(request.session_id)
 
     json_request = await raw_request.json()
@@ -642,72 +711,6 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         response['remote_token_ids'] = remote_token_ids
 
     return response
-
-
-@router.post('/v1/chat/encoder', dependencies=[Depends(validate_json_request)])
-async def chat_encoder_v1(request: ChatCompletionRequest, raw_request: Request = None):
-    """Internal EPD endpoint that returns encoder output references."""
-    error_check_ret = check_request(request)
-    if error_check_ret is not None:
-        return error_check_ret
-    json_request = await raw_request.json()
-    transfer_backend = json_request.get('encoder_transfer_backend', VariableInterface.epd_transfer_backend)
-    transfer_id = json_request.get('epd_transfer_id')
-    channel_address = json_request.get('epd_channel_address')
-    if transfer_backend not in EPD_TRANSFER_BACKENDS:
-        return create_error_response(HTTPStatus.BAD_REQUEST,
-                                     f'unsupported EPD encoder transfer backend: {transfer_backend}')
-
-    model_name = request.model
-    adapter_name = None
-    if model_name != VariableInterface.async_engine.model_name:
-        adapter_name = model_name
-
-    do_preprocess = False if isinstance(request.messages, str) else request.do_preprocess
-    chat_template_kwargs = request.chat_template_kwargs or {}
-    if request.enable_thinking is not None:
-        logger.warning('`enable_thinking` will be deprecated in the future, '
-                       'please use `chat_template_kwargs` instead.')
-        if chat_template_kwargs.get('enable_thinking') is None:
-            chat_template_kwargs['enable_thinking'] = request.enable_thinking
-        else:
-            logger.warning('`enable_thinking` in `chat_template_kwargs` will override the value in request.')
-
-    try:
-        prompt_input = await VariableInterface.async_engine.prompt_processor.get_prompt_input(
-            prompt=request.messages,
-            do_preprocess=do_preprocess,
-            sequence_start=True,
-            adapter_name=adapter_name,
-            tools=request.tools,
-            reasoning_effort=request.reasoning_effort,
-            chat_template_kwargs=chat_template_kwargs or None,
-            media_io_kwargs=request.media_io_kwargs,
-            mm_processor_kwargs=request.mm_processor_kwargs)
-        prompt_input = await materialize_encoder_prompt_input_for_engine(prompt_input, VariableInterface.async_engine)
-        if transfer_backend == EPD_BACKEND_ZMQ_IPC:
-            await send_prompt_input_via_channel(prompt_input, transfer_id, channel_address)
-        session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
-        encoder_result = prompt_input_to_encoder_cache_ref(
-            prompt_input,
-            remote_engine_id=VariableInterface.api_server_url or 'local',
-            remote_session_id=session_id,
-            backend=transfer_backend,
-            transfer_id=transfer_id,
-            channel_address=channel_address,
-        )
-    except ValueError as exc:
-        return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
-    except Exception as exc:
-        logger.exception('EPD encoder transfer failed')
-        return create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
-
-    return {
-        'id': str(request.session_id),
-        'object': 'encoder_result',
-        'model': model_name,
-        'encoder_result': encoder_result.model_dump(mode='json'),
-    }
 
 
 @router.post('/v1/completions', dependencies=[Depends(validate_json_request)])
@@ -1436,7 +1439,7 @@ def serve(model_path: str,
           tool_call_parser: str | None = None,
           allow_terminate_by_client: bool = False,
           enable_abort_handling: bool = False,
-          epd_transfer_backend: str = EPD_BACKEND_INLINE,
+          epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON,
           epd_channel_address: str | None = None,
           speculative_config: SpeculativeConfig | None = None,
           **kwargs):

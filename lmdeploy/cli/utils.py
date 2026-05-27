@@ -690,8 +690,8 @@ class ArgumentHelper:
     def encoder_transfer_backend(parser):
         return parser.add_argument('--encoder-transfer-backend',
                                    type=str,
-                                   default='inline',
-                                   choices=['inline', 'zmq_ipc'],
+                                   default='http_json',
+                                   choices=['http_json', 'zmq_ipc'],
                                    help='encoder embedding transfer backend for EPD')
 
     @staticmethod

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from lmdeploy.messages import GenerationConfig, ResponseType
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderInlineEmbedding, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderHttpJsonEmbedding, MigrationProtocol
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
 from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
@@ -15,8 +15,8 @@ from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.serve.epd_channel import EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.epd import (
     encoder_cache_ref_to_prompt_input,
-    materialize_encoder_prompt_input,
-    materialize_encoder_prompt_input_for_engine,
+    compute_encoder_prompt_input,
+    compute_encoder_prompt_input_for_engine,
     prompt_input_to_encoder_cache_ref,
 )
 from lmdeploy.vl.constants import Modality
@@ -27,7 +27,7 @@ def test_encoder_cache_ref_round_trip():
         token_ids=[1, 2, 3],
         mm_mask=[0, 1, 0],
         input_embeddings=[
-            EncoderInlineEmbedding(
+            EncoderHttpJsonEmbedding(
                 data=[[0.5, 1.5], [2.5, 3.5]],
                 start=1,
                 end=3,
@@ -35,7 +35,7 @@ def test_encoder_cache_ref_round_trip():
             )
         ],
         protocol=MigrationProtocol.TCP,
-        backend='inline',
+        backend='http_json',
         remote_engine_id='encoder-0',
         remote_session_id=7,
         remote_block_ids=[11, 12],
@@ -53,11 +53,11 @@ def test_encoder_cache_ref_round_trip():
     assert loaded.input_embeddings[0].end == 3
 
 
-def test_encoder_cache_ref_converts_inline_embeddings_to_prompt_input():
+def test_encoder_cache_ref_converts_http_json_embeddings_to_prompt_input():
     ref = EncoderCacheRef(
         token_ids=[101, 102, 103, 104],
         input_embeddings=[
-            EncoderInlineEmbedding(
+            EncoderHttpJsonEmbedding(
                 data=[[1.0, 2.0], [3.0, 4.0]],
                 start=1,
                 end=3,
@@ -65,7 +65,7 @@ def test_encoder_cache_ref_converts_inline_embeddings_to_prompt_input():
             )
         ],
         protocol=MigrationProtocol.TCP,
-        backend='inline',
+        backend='http_json',
         remote_engine_id='encoder-0',
         remote_session_id=9,
         remote_block_ids=[],
@@ -84,7 +84,7 @@ def test_encoder_cache_ref_converts_inline_embeddings_to_prompt_input():
     np.testing.assert_allclose(embedding.embeddings, np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
 
 
-def test_prompt_input_converts_to_inline_encoder_cache_ref():
+def test_prompt_input_converts_to_http_json_encoder_cache_ref():
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)],
@@ -99,7 +99,7 @@ def test_prompt_input_converts_to_inline_encoder_cache_ref():
     )
 
     assert ref.token_ids == [10, 11, 12, 13]
-    assert ref.backend == 'inline'
+    assert ref.backend == 'http_json'
     assert ref.remote_engine_id == 'http://encoder'
     assert ref.remote_session_id == 5
     assert ref.dtype == 'float32'
@@ -110,7 +110,7 @@ def test_prompt_input_converts_to_inline_encoder_cache_ref():
     assert ref.input_embeddings[0].data == [[1.0, 2.0], [3.0, 4.0]]
 
 
-def test_prompt_input_converts_to_zmq_encoder_cache_ref_without_inline_data():
+def test_prompt_input_converts_to_zmq_encoder_cache_ref_without_http_json_data():
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)],
@@ -218,7 +218,7 @@ class _FakeGraphRunner:
         return self.model.get_input_processor()
 
 
-def test_materialize_encoder_prompt_input_runs_non_deepstack_visual_path():
+def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -230,20 +230,20 @@ def test_materialize_encoder_prompt_input_runs_non_deepstack_visual_path():
         }],
     }
 
-    materialized = materialize_encoder_prompt_input(prompt_input, _FakeQwen35Model())
+    computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model())
 
-    assert materialized['input_ids'] == [1, 99, 99, 2]
-    assert 'multimodal' not in materialized
-    assert materialized['input_embedding_ranges'] == [[1, 3]]
-    assert len(materialized['input_embeddings']) == 1
-    embedding = materialized['input_embeddings'][0]
+    assert computed['input_ids'] == [1, 99, 99, 2]
+    assert 'multimodal' not in computed
+    assert computed['input_embedding_ranges'] == [[1, 3]]
+    assert len(computed['input_embeddings']) == 1
+    embedding = computed['input_embeddings'][0]
     assert isinstance(embedding, InputEmbeddings)
     assert embedding.start == 1
     assert embedding.end == 3
     np.testing.assert_allclose(embedding.embeddings, np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
-def test_materialize_encoder_prompt_input_finds_nested_visual_module():
+def test_compute_encoder_prompt_input_finds_nested_visual_module():
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -255,13 +255,13 @@ def test_materialize_encoder_prompt_input_finds_nested_visual_module():
         }],
     }
 
-    materialized = materialize_encoder_prompt_input(prompt_input, _FakeQwen35Model(nested_visual=True))
+    computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(nested_visual=True))
 
-    np.testing.assert_allclose(materialized['input_embeddings'][0].embeddings,
+    np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
-def test_materialize_encoder_prompt_input_unwraps_graph_runner_model():
+def test_compute_encoder_prompt_input_unwraps_graph_runner_model():
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -273,19 +273,19 @@ def test_materialize_encoder_prompt_input_unwraps_graph_runner_model():
         }],
     }
 
-    materialized = materialize_encoder_prompt_input(prompt_input, _FakeGraphRunner(_FakeQwen35Model()))
+    computed = compute_encoder_prompt_input(prompt_input, _FakeGraphRunner(_FakeQwen35Model()))
 
-    np.testing.assert_allclose(materialized['input_embeddings'][0].embeddings,
+    np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
-def test_materialize_encoder_prompt_input_for_engine_uses_mp_worker_materializer():
+def test_compute_encoder_prompt_input_for_engine_uses_mp_worker_compute_method():
     class _FakeRemoteEngine:
 
         def __init__(self):
             self.received = None
 
-        async def materialize_encoder_prompt_input(self, prompt_input):
+        async def compute_encoder_prompt_input(self, prompt_input):
             self.received = prompt_input
             return {
                 'input_ids': prompt_input['input_ids'],
@@ -296,16 +296,16 @@ def test_materialize_encoder_prompt_input_for_engine_uses_mp_worker_materializer
     async_engine = type('FakeAsyncEngine', (), {'engine': remote_engine})()
     prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
 
-    materialized = asyncio.run(materialize_encoder_prompt_input_for_engine(prompt_input, async_engine))
+    computed = asyncio.run(compute_encoder_prompt_input_for_engine(prompt_input, async_engine))
 
     assert remote_engine.received is prompt_input
-    assert materialized == {
+    assert computed == {
         'input_ids': [1, 2],
         'input_embeddings': ['remote-embedding'],
     }
 
 
-def test_pytorch_engine_materializer_delegates_to_executor():
+def test_pytorch_engine_compute_method_delegates_to_executor():
     from lmdeploy.pytorch.engine.engine import Engine
 
     class _FakeExecutor:
@@ -313,7 +313,7 @@ def test_pytorch_engine_materializer_delegates_to_executor():
         def __init__(self):
             self.received = None
 
-        async def materialize_encoder_prompt_input(self, prompt_input):
+        async def compute_encoder_prompt_input(self, prompt_input):
             self.received = prompt_input
             return {
                 'input_ids': prompt_input['input_ids'],
@@ -325,16 +325,16 @@ def test_pytorch_engine_materializer_delegates_to_executor():
     engine.executor = executor
     prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
 
-    materialized = asyncio.run(engine.materialize_encoder_prompt_input(prompt_input))
+    computed = asyncio.run(engine.compute_encoder_prompt_input(prompt_input))
 
     assert executor.received is prompt_input
-    assert materialized == {
+    assert computed == {
         'input_ids': [1, 2],
         'input_embeddings': ['executor-embedding'],
     }
 
 
-def test_mp_executor_materializer_runs_all_workers_and_returns_rank0():
+def test_mp_executor_compute_method_runs_all_workers_and_returns_rank0():
     from lmdeploy.pytorch.engine.executor.mp_executor import MPExecutor
 
     executor = MPExecutor.__new__(MPExecutor)
@@ -348,15 +348,15 @@ def test_mp_executor_materializer_runs_all_workers_and_returns_rank0():
             receiver_mask=receiver_mask,
             return_mask=return_mask,
         )
-        return ['rank0-materialized', None]
+        return ['rank0-computed', None]
 
     executor.collective_rpc_async = fake_collective_rpc_async
     prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
 
-    materialized = asyncio.run(executor.materialize_encoder_prompt_input(prompt_input))
+    computed = asyncio.run(executor.compute_encoder_prompt_input(prompt_input))
 
-    assert materialized == 'rank0-materialized'
-    assert captured['method'] == 'materialize_encoder_prompt_input'
+    assert computed == 'rank0-computed'
+    assert captured['method'] == 'compute_encoder_prompt_input'
     assert captured['args'] == (prompt_input, )
     assert captured['receiver_mask'] == 0xff
     assert captured['return_mask'] == 1
@@ -380,18 +380,18 @@ def test_mp_executor_encoder_role_start_skips_output_prefetch():
     assert executor._prefetch_task is None
 
 
-def test_materialize_encoder_prompt_input_rejects_deepstack_visual_model():
+def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
     prompt_input = {'input_ids': [1, 99], 'multimodal': [{'modality': Modality.IMAGE}]}
 
     with pytest.raises(ValueError, match='DeepStack'):
-        materialize_encoder_prompt_input(prompt_input, _FakeQwen35Model(deepstack_visual_indexes=[5]))
+        compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(deepstack_visual_indexes=[5]))
 
 
-def test_encoder_cache_ref_rejects_mismatched_inline_embedding_range():
+def test_encoder_cache_ref_rejects_mismatched_http_json_embedding_range():
     ref = EncoderCacheRef(
         token_ids=[101, 102, 103],
         input_embeddings=[
-            EncoderInlineEmbedding(
+            EncoderHttpJsonEmbedding(
                 data=[[1.0, 2.0], [3.0, 4.0]],
                 start=1,
                 end=2,
@@ -399,7 +399,7 @@ def test_encoder_cache_ref_rejects_mismatched_inline_embedding_range():
             )
         ],
         protocol=MigrationProtocol.TCP,
-        backend='inline',
+        backend='http_json',
         remote_engine_id='encoder-0',
         remote_session_id=9,
         remote_block_ids=[],
@@ -413,7 +413,7 @@ def test_generation_config_carries_encoder_result():
     ref = EncoderCacheRef(
         token_ids=[1],
         protocol=MigrationProtocol.TCP,
-        backend='inline',
+        backend='http_json',
         remote_engine_id='encoder-0',
         remote_session_id=1,
         remote_block_ids=[],
@@ -422,6 +422,47 @@ def test_generation_config_carries_encoder_result():
     config = GenerationConfig(encoder_result=ref)
 
     assert config.encoder_result is ref
+
+
+def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeypatch):
+    from lmdeploy.pytorch.disagg.config import EngineRole
+    from lmdeploy.serve.openai import api_server
+    from lmdeploy.serve.openai.protocol import ChatCompletionRequest
+
+    class _FakeSessionManager:
+
+        def has(self, session_id):
+            return False
+
+    fake_async_engine = type('FakeAsyncEngine', (), {
+        'model_name': 'm',
+        'backend_config': type('FakeBackendConfig', (), {
+            'role': EngineRole.Encoder,
+            'logprobs_mode': None,
+        })(),
+        'session_mgr': _FakeSessionManager(),
+    })()
+    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', fake_async_engine)
+
+    called = {}
+
+    async def fake_encoder_response(request, raw_request):
+        called['request'] = request
+        called['raw_request'] = raw_request
+        return {'object': 'encoder_result'}
+
+    monkeypatch.setattr(api_server, '_create_epd_encoder_response', fake_encoder_response)
+
+    request = ChatCompletionRequest(model='m', messages='hello')
+    raw_request = object()
+
+    response = asyncio.run(api_server.chat_completions_v1(request, raw_request))
+
+    assert response == {'object': 'encoder_result'}
+    assert called == {
+        'request': request,
+        'raw_request': raw_request,
+    }
 
 
 def test_engine_instance_forwards_input_embeddings_to_add_message():

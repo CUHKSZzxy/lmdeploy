@@ -71,9 +71,9 @@ class MPEngine(EngineBase):
         """Get schedule metrics."""
         return await self._collective_rpc_async('get_schedule_metrics')
 
-    async def materialize_encoder_prompt_input(self, prompt_input: dict):
-        """Materialize EPD encoder embeddings in the worker process."""
-        return await self._collective_rpc_async('materialize_encoder_prompt_input', prompt_input)
+    async def compute_encoder_prompt_input(self, prompt_input: dict):
+        """Compute EPD encoder embeddings in the worker process."""
+        return await self._collective_rpc_async('compute_encoder_prompt_input', prompt_input)
 
     def p2p_initialize(self, conn_request: DistServeInitRequest):
         """Init rdma link."""

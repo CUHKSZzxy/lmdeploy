@@ -420,9 +420,9 @@ class MPExecutor(ExecutorBase):
         """Get input processor."""
         return self.collective_rpc('get_input_processor', receiver_mask=1, return_mask=1)[0]
 
-    async def materialize_encoder_prompt_input(self, prompt_input: dict):
-        """Materialize EPD encoder embeddings across TP workers."""
-        outputs = await self.collective_rpc_async('materialize_encoder_prompt_input',
+    async def compute_encoder_prompt_input(self, prompt_input: dict):
+        """Compute EPD encoder embeddings across TP workers."""
+        outputs = await self.collective_rpc_async('compute_encoder_prompt_input',
                                                  args=(prompt_input, ),
                                                  return_mask=1)
         return outputs[0]

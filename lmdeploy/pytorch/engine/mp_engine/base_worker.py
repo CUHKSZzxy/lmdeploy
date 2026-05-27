@@ -85,17 +85,17 @@ class EngineWorkerBase:
         """Get schedule metrics."""
         return self.engine.get_schedule_metrics()
 
-    async def materialize_encoder_prompt_input(self, prompt_input: dict):
-        """Materialize EPD encoder embeddings in the worker-owned model."""
-        materializer = getattr(self.engine, 'materialize_encoder_prompt_input', None)
-        if callable(materializer):
-            materialized = materializer(prompt_input)
-            if inspect.isawaitable(materialized):
-                materialized = await materialized
-            return materialized
+    async def compute_encoder_prompt_input(self, prompt_input: dict):
+        """Compute EPD encoder embeddings in the worker-owned model."""
+        compute_fn = getattr(self.engine, 'compute_encoder_prompt_input', None)
+        if callable(compute_fn):
+            computed = compute_fn(prompt_input)
+            if inspect.isawaitable(computed):
+                computed = await computed
+            return computed
 
-        from lmdeploy.serve.epd import materialize_encoder_prompt_input
-        return materialize_encoder_prompt_input(prompt_input, self.engine)
+        from lmdeploy.serve.epd import compute_encoder_prompt_input
+        return compute_encoder_prompt_input(prompt_input, self.engine)
 
     def p2p_initialize(self, conn_request: DistServeInitRequest):
         """Init rdma link."""
