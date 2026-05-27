@@ -117,7 +117,7 @@ class EncoderCacheRef(BaseModel):
 
     protocol: MigrationProtocol
     backend: str = 'http_json'
-    channel_address: str | None = None
+    receiver_address: str | None = None
     remote_engine_id: str
     remote_session_id: int
     remote_block_ids: list[int] = Field(default_factory=list)

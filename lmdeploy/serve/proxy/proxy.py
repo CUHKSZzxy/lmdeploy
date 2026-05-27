@@ -8,7 +8,6 @@ import os.path as osp
 import random
 import threading
 import time
-import uuid
 from collections import deque
 from http import HTTPStatus
 from typing import Literal
@@ -26,7 +25,8 @@ from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMA
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
-from lmdeploy.serve.epd_channel import EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
+from lmdeploy.serve.epd_channel import EPD_BACKEND_HTTP_JSON
+from lmdeploy.serve.epd_connector import build_encoder_transfer_config
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
     ChatCompletionRequest,
@@ -53,7 +53,7 @@ class Status(BaseModel):
     latency: deque = Field(default=deque(maxlen=LATENCY_DEQUE_LEN), examples=[[]])
     speed: int | None = Field(default=None, examples=[None])
     epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
-    epd_channel_address: str | None = None
+    encoder_output_receiver_address: str | None = None
 
 
 class Node(BaseModel):
@@ -504,13 +504,11 @@ def _build_epd_language_request(request_dict: dict, encoder_result: dict | Encod
 def _build_epd_encoder_request(request_dict: dict, language_status: Status) -> dict:
     request_dict = copy.deepcopy(request_dict)
     request_dict['stream'] = False
-    transfer_backend = language_status.epd_transfer_backend or EPD_BACKEND_HTTP_JSON
-    request_dict['encoder_transfer_backend'] = transfer_backend
-    if transfer_backend == EPD_BACKEND_ZMQ_IPC:
-        if not language_status.epd_channel_address:
-            raise ValueError('language node does not advertise an EPD channel address')
-        request_dict['epd_transfer_id'] = f'epd-{uuid.uuid4().hex}'
-        request_dict['epd_channel_address'] = language_status.epd_channel_address
+    transfer_config = build_encoder_transfer_config(
+        backend=language_status.epd_transfer_backend,
+        receiver_address=language_status.encoder_output_receiver_address,
+    )
+    request_dict.update(transfer_config.to_request_fields())
     return request_dict
 
 

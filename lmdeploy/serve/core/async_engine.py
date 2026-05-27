@@ -29,7 +29,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeDropConnectionRequest,
     DistServeInitRequest,
 )
-from lmdeploy.serve.epd import encoder_cache_ref_to_prompt_input_async
+from lmdeploy.serve.epd_connector import encoder_cache_ref_to_prompt_input_async
 from lmdeploy.serve.managers import Session, SessionManager
 from lmdeploy.serve.processors import MultimodalProcessor
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer

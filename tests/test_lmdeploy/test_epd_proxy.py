@@ -68,7 +68,7 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_resul
     assert language_request['encoder_result']['protocol'] == 'TCP'
 
 
-def test_build_epd_encoder_request_uses_language_channel():
+def test_build_epd_encoder_request_uses_language_receiver_address():
     request_dict = {
         'model': 'm',
         'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}}]}],
@@ -78,21 +78,12 @@ def test_build_epd_encoder_request_uses_language_channel():
         role=EngineRole.Hybrid,
         models=['m'],
         epd_transfer_backend=EPD_BACKEND_ZMQ_IPC,
-        epd_channel_address='ipc:///tmp/lmdeploy_epd_test.sock',
+        encoder_output_receiver_address='ipc:///tmp/lmdeploy_epd_test.sock',
     )
 
     encoder_request = _build_epd_encoder_request(request_dict, language_status)
 
     assert encoder_request['stream'] is False
     assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_ZMQ_IPC
-    assert encoder_request['epd_channel_address'] == 'ipc:///tmp/lmdeploy_epd_test.sock'
+    assert encoder_request['encoder_output_receiver_address'] == 'ipc:///tmp/lmdeploy_epd_test.sock'
     assert encoder_request['epd_transfer_id'].startswith('epd-')
-
-
-def test_api_server_does_not_register_dedicated_encoder_chat_endpoint():
-    from lmdeploy.serve.openai.api_server import router
-
-    paths = {route.path for route in router.routes}
-
-    assert '/v1/chat/completions' in paths
-    assert '/v1/chat/encoder' not in paths

@@ -12,12 +12,17 @@ from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
-from lmdeploy.serve.epd_channel import EPD_BACKEND_ZMQ_IPC
-from lmdeploy.serve.epd import (
+from lmdeploy.serve.epd_channel import EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
+from lmdeploy.serve.epd_connector import (
+    EncoderTransferConfig,
+    build_encoder_transfer_config,
     encoder_cache_ref_to_prompt_input,
+    prompt_input_to_encoder_cache_ref,
+    publish_encoder_prompt_input,
+)
+from lmdeploy.serve.epd import (
     compute_encoder_prompt_input,
     compute_encoder_prompt_input_for_engine,
-    prompt_input_to_encoder_cache_ref,
 )
 from lmdeploy.vl.constants import Modality
 
@@ -110,6 +115,37 @@ def test_prompt_input_converts_to_http_json_encoder_cache_ref():
     assert ref.input_embeddings[0].data == [[1.0, 2.0], [3.0, 4.0]]
 
 
+def test_encoder_transfer_config_defaults_and_validates_receiver_backend():
+    config = EncoderTransferConfig.from_request({'encoder_transfer_backend': None})
+
+    assert config.backend == EPD_BACKEND_HTTP_JSON
+    assert config.to_request_fields() == {'encoder_transfer_backend': EPD_BACKEND_HTTP_JSON}
+
+    with pytest.raises(ValueError, match='receiver address'):
+        build_encoder_transfer_config(EPD_BACKEND_ZMQ_IPC)
+
+
+def test_http_json_connector_publishes_encoder_cache_ref():
+    prompt_input = {
+        'input_ids': [10, 11, 12, 13],
+        'input_embeddings': [torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)],
+        'input_embedding_ranges': [[1, 3]],
+    }
+
+    ref = asyncio.run(
+        publish_encoder_prompt_input(
+            prompt_input,
+            remote_engine_id='http://encoder',
+            remote_session_id=5,
+            transfer_config=EncoderTransferConfig(backend='http_json'),
+        ))
+
+    assert ref.backend == 'http_json'
+    assert ref.remote_engine_id == 'http://encoder'
+    assert ref.input_embeddings[0].start == 1
+    assert ref.input_embeddings[0].data == [[1.0, 2.0], [3.0, 4.0]]
+
+
 def test_prompt_input_converts_to_zmq_encoder_cache_ref_without_http_json_data():
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
@@ -124,12 +160,12 @@ def test_prompt_input_converts_to_zmq_encoder_cache_ref_without_http_json_data()
         protocol=MigrationProtocol.TCP,
         backend=EPD_BACKEND_ZMQ_IPC,
         transfer_id='epd-1',
-        channel_address='ipc:///tmp/lmdeploy_epd_test.sock',
+        receiver_address='ipc:///tmp/lmdeploy_epd_test.sock',
     )
 
     assert ref.backend == EPD_BACKEND_ZMQ_IPC
     assert ref.transfer_id == 'epd-1'
-    assert ref.channel_address == 'ipc:///tmp/lmdeploy_epd_test.sock'
+    assert ref.receiver_address == 'ipc:///tmp/lmdeploy_epd_test.sock'
     assert ref.input_embedding_ranges == [[1, 3]]
     assert ref.input_embeddings is None
     assert ref.shape == [[2, 2]]

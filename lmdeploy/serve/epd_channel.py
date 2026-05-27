@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""EPD encoder embedding transfer channels."""
+"""EPD encoder-output transfer transports."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ class EncoderTransferPayload:
         return [[embedding.start, embedding.end] for embedding in self.embeddings]
 
 
-def default_epd_channel_address(server_port: int) -> str:
+def default_encoder_output_receiver_address(server_port: int) -> str:
     """Build the default local IPC endpoint for an EPD language node."""
     return f'ipc:///tmp/lmdeploy_epd_{server_port}.sock'
 
@@ -83,11 +83,11 @@ def _payload_to_frames(payload: EncoderTransferPayload) -> list[bytes]:
 
 def _frames_to_payload(frames: list[bytes]) -> EncoderTransferPayload:
     if not frames:
-        raise ValueError('empty EPD channel payload')
+        raise ValueError('empty EPD encoder-output payload')
     header = json.loads(frames[0].decode())
     embedding_headers = header.get('embeddings') or []
     if len(embedding_headers) != len(frames) - 1:
-        raise ValueError('EPD channel embedding frame count mismatch')
+        raise ValueError('EPD encoder-output embedding frame count mismatch')
 
     embeddings = []
     for emb_header, frame in zip(embedding_headers, frames[1:]):
@@ -113,7 +113,7 @@ def _frames_to_payload(frames: list[bytes]) -> EncoderTransferPayload:
 
 
 class ZmqIpcEncoderSender:
-    """Async ZMQ sender for EPD embedding payloads."""
+    """Async ZMQ sender for EPD encoder-output payloads."""
 
     def __init__(self, address: str):
         self.address = address

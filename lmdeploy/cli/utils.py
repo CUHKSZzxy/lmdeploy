@@ -695,11 +695,11 @@ class ArgumentHelper:
                                    help='encoder embedding transfer backend for EPD')
 
     @staticmethod
-    def epd_channel_address(parser):
-        return parser.add_argument('--epd-channel-address',
+    def encoder_output_receiver_address(parser):
+        return parser.add_argument('--encoder-output-receiver-address',
                                    type=str,
                                    default=None,
-                                   help='EPD encoder embedding channel address')
+                                   help='address where this language node receives EPD encoder outputs')
 
     @staticmethod
     def disable_vision_encoder(parser):
