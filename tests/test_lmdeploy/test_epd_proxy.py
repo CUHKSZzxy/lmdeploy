@@ -1,6 +1,6 @@
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
-from lmdeploy.serve.epd_channel import EPD_BACKEND_ZMQ_IPC
+from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,
@@ -81,9 +81,32 @@ def test_build_epd_encoder_request_uses_language_receiver_address():
         encoder_output_receiver_address='ipc:///tmp/lmdeploy_epd_test.sock',
     )
 
-    encoder_request = _build_epd_encoder_request(request_dict, language_status)
+    encoder_request = _build_epd_encoder_request(request_dict, 'http://language', language_status)
 
     assert encoder_request['stream'] is False
     assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_ZMQ_IPC
     assert encoder_request['encoder_output_receiver_address'] == 'ipc:///tmp/lmdeploy_epd_test.sock'
+    assert encoder_request['epd_transfer_id'].startswith('epd-')
+
+
+def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
+    request_dict = {
+        'model': 'm',
+        'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}}]}],
+        'stream': True,
+    }
+    endpoint_info = {'io_info': {'data_channel_info': []}}
+    language_status = Status(
+        role=EngineRole.Hybrid,
+        models=['m'],
+        epd_transfer_backend=EPD_BACKEND_DLSLIME_RDMA,
+        encoder_output_receiver_endpoint_info=endpoint_info,
+    )
+
+    encoder_request = _build_epd_encoder_request(request_dict, 'http://language', language_status)
+
+    assert encoder_request['stream'] is False
+    assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_DLSLIME_RDMA
+    assert encoder_request['encoder_output_receiver_endpoint_info'] == endpoint_info
+    assert encoder_request['encoder_output_receiver_engine_id'] == 'http://language'
     assert encoder_request['epd_transfer_id'].startswith('epd-')

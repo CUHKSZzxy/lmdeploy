@@ -49,6 +49,7 @@ from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine
 from lmdeploy.serve.epd import compute_encoder_prompt_input_for_engine
 from lmdeploy.serve.epd_channel import (
+    EPD_BACKEND_DLSLIME_RDMA,
     EPD_BACKEND_HTTP_JSON,
     EPD_BACKEND_ZMQ_IPC,
     EPD_TRANSFER_BACKENDS,
@@ -58,6 +59,11 @@ from lmdeploy.serve.epd_channel import (
     stop_epd_receiver,
 )
 from lmdeploy.serve.epd_connector import EncoderTransferConfig, publish_encoder_prompt_input
+from lmdeploy.serve.epd_dlslime import (
+    DlslimeRdmaTransferManager,
+    get_dlslime_rdma_transfer_manager,
+    set_dlslime_rdma_transfer_manager,
+)
 from lmdeploy.serve.openai.protocol import (
     AbortRequest,
     ChatCompletionRequest,
@@ -1290,12 +1296,17 @@ async def startup_event():
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
         encoder_output_receiver_address = None if getattr(engine_config, 'role', None) == EngineRole.Encoder \
             else VariableInterface.encoder_output_receiver_address
+        encoder_output_receiver_endpoint_info = None
+        if (VariableInterface.epd_transfer_backend == EPD_BACKEND_DLSLIME_RDMA
+                and getattr(engine_config, 'role', None) != EngineRole.Encoder):
+            encoder_output_receiver_endpoint_info = get_dlslime_rdma_transfer_manager().endpoint_info
         url = f'{VariableInterface.proxy_url}/nodes/add'
         status = {
             'models': get_model_list(),
             'role': engine_role,
             'epd_transfer_backend': VariableInterface.epd_transfer_backend,
             'encoder_output_receiver_address': encoder_output_receiver_address,
+            'encoder_output_receiver_endpoint_info': encoder_output_receiver_endpoint_info,
         }
         data = {'url': VariableInterface.api_server_url, 'status': status}
         headers = {'accept': 'application/json', 'Content-Type': 'application/json'}
@@ -1372,8 +1383,16 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
     async def lifespan_handler(app: FastAPI):
         task = None
         epd_receiver_started = False
+        dlslime_rdma_manager = None
         try:
             role = getattr(backend_config, 'role', None)
+            if VariableInterface.epd_transfer_backend == EPD_BACKEND_DLSLIME_RDMA:
+                dlslime_rdma_manager = DlslimeRdmaTransferManager(
+                    engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
+                    rank=getattr(backend_config, 'dp_rank', 0) or 0,
+                )
+                set_dlslime_rdma_transfer_manager(dlslime_rdma_manager)
+
             if (VariableInterface.epd_transfer_backend == EPD_BACKEND_ZMQ_IPC
                     and role != EngineRole.Encoder):
                 await start_epd_receiver(VariableInterface.encoder_output_receiver_address)
@@ -1401,6 +1420,9 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
                 task.cancel()
             if epd_receiver_started:
                 await stop_epd_receiver()
+            if dlslime_rdma_manager is not None:
+                dlslime_rdma_manager.close()
+                set_dlslime_rdma_transfer_manager(None)
             close_epd_senders()
             await metrics_processor.stop_metrics_handler()
 

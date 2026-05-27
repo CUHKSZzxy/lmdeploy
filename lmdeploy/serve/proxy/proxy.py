@@ -54,6 +54,7 @@ class Status(BaseModel):
     speed: int | None = Field(default=None, examples=[None])
     epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
     encoder_output_receiver_address: str | None = None
+    encoder_output_receiver_endpoint_info: dict | None = None
 
 
 class Node(BaseModel):
@@ -501,12 +502,14 @@ def _build_epd_language_request(request_dict: dict, encoder_result: dict | Encod
     return request_dict
 
 
-def _build_epd_encoder_request(request_dict: dict, language_status: Status) -> dict:
+def _build_epd_encoder_request(request_dict: dict, language_url: str, language_status: Status) -> dict:
     request_dict = copy.deepcopy(request_dict)
     request_dict['stream'] = False
     transfer_config = build_encoder_transfer_config(
         backend=language_status.epd_transfer_backend,
         receiver_address=language_status.encoder_output_receiver_address,
+        receiver_endpoint_info=language_status.encoder_output_receiver_endpoint_info,
+        receiver_engine_id=language_url,
     )
     request_dict.update(transfer_config.to_request_fields())
     return request_dict
@@ -731,7 +734,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             if request_dict.get('encoder_result') is None:
                 language_status = node_manager.nodes[node_url]
                 try:
-                    encoder_request = _build_epd_encoder_request(request_dict, language_status)
+                    encoder_request = _build_epd_encoder_request(request_dict, node_url, language_status)
                 except ValueError as exc:
                     return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
                 logger.info(f'An Encoder request is dispatched to {encoder_url}')

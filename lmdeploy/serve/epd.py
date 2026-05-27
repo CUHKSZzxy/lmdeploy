@@ -165,7 +165,7 @@ def compute_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dict:
         if end - start != embedding.shape[0]:
             raise ValueError(f'encoder embedding range [{start}, {end}) does not match embedding rows '
                              f'{embedding.shape[0]}')
-        embedding = embedding.to(device=embed_device, dtype=embed_dtype).detach().float().cpu().numpy()
+        embedding = embedding.to(device=embed_device, dtype=embed_dtype).detach().contiguous()
         input_embeddings.append(InputEmbeddings(embedding, start=start, end=end))
         input_embedding_ranges.append([start, end])
 

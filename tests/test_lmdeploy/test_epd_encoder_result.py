@@ -1,4 +1,5 @@
 import asyncio
+import ctypes
 
 import numpy as np
 import pytest
@@ -20,6 +21,10 @@ from lmdeploy.serve.epd_connector import (
     get_encoder_transfer_connector,
     prompt_input_to_encoder_cache_ref,
     publish_encoder_prompt_input,
+)
+from lmdeploy.serve.epd_dlslime import (
+    DlslimeRdmaTransferManager,
+    set_dlslime_rdma_transfer_manager,
 )
 from lmdeploy.serve.epd import (
     compute_encoder_prompt_input,
@@ -126,19 +131,26 @@ def test_encoder_transfer_config_defaults_and_validates_receiver_backend():
         build_encoder_transfer_config(EPD_BACKEND_ZMQ_IPC)
 
 
-def test_dlslime_rdma_transfer_config_generates_transfer_id_and_fails_fast():
-    config = build_encoder_transfer_config(EPD_BACKEND_DLSLIME_RDMA)
+def test_dlslime_rdma_transfer_config_generates_transfer_id_and_requires_manager():
+    endpoint_info = {'io_info': {'data_channel_info': []}}
+    config = build_encoder_transfer_config(EPD_BACKEND_DLSLIME_RDMA,
+                                           receiver_endpoint_info=endpoint_info,
+                                           receiver_engine_id='http://language')
 
     assert config.backend == EPD_BACKEND_DLSLIME_RDMA
     assert config.transfer_id.startswith('epd-')
     assert config.receiver_address is None
+    assert config.receiver_endpoint_info == endpoint_info
     assert config.to_request_fields() == {
         'encoder_transfer_backend': EPD_BACKEND_DLSLIME_RDMA,
         'epd_transfer_id': config.transfer_id,
+        'encoder_output_receiver_endpoint_info': endpoint_info,
+        'encoder_output_receiver_engine_id': 'http://language',
     }
 
     connector = get_encoder_transfer_connector(EPD_BACKEND_DLSLIME_RDMA)
-    with pytest.raises(ValueError, match='registered RDMA transfer buffers'):
+    set_dlslime_rdma_transfer_manager(None)
+    with pytest.raises(ValueError, match='not initialized'):
         asyncio.run(
             connector.publish(
                 {},
@@ -146,6 +158,102 @@ def test_dlslime_rdma_transfer_config_generates_transfer_id_and_fails_fast():
                 remote_session_id=5,
                 transfer_config=config,
             ))
+
+
+class _FakeDlslimeFuture:
+
+    def wait(self):
+        return None
+
+
+class _FakeDlslimeEndpoint:
+
+    def __init__(self, name: str):
+        self.name = name
+        self.connected = []
+        self._local_regions = {}
+        self._remote_regions = {}
+        self._mr_info = {}
+
+    def endpoint_info(self):
+        return {'name': self.name}
+
+    def mr_info(self):
+        return self._mr_info
+
+    def connect(self, endpoint_info):
+        self.connected.append(endpoint_info)
+
+    def register_memory_region(self, name, data_ptr, offset, length):
+        handle = len(self._local_regions)
+        self._local_regions[handle] = {
+            'addr': int(data_ptr) + int(offset),
+            'length': int(length),
+        }
+        self._mr_info[name] = {
+            'addr': int(data_ptr) + int(offset),
+            'handle': handle,
+            'length': int(length),
+            'rkey': handle,
+        }
+        return handle
+
+    def register_remote_memory_region(self, name, mr_info):
+        handle = 1000 + len(self._remote_regions)
+        self._remote_regions[handle] = {
+            'addr': int(mr_info['addr']),
+            'length': int(mr_info['length']),
+        }
+        return handle
+
+    def read(self, assignments):
+        for local_handle, remote_handle, target_offset, source_offset, length in assignments:
+            local = self._local_regions[local_handle]
+            remote = self._remote_regions[remote_handle]
+            assert int(target_offset) + int(length) <= local['length']
+            assert int(source_offset) + int(length) <= remote['length']
+            ctypes.memmove(
+                local['addr'] + int(target_offset),
+                remote['addr'] + int(source_offset),
+                int(length),
+            )
+        return _FakeDlslimeFuture()
+
+    def shutdown(self):
+        return None
+
+
+def test_dlslime_rdma_transfer_manager_round_trip_with_fake_endpoint():
+    source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    prompt_input = {
+        'input_ids': [10, 11, 12, 13],
+        'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
+    }
+    producer = DlslimeRdmaTransferManager('encoder', endpoint=_FakeDlslimeEndpoint('encoder'), device='cpu')
+    consumer = DlslimeRdmaTransferManager('language', endpoint=_FakeDlslimeEndpoint('language'), device='cpu')
+
+    ref = asyncio.run(
+        producer.publish(
+            prompt_input,
+            remote_engine_id='http://encoder',
+            remote_session_id=5,
+            transfer_id='epd-test',
+            receiver_endpoint_info=consumer.endpoint_info,
+            receiver_engine_id='http://language',
+        ))
+    prompt_input = asyncio.run(consumer.receive(ref))
+
+    assert ref.backend == EPD_BACKEND_DLSLIME_RDMA
+    assert ref.protocol is MigrationProtocol.RDMA
+    assert ref.input_embeddings is None
+    assert ref.input_embedding_ranges == [[1, 3]]
+    assert ref.shape == [[2, 2]]
+    assert prompt_input['input_ids'] == [10, 11, 12, 13]
+    assert len(prompt_input['input_embeddings']) == 1
+    received = prompt_input['input_embeddings'][0]
+    assert received.start == 1
+    assert received.end == 3
+    torch.testing.assert_close(received.embeddings, source)
 
 
 def test_http_json_connector_publishes_encoder_cache_ref():

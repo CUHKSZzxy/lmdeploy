@@ -11,6 +11,7 @@ import numpy as np
 
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderHttpJsonEmbedding, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
+from lmdeploy.serve.epd_dlslime import get_dlslime_rdma_transfer_manager
 from lmdeploy.serve.epd_channel import (
     EPD_BACKEND_DLSLIME_RDMA,
     EPD_BACKEND_HTTP_JSON,
@@ -30,6 +31,8 @@ class EncoderTransferConfig:
     backend: str = EPD_BACKEND_HTTP_JSON
     transfer_id: str | None = None
     receiver_address: str | None = None
+    receiver_endpoint_info: dict | None = None
+    receiver_engine_id: str | None = None
 
     def __post_init__(self):
         if self.backend not in EPD_TRANSFER_BACKENDS:
@@ -39,8 +42,11 @@ class EncoderTransferConfig:
                 raise ValueError('EPD encoder-output transfer requires transfer_id')
             if not self.receiver_address:
                 raise ValueError('EPD encoder-output transfer requires receiver_address')
-        elif self.backend == EPD_BACKEND_DLSLIME_RDMA and not self.transfer_id:
-            raise ValueError('EPD DLSlime RDMA transfer requires transfer_id')
+        elif self.backend == EPD_BACKEND_DLSLIME_RDMA:
+            if not self.transfer_id:
+                raise ValueError('EPD DLSlime RDMA transfer requires transfer_id')
+            if not self.receiver_endpoint_info:
+                raise ValueError('EPD DLSlime RDMA transfer requires receiver_endpoint_info')
 
     @classmethod
     def from_request(cls, request_dict: dict, default_backend: str = EPD_BACKEND_HTTP_JSON) -> 'EncoderTransferConfig':
@@ -49,6 +55,8 @@ class EncoderTransferConfig:
             backend=request_dict.get('encoder_transfer_backend') or default_backend or EPD_BACKEND_HTTP_JSON,
             transfer_id=request_dict.get('epd_transfer_id'),
             receiver_address=request_dict.get('encoder_output_receiver_address'),
+            receiver_endpoint_info=request_dict.get('encoder_output_receiver_endpoint_info'),
+            receiver_engine_id=request_dict.get('encoder_output_receiver_engine_id'),
         )
 
     def to_request_fields(self) -> dict:
@@ -58,11 +66,17 @@ class EncoderTransferConfig:
             fields['epd_transfer_id'] = self.transfer_id
         if self.receiver_address:
             fields['encoder_output_receiver_address'] = self.receiver_address
+        if self.receiver_endpoint_info:
+            fields['encoder_output_receiver_endpoint_info'] = self.receiver_endpoint_info
+        if self.receiver_engine_id:
+            fields['encoder_output_receiver_engine_id'] = self.receiver_engine_id
         return fields
 
 
 def build_encoder_transfer_config(backend: str | None,
                                   receiver_address: str | None = None,
+                                  receiver_endpoint_info: dict | None = None,
+                                  receiver_engine_id: str | None = None,
                                   transfer_id: str | None = None) -> EncoderTransferConfig:
     """Create a validated encoder transfer config for a proxy-to-encoder request."""
     backend = backend or EPD_BACKEND_HTTP_JSON
@@ -74,8 +88,13 @@ def build_encoder_transfer_config(backend: str | None,
         transfer_id = transfer_id or f'epd-{uuid.uuid4().hex}'
         return EncoderTransferConfig(backend=backend, transfer_id=transfer_id, receiver_address=receiver_address)
     if backend == EPD_BACKEND_DLSLIME_RDMA:
+        if not receiver_endpoint_info:
+            raise ValueError('language node does not advertise encoder-output receiver_endpoint_info')
         transfer_id = transfer_id or f'epd-{uuid.uuid4().hex}'
-        return EncoderTransferConfig(backend=backend, transfer_id=transfer_id)
+        return EncoderTransferConfig(backend=backend,
+                                     transfer_id=transfer_id,
+                                     receiver_endpoint_info=receiver_endpoint_info,
+                                     receiver_engine_id=receiver_engine_id)
     return EncoderTransferConfig(backend=backend)
 
 
@@ -154,21 +173,23 @@ class ZmqIpcEncoderTransferConnector(EncoderTransferConnector):
 
 
 class DlslimeRdmaEncoderTransferConnector(EncoderTransferConnector):
-    """DLSlime/RDMA transfer backend placeholder.
-
-    Real RDMA transfer needs registered source/destination transfer buffers and
-    endpoint-info handshake. Keep this backend explicit so it cannot silently
-    fall back to HTTP JSON while that data plane is being wired.
-    """
+    """Transfer encoder embeddings through DLSlime RDMA."""
 
     backend = EPD_BACKEND_DLSLIME_RDMA
 
     async def publish(self, prompt_input: dict, remote_engine_id: str, remote_session_id: int,
                       transfer_config: EncoderTransferConfig) -> EncoderCacheRef:
-        raise ValueError('dlslime_rdma EPD transfer requires registered RDMA transfer buffers.')
+        manager = get_dlslime_rdma_transfer_manager()
+        return await manager.publish(prompt_input,
+                                     remote_engine_id,
+                                     remote_session_id,
+                                     transfer_config.transfer_id,
+                                     receiver_endpoint_info=transfer_config.receiver_endpoint_info,
+                                     receiver_engine_id=transfer_config.receiver_engine_id)
 
     async def receive(self, encoder_result: EncoderCacheRef) -> dict:
-        raise ValueError('dlslime_rdma EPD transfer requires registered RDMA transfer buffers.')
+        manager = get_dlslime_rdma_transfer_manager()
+        return await manager.receive(encoder_result)
 
 
 _CONNECTORS: dict[str, EncoderTransferConnector] = {
