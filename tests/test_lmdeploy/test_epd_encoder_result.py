@@ -12,11 +12,12 @@ from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
-from lmdeploy.serve.epd_channel import EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
+from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.epd_connector import (
     EncoderTransferConfig,
     build_encoder_transfer_config,
     encoder_cache_ref_to_prompt_input,
+    get_encoder_transfer_connector,
     prompt_input_to_encoder_cache_ref,
     publish_encoder_prompt_input,
 )
@@ -123,6 +124,28 @@ def test_encoder_transfer_config_defaults_and_validates_receiver_backend():
 
     with pytest.raises(ValueError, match='receiver address'):
         build_encoder_transfer_config(EPD_BACKEND_ZMQ_IPC)
+
+
+def test_dlslime_rdma_transfer_config_generates_transfer_id_and_fails_fast():
+    config = build_encoder_transfer_config(EPD_BACKEND_DLSLIME_RDMA)
+
+    assert config.backend == EPD_BACKEND_DLSLIME_RDMA
+    assert config.transfer_id.startswith('epd-')
+    assert config.receiver_address is None
+    assert config.to_request_fields() == {
+        'encoder_transfer_backend': EPD_BACKEND_DLSLIME_RDMA,
+        'epd_transfer_id': config.transfer_id,
+    }
+
+    connector = get_encoder_transfer_connector(EPD_BACKEND_DLSLIME_RDMA)
+    with pytest.raises(ValueError, match='registered RDMA transfer buffers'):
+        asyncio.run(
+            connector.publish(
+                {},
+                remote_engine_id='http://encoder',
+                remote_session_id=5,
+                transfer_config=config,
+            ))
 
 
 def test_http_json_connector_publishes_encoder_cache_ref():

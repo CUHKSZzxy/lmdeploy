@@ -691,7 +691,7 @@ class ArgumentHelper:
         return parser.add_argument('--encoder-transfer-backend',
                                    type=str,
                                    default='http_json',
-                                   choices=['http_json', 'zmq_ipc'],
+                                   choices=['http_json', 'zmq_ipc', 'dlslime_rdma'],
                                    help='encoder embedding transfer backend for EPD')
 
     @staticmethod
