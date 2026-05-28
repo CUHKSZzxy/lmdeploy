@@ -47,14 +47,14 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine
-from lmdeploy.serve.epd import compute_encoder_prompt_input_for_engine
-from lmdeploy.serve.epd_channel import (
+from lmdeploy.pytorch.disagg.epd.engine import compute_encoder_prompt_input_for_engine
+from lmdeploy.pytorch.disagg.epd.channel import (
     EPD_BACKEND_DLSLIME_RDMA,
     EPD_BACKEND_HTTP_JSON,
     EPD_TRANSFER_BACKENDS,
 )
-from lmdeploy.serve.epd_connector import EncoderTransferConfig, publish_encoder_output
-from lmdeploy.serve.epd_dlslime import (
+from lmdeploy.pytorch.disagg.epd.connector import EncoderTransferConfig, publish_encoder_output
+from lmdeploy.pytorch.disagg.epd.dlslime import (
     DlslimeRdmaTransferManager,
     get_dlslime_rdma_transfer_manager,
     set_dlslime_rdma_transfer_manager,

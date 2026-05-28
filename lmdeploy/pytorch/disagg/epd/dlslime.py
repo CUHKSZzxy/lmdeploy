@@ -13,8 +13,9 @@ import torch
 
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
-from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA
 from lmdeploy.utils import get_logger
+
+from .channel import EPD_BACKEND_DLSLIME_RDMA
 
 logger = get_logger('lmdeploy')
 

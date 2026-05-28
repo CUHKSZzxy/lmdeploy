@@ -1,6 +1,6 @@
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
-from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA
+from lmdeploy.pytorch.disagg.epd.channel import EPD_BACKEND_DLSLIME_RDMA
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,

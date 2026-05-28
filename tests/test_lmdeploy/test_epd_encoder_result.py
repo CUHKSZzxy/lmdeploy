@@ -18,8 +18,8 @@ from lmdeploy.pytorch.models.patch import build_model_context
 from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
-from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON
-from lmdeploy.serve.epd_connector import (
+from lmdeploy.pytorch.disagg.epd.channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON
+from lmdeploy.pytorch.disagg.epd.connector import (
     EncoderTransferConfig,
     build_encoder_transfer_config,
     encoder_cache_ref_to_prompt_input,
@@ -27,11 +27,11 @@ from lmdeploy.serve.epd_connector import (
     prompt_input_to_encoder_cache_ref,
     publish_encoder_output,
 )
-from lmdeploy.serve.epd_dlslime import (
+from lmdeploy.pytorch.disagg.epd.dlslime import (
     DlslimeRdmaTransferManager,
     set_dlslime_rdma_transfer_manager,
 )
-from lmdeploy.serve.epd import (
+from lmdeploy.pytorch.disagg.epd.engine import (
     compute_encoder_prompt_input_for_engine,
 )
 from lmdeploy.vl.constants import Modality

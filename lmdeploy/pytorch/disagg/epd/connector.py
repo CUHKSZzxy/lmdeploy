@@ -11,13 +11,14 @@ import numpy as np
 
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderHttpJsonEmbedding, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
-from lmdeploy.serve.epd_dlslime import get_dlslime_rdma_transfer_manager
-from lmdeploy.serve.epd_channel import (
+
+from .channel import (
     EPD_BACKEND_DLSLIME_RDMA,
     EPD_BACKEND_HTTP_JSON,
     EPD_TRANSFER_BACKENDS,
     EncoderTransferEmbedding,
 )
+from .dlslime import get_dlslime_rdma_transfer_manager
 
 
 @dataclass(frozen=True)

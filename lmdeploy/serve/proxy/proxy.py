@@ -25,8 +25,8 @@ from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMA
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
-from lmdeploy.serve.epd_channel import EPD_BACKEND_HTTP_JSON
-from lmdeploy.serve.epd_connector import build_encoder_transfer_config
+from lmdeploy.pytorch.disagg.epd.channel import EPD_BACKEND_HTTP_JSON
+from lmdeploy.pytorch.disagg.epd.connector import build_encoder_transfer_config
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
     ChatCompletionRequest,
