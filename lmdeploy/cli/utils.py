@@ -702,12 +702,13 @@ class ArgumentHelper:
                                    help='address where this language node receives EPD encoder outputs')
 
     @staticmethod
-    def disable_vision_encoder(parser):
-        """Disable loading vision encoder."""
-        return parser.add_argument('--disable-vision-encoder',
+    def language_only(parser):
+        """Disable loading multimodal encoder."""
+        return parser.add_argument('--language-only',
+                                   dest='disable_vision_encoder',
                                    action='store_true',
                                    default=False,
-                                   help='disable multimodal encoder')
+                                   help='load only the language path and disable the multimodal encoder')
 
     @staticmethod
     def logprobs_mode(parser):

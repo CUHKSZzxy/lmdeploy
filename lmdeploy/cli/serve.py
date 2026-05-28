@@ -99,7 +99,7 @@ class SubCliServe:
         ArgumentHelper.adapters(pt_group)
         ArgumentHelper.device(pt_group)
         ArgumentHelper.eager_mode(pt_group)
-        ArgumentHelper.disable_vision_encoder(pt_group)
+        ArgumentHelper.language_only(pt_group)
         ArgumentHelper.logprobs_mode(pt_group)
         ArgumentHelper.dllm_block_length(pt_group)
         ArgumentHelper.dllm_unmasking_strategy(pt_group)

@@ -114,7 +114,7 @@ pd_args=(
     --server-port "$PREFILL_DECODE_PORT"
     --proxy-url "http://${SERVER_NAME}:${PROXY_PORT}"
     --role Hybrid
-    --disable-vision-encoder
+    --language-only
     --encoder-transfer-backend "$ENCODER_TRANSFER_BACKEND"
 )
 if [[ "$ENCODER_TRANSFER_BACKEND" == "zmq_ipc" ]]; then
