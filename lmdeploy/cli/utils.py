@@ -710,6 +710,14 @@ class ArgumentHelper:
                                    help='load only the language path and disable the multimodal encoder')
 
     @staticmethod
+    def encoder_only(parser):
+        """Disable loading language model."""
+        return parser.add_argument('--encoder-only',
+                                   action='store_true',
+                                   default=False,
+                                   help='load only the multimodal encoder path and disable the language model')
+
+    @staticmethod
     def logprobs_mode(parser):
         """The mode of logprobs."""
         return parser.add_argument('--logprobs-mode',

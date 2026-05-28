@@ -24,9 +24,11 @@ from .qwen3_5 import (
     Qwen3_5Model,
     Qwen3_5TextModel,
     Qwen3_5TextRotaryEmbedding,
+    _should_skip_qwen3_5_weight,
 )
 from .qwen3_5 import Qwen3_5VisionModel as Qwen3_5MoeVisionModel
 from .qwen3_vl import Qwen3VLInputProcessor as Qwen3_5MoeInputProcessor
+from .utils.model import build_language_model
 
 
 class Qwen3_5MoeTopKRouter(nn.Module):
@@ -223,15 +225,19 @@ class Qwen3_5MoeModel(Qwen3_5Model):
                  device: torch.device | None = None,
                  prefix: str = ''):
         nn.Module.__init__(self)
+        bm_ctx = get_build_model_context()
+        self.encoder_only = bm_ctx.encoder_only
+        self.language_only = bm_ctx.language_only
 
         self.visual = Qwen3_5MoeVisionModel(config.vision_config,
                                             dtype=dtype,
                                             device=device,
                                             prefix=add_prefix('visual', prefix))
-        self.language_model = Qwen3_5MoeTextModel(config.text_config,
-                                                  dtype=dtype,
-                                                  device=device,
-                                                  prefix=add_prefix('language_model', prefix))
+        self.language_model = build_language_model(Qwen3_5MoeTextModel,
+                                                   config.text_config,
+                                                   dtype=dtype,
+                                                   device=device,
+                                                   prefix=add_prefix('language_model', prefix))
 
         # build time series model
         if hasattr(config, 'ts_config'):
@@ -261,6 +267,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         nn.Module.__init__(self)
         self.config = config
         self.ctx_mgr = ctx_mgr
+        bm_ctx = get_build_model_context()
+        self.encoder_only = bm_ctx.encoder_only
+        self.language_only = bm_ctx.language_only
 
         # build preprocessor
         self.input_processor = Qwen3_5MoeInputProcessor(self.config, dtype)
@@ -268,15 +277,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # build model
         self.model = Qwen3_5MoeModel(config, dtype=dtype, device=device, prefix=add_prefix('model', prefix))
         # build lm_head
-        self.lm_head = self.build_lm_head(config.text_config.hidden_size,
-                                          config.text_config.vocab_size,
-                                          bias=False,
-                                          dtype=dtype,
-                                          device=device)
+        if self.encoder_only:
+            self.lm_head = None
+        else:
+            self.lm_head = self.build_lm_head(config.text_config.hidden_size,
+                                              config.text_config.vocab_size,
+                                              bias=False,
+                                              dtype=dtype,
+                                              device=device)
         # for router replay
-        bm_ctx = get_build_model_context()
         self.enable_return_routed_experts = bm_ctx.enable_return_routed_experts
-        self.is_spec_decoding = get_build_model_context().num_spec_tokens > 0
+        self.is_spec_decoding = bm_ctx.num_spec_tokens > 0
 
     def _load_weight_experts(self, name: str, loaded_weight: torch.Tensor, params_dict: dict[str, nn.Parameter]):
         """Load weight experts."""
@@ -357,6 +368,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         params_dict = dict(self.named_parameters())
         buffers_dict = dict(self.named_buffers())
         for name, loaded_weight in weights:
+
+            if _should_skip_qwen3_5_weight(name, self.encoder_only, self.language_only):
+                continue
 
             if __skip_layers(name):
                 continue

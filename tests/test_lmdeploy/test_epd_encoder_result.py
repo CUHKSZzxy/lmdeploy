@@ -6,12 +6,16 @@ import pytest
 import torch
 from torch import nn
 
-from lmdeploy.messages import GenerationConfig, ResponseType
+from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderHttpJsonEmbedding, MigrationProtocol
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
 from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
+from lmdeploy.pytorch.model_inputs import BuildModelContext
 from lmdeploy.pytorch.messages import InputEmbeddings
+from lmdeploy.pytorch.models.patch import build_model_context
+from lmdeploy.pytorch.models.qwen3_5 import _should_skip_qwen3_5_weight
+from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
 from lmdeploy.serve.epd_connector import (
@@ -119,6 +123,33 @@ def test_prompt_input_converts_to_http_json_encoder_cache_ref():
     assert ref.input_embeddings[0].start == 1
     assert ref.input_embeddings[0].end == 3
     assert ref.input_embeddings[0].data == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_engine_config_rejects_language_only_with_encoder_only():
+    with pytest.raises(ValueError, match='language_only and encoder_only'):
+        PytorchEngineConfig(language_only=True, encoder_only=True)
+
+
+def test_build_language_model_skips_module_in_encoder_only_context():
+
+    class _TinyLanguageModel(nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(1, 1)
+
+    with build_model_context(BuildModelContext(encoder_only=True)):
+        model = build_language_model(_TinyLanguageModel)
+
+    assert isinstance(model, nn.Identity)
+    assert model._is_dummy_mod
+
+
+def test_qwen35_weight_filter_matches_role_specific_paths():
+    assert _should_skip_qwen3_5_weight('model.language_model.layers.0.self_attn.q_proj.weight', True, False)
+    assert not _should_skip_qwen3_5_weight('model.visual.blocks.0.attn.q_proj.weight', True, False)
+    assert _should_skip_qwen3_5_weight('model.visual.blocks.0.attn.q_proj.weight', False, True)
+    assert not _should_skip_qwen3_5_weight('model.language_model.layers.0.self_attn.q_proj.weight', False, True)
 
 
 def test_encoder_transfer_config_defaults_and_validates_receiver_backend():
@@ -351,8 +382,9 @@ class _FakeVisual(nn.Module):
 
 class _FakeQwen35Model(nn.Module):
 
-    def __init__(self, deepstack_visual_indexes=None, nested_visual=False):
+    def __init__(self, deepstack_visual_indexes=None, nested_visual=False, encoder_only=False):
         super().__init__()
+        self.encoder_only = encoder_only
         vision_config = type('VisionConfig', (), {
             'deepstack_visual_indexes': deepstack_visual_indexes or [],
         })()
@@ -363,6 +395,8 @@ class _FakeQwen35Model(nn.Module):
         self.embed_tokens = nn.Embedding(128, 2)
 
     def get_input_embeddings(self):
+        if self.encoder_only:
+            raise RuntimeError('encoder-only fake model does not load token embeddings')
         return self.embed_tokens
 
     def get_input_processor(self):
@@ -424,6 +458,25 @@ def test_compute_encoder_prompt_input_finds_nested_visual_module():
 
     computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(nested_visual=True))
 
+    np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
+                               np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
+
+
+def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_embeddings():
+    prompt_input = {
+        'input_ids': [1, 99, 99, 2],
+        'multimodal': [{
+            'modality': Modality.IMAGE,
+            'pixel_values': torch.ones((2, 1)),
+            'image_grid_thw': torch.tensor([1, 1, 2]),
+            'offset': (1, 3),
+            'image_token_id': 99,
+        }],
+    }
+
+    computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(encoder_only=True))
+
+    assert computed['input_embedding_ranges'] == [[1, 3]]
     np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 

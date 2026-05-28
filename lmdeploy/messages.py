@@ -386,6 +386,8 @@ class PytorchEngineConfig:
             It can be used to override the default config of the model,
         language_only: Whether to load only the language path and skip
             multimodal encoder modules. Default to False.
+        encoder_only: Whether to load only the multimodal encoder path and skip
+            language model modules. Default to False.
         logprobs_mode: The mode of logprob, options: ['raw_logits', 'raw_logprobs']
         dllm_block_length: Block size of block diffusion model.
         dllm_unmasking_strategy: Dllm unmasking strategy, options:
@@ -430,6 +432,7 @@ class PytorchEngineConfig:
     enable_metrics: bool = True
     hf_overrides: dict[str, Any] | None = None
     language_only: bool = False
+    encoder_only: bool = False
     logprobs_mode: str = None
     # router replay
     enable_return_routed_experts: bool = False
@@ -477,6 +480,8 @@ class PytorchEngineConfig:
             self.kernel_block_size = 16
             logger.warning('Currently, camb device requires block_size and kernel_block_size to be 16, '
                            'setting both to 16.')
+        if self.language_only and self.encoder_only:
+            raise ValueError('language_only and encoder_only cannot both be enabled.')
 
 
 class ResponseType(enum.Enum):

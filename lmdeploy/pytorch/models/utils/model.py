@@ -129,7 +129,7 @@ class DeployModelMixinV1(DeployModelMixin):
 
     def update_weights(self):
         """Update weights."""
-        if getattr(self.config, 'tie_word_embeddings', False):
+        if getattr(self.config, 'tie_word_embeddings', False) and self.lm_head is not None:
             self.lm_head.weight = self.get_input_embeddings().weight
 
     def build_lm_head(self,
@@ -171,6 +171,12 @@ class DeployModelMixinV1(DeployModelMixin):
 
         return multimodal_mask
 
+def _build_dummy_module():
+    mod = torch.nn.Identity()
+    mod._is_dummy_mod = True
+    return mod
+
+
 def vlm_model(vlm_cls):
     if not issubclass(vlm_cls, torch.nn.Module):
         raise ValueError('Only subclasses of nn.Module can be decorated with @vlm_model.')
@@ -180,13 +186,19 @@ def vlm_model(vlm_cls):
         bm_ctx = get_build_model_context()
         language_only = bm_ctx.language_only
         if language_only:
-            mod = torch.nn.Identity()
-            mod._is_dummy_mod = True
-            return mod
+            return _build_dummy_module()
         else:
             return vlm_cls(*args, **kwargs)
 
     return wrapper
+
+
+def build_language_model(model_cls, *args, **kwargs):
+    """Build language model unless the current build context is encoder-only."""
+    bm_ctx = get_build_model_context()
+    if bm_ctx.encoder_only:
+        return _build_dummy_module()
+    return model_cls(*args, **kwargs)
 
 
 def build_embedding(vocab_size: int,

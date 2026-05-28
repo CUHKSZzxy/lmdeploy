@@ -84,6 +84,8 @@ def _reject_deepstack_model(model):
 
 
 def _module_device_and_dtype(module, fallback_device=None, fallback_dtype=None):
+    if module is None:
+        return fallback_device or torch.device('cpu'), fallback_dtype or torch.float32
     parameter = next(module.parameters(), None)
     device = getattr(parameter, 'device', fallback_device)
     dtype = getattr(parameter, 'dtype', fallback_dtype)
@@ -131,9 +133,18 @@ def compute_encoder_prompt_input(prompt_input: dict, model_or_engine) -> dict:
     if any(not _is_visual_modality(mm_input) for mm_input in mm_inputs):
         raise ValueError('EPD encoder embedding computation currently supports image/video visual inputs only.')
 
-    embedding_layer = model.get_input_embeddings()
+    try:
+        embedding_layer = model.get_input_embeddings()
+    except RuntimeError:
+        if not getattr(model, 'encoder_only', False):
+            raise
+        embedding_layer = None
     embed_device, embed_dtype = _module_device_and_dtype(embedding_layer)
-    visual_device, _ = _module_device_and_dtype(visual, fallback_device=embed_device, fallback_dtype=embed_dtype)
+    visual_device, visual_dtype = _module_device_and_dtype(visual,
+                                                           fallback_device=embed_device,
+                                                           fallback_dtype=embed_dtype)
+    if embedding_layer is None:
+        embed_device, embed_dtype = visual_device, visual_dtype
     pixel_values = torch.cat([mm_input.data for mm_input in mm_inputs]).to(device=visual_device, dtype=embed_dtype)
     grid_thw = torch.stack([torch.as_tensor(mm_input.meta['grid_thw'], dtype=torch.long) for mm_input in mm_inputs])
 

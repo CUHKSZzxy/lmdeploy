@@ -33,7 +33,21 @@ from .qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding as Qwen3_5VisionRotaryEmbe
 from .qwen2_5_vl import Qwen2_5_VLVisionAttention as Qwen3_5VisionAttention
 from .qwen3_vl import Qwen3VLInputProcessor as Qwen3_5InputProcessor
 from .utils.cudagraph import CudaGraphMixin
-from .utils.model import DeployModelMixinV1, vlm_model
+from .utils.model import DeployModelMixinV1, build_language_model, vlm_model
+
+
+def _is_qwen3_5_visual_weight(name: str) -> bool:
+    """Return whether a checkpoint tensor belongs to the visual encoder."""
+    return name.startswith('visual.') or name.startswith('model.visual.') or '.visual.' in name
+
+
+def _should_skip_qwen3_5_weight(name: str, encoder_only: bool, language_only: bool) -> bool:
+    is_visual_weight = _is_qwen3_5_visual_weight(name)
+    if encoder_only:
+        return not is_visual_weight
+    if language_only:
+        return is_visual_weight
+    return False
 
 
 class Qwen3_5VisionPatchEmbed(nn.Module):
@@ -1000,15 +1014,19 @@ class Qwen3_5Model(nn.Module):
                  device: torch.device | None = None,
                  prefix: str = ''):
         super().__init__()
+        bm_ctx = get_build_model_context()
+        self.encoder_only = bm_ctx.encoder_only
+        self.language_only = bm_ctx.language_only
 
         self.visual = Qwen3_5VisionModel(config.vision_config,
                                          dtype=dtype,
                                          device=device,
                                          prefix=add_prefix('visual', prefix))
-        self.language_model = Qwen3_5TextModel(config.text_config,
-                                               dtype=dtype,
-                                               device=device,
-                                               prefix=add_prefix('language_model', prefix))
+        self.language_model = build_language_model(Qwen3_5TextModel,
+                                                   config.text_config,
+                                                   dtype=dtype,
+                                                   device=device,
+                                                   prefix=add_prefix('language_model', prefix))
 
     def forward(
         self,
@@ -1033,6 +1051,8 @@ class Qwen3_5Model(nn.Module):
         ts_sr: torch.Tensor = None,
     ):
         """Model forward, return logits."""
+        if self.encoder_only:
+            raise RuntimeError('Qwen3.5 encoder-only model cannot run language forward.')
 
         output_inputs_embeds = None
         if inputs_embeds is None:
@@ -1079,6 +1099,8 @@ class Qwen3_5Model(nn.Module):
 
     def get_input_embeddings(self):
         """Get input embeddings."""
+        if self.encoder_only:
+            raise RuntimeError('Qwen3.5 encoder-only model does not load token embeddings.')
         return self.language_model.get_input_embeddings()
 
 
@@ -1106,6 +1128,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
         super().__init__()
         self.config = config
         self.ctx_mgr = ctx_mgr
+        bm_ctx = get_build_model_context()
+        self.encoder_only = bm_ctx.encoder_only
+        self.language_only = bm_ctx.language_only
 
         # build preprocessor
         self.input_processor = Qwen3_5InputProcessor(self.config, dtype)
@@ -1113,14 +1138,17 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
         # build model
         self.model = Qwen3_5Model(config, dtype=dtype, device=device, prefix=add_prefix('model', prefix))
         # build lm_head
-        self.lm_head = self.build_lm_head(config.text_config.hidden_size,
-                                          config.text_config.vocab_size,
-                                          bias=False,
-                                          dtype=dtype,
-                                          device=device)
+        if self.encoder_only:
+            self.lm_head = None
+        else:
+            self.lm_head = self.build_lm_head(config.text_config.hidden_size,
+                                              config.text_config.vocab_size,
+                                              bias=False,
+                                              dtype=dtype,
+                                              device=device)
         # dense model
         self.enable_return_routed_experts = False
-        self.is_spec_decoding = get_build_model_context().num_spec_tokens > 0
+        self.is_spec_decoding = bm_ctx.num_spec_tokens > 0
 
 
     def forward(
@@ -1146,6 +1174,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
         **kwargs,
     ):
         """Model forward, return logits."""
+        if self.encoder_only:
+            raise RuntimeError('Qwen3.5 encoder-only model cannot run language forward.')
         all_routed_experts = None
         if self.enable_return_routed_experts:
             config = self.config.text_config
@@ -1180,6 +1210,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
 
     def get_input_embeddings(self):
         """Get input embeddings."""
+        if self.encoder_only:
+            raise RuntimeError('Qwen3.5 encoder-only model does not load token embeddings.')
         return self.model.get_input_embeddings()
 
     def prepare_inputs_for_generation(
@@ -1189,6 +1221,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
         context: StepContext | None = None,
     ):
         """Prepare input."""
+        if self.encoder_only:
+            raise RuntimeError('Qwen3.5 encoder-only model cannot prepare language inputs.')
         # get input_ids, position_ids and attention metadatas
         input_ids = context.input_ids
         position_ids = context.position_ids
@@ -1305,6 +1339,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+
+            if _should_skip_qwen3_5_weight(name, self.encoder_only, self.language_only):
+                continue
 
             if __skip_layers(name):
                 continue
