@@ -18,9 +18,10 @@ from lmdeploy.pytorch.models.patch import build_model_context
 from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
-from lmdeploy.pytorch.disagg.epd.channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON
 from lmdeploy.pytorch.disagg.epd.connector import (
     EncoderTransferConfig,
+    EPD_BACKEND_DLSLIME,
+    EPD_BACKEND_HTTP_JSON,
     build_encoder_transfer_config,
     encoder_cache_ref_to_prompt_input,
     get_encoder_transfer_connector,
@@ -28,8 +29,8 @@ from lmdeploy.pytorch.disagg.epd.connector import (
     publish_encoder_output,
 )
 from lmdeploy.pytorch.disagg.epd.dlslime import (
-    DlslimeRdmaTransferManager,
-    set_dlslime_rdma_transfer_manager,
+    DLSlimeEncoderTransferManager,
+    set_dlslime_encoder_transfer_manager,
 )
 from lmdeploy.pytorch.disagg.epd.engine import (
     compute_encoder_prompt_input_for_engine,
@@ -145,34 +146,24 @@ def test_build_language_model_skips_module_in_encoder_only_context():
     assert model._is_dummy_mod
 
 
-def test_encoder_transfer_config_defaults_and_rejects_removed_zmq_backend():
-    config = EncoderTransferConfig.from_request({'encoder_transfer_backend': None})
-
-    assert config.backend == EPD_BACKEND_HTTP_JSON
-    assert config.to_request_fields() == {'encoder_transfer_backend': EPD_BACKEND_HTTP_JSON}
-
-    with pytest.raises(ValueError, match='unsupported EPD encoder transfer backend'):
-        build_encoder_transfer_config('zmq_ipc')
-
-
-def test_dlslime_rdma_transfer_config_generates_transfer_id_and_requires_manager():
+def test_dlslime_encoder_transfer_config_generates_transfer_id_and_requires_manager():
     endpoint_info = {'io_info': {'data_channel_info': []}}
-    config = build_encoder_transfer_config(EPD_BACKEND_DLSLIME_RDMA,
+    config = build_encoder_transfer_config(EPD_BACKEND_DLSLIME,
                                            receiver_endpoint_info=endpoint_info,
                                            receiver_engine_id='http://language')
 
-    assert config.backend == EPD_BACKEND_DLSLIME_RDMA
+    assert config.backend == EPD_BACKEND_DLSLIME
     assert config.transfer_id.startswith('epd-')
     assert config.receiver_endpoint_info == endpoint_info
     assert config.to_request_fields() == {
-        'encoder_transfer_backend': EPD_BACKEND_DLSLIME_RDMA,
+        'encoder_transfer_backend': EPD_BACKEND_DLSLIME,
         'epd_transfer_id': config.transfer_id,
         'encoder_output_receiver_endpoint_info': endpoint_info,
         'encoder_output_receiver_engine_id': 'http://language',
     }
 
-    connector = get_encoder_transfer_connector(EPD_BACKEND_DLSLIME_RDMA)
-    set_dlslime_rdma_transfer_manager(None)
+    connector = get_encoder_transfer_connector(EPD_BACKEND_DLSLIME)
+    set_dlslime_encoder_transfer_manager(None)
     with pytest.raises(ValueError, match='not initialized'):
         asyncio.run(
             connector.publish(
@@ -183,13 +174,13 @@ def test_dlslime_rdma_transfer_config_generates_transfer_id_and_requires_manager
             ))
 
 
-class _FakeDlslimeFuture:
+class _FakeDLSlimeFuture:
 
     def wait(self):
         return None
 
 
-class _FakeDlslimeEndpoint:
+class _FakeDLSlimeEndpoint:
 
     def __init__(self, name: str):
         self.name = name
@@ -240,20 +231,20 @@ class _FakeDlslimeEndpoint:
                 remote['addr'] + int(source_offset),
                 int(length),
             )
-        return _FakeDlslimeFuture()
+        return _FakeDLSlimeFuture()
 
     def shutdown(self):
         return None
 
 
-def test_dlslime_rdma_transfer_manager_round_trip_with_fake_endpoint():
+def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
     }
-    producer = DlslimeRdmaTransferManager('encoder', endpoint=_FakeDlslimeEndpoint('encoder'), device='cpu')
-    consumer = DlslimeRdmaTransferManager('language', endpoint=_FakeDlslimeEndpoint('language'), device='cpu')
+    producer = DLSlimeEncoderTransferManager('encoder', endpoint=_FakeDLSlimeEndpoint('encoder'), device='cpu')
+    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
 
     ref = asyncio.run(
         producer.publish(
@@ -266,7 +257,7 @@ def test_dlslime_rdma_transfer_manager_round_trip_with_fake_endpoint():
         ))
     prompt_input = asyncio.run(consumer.receive(ref))
 
-    assert ref.backend == EPD_BACKEND_DLSLIME_RDMA
+    assert ref.backend == EPD_BACKEND_DLSLIME
     assert ref.protocol is MigrationProtocol.RDMA
     assert ref.input_embeddings is None
     assert ref.input_embedding_ranges == [[1, 3]]

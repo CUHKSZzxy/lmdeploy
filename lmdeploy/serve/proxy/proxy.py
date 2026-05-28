@@ -24,9 +24,8 @@ from pydantic import BaseModel, Field
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
+from lmdeploy.pytorch.disagg.epd.connector import EPD_DEFAULT_TRANSFER_BACKEND, build_encoder_transfer_config
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
-from lmdeploy.pytorch.disagg.epd.channel import EPD_BACKEND_HTTP_JSON
-from lmdeploy.pytorch.disagg.epd.connector import build_encoder_transfer_config
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
     ChatCompletionRequest,
@@ -52,7 +51,7 @@ class Status(BaseModel):
     unfinished: int = 0
     latency: deque = Field(default=deque(maxlen=LATENCY_DEQUE_LEN), examples=[[]])
     speed: int | None = Field(default=None, examples=[None])
-    epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
+    epd_transfer_backend: str = EPD_DEFAULT_TRANSFER_BACKEND
     encoder_output_receiver_endpoint_info: dict | None = None
 
 

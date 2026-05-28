@@ -1,6 +1,6 @@
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
-from lmdeploy.pytorch.disagg.epd.channel import EPD_BACKEND_DLSLIME_RDMA
+from lmdeploy.pytorch.disagg.epd.connector import EPD_BACKEND_DLSLIME
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,
@@ -78,14 +78,14 @@ def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
     language_status = Status(
         role=EngineRole.Hybrid,
         models=['m'],
-        epd_transfer_backend=EPD_BACKEND_DLSLIME_RDMA,
+        epd_transfer_backend=EPD_BACKEND_DLSLIME,
         encoder_output_receiver_endpoint_info=endpoint_info,
     )
 
     encoder_request = _build_epd_encoder_request(request_dict, 'http://language', language_status)
 
     assert encoder_request['stream'] is False
-    assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_DLSLIME_RDMA
+    assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_DLSLIME
     assert encoder_request['encoder_output_receiver_endpoint_info'] == endpoint_info
     assert encoder_request['encoder_output_receiver_engine_id'] == 'http://language'
     assert encoder_request['epd_transfer_id'].startswith('epd-')

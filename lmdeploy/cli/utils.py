@@ -690,8 +690,8 @@ class ArgumentHelper:
     def encoder_transfer_backend(parser):
         return parser.add_argument('--encoder-transfer-backend',
                                    type=str,
-                                   default='http_json',
-                                   choices=['http_json', 'dlslime_rdma'],
+                                   default='dlslime',
+                                   choices=['http_json', 'dlslime'],
                                    help='encoder embedding transfer backend for EPD')
 
     @staticmethod

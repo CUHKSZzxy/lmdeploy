@@ -15,23 +15,13 @@ from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProt
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.utils import get_logger
 
-from .channel import EPD_BACKEND_DLSLIME_RDMA
+from .connector import EPD_BACKEND_DLSLIME
 
 logger = get_logger('lmdeploy')
 
 _DLSLIME_EXTRA_ENDPOINT_INFO = 'dlslime_endpoint_info'
 _DLSLIME_EXTRA_MR_INFO = 'dlslime_mr_info'
 _DLSLIME_EXTRA_NBYTES = 'dlslime_nbytes'
-
-_TORCH_DTYPES = {
-    'float32': torch.float32,
-    'torch.float32': torch.float32,
-    'float16': torch.float16,
-    'torch.float16': torch.float16,
-    'bfloat16': torch.bfloat16,
-    'torch.bfloat16': torch.bfloat16,
-}
-
 
 @dataclass
 class _EmbeddingLayout:
@@ -59,12 +49,6 @@ def _embedding_range(embedding, ranges, index: int) -> list[int]:
 def _dtype_name(dtype: torch.dtype) -> str:
     name = str(dtype)
     return name.split('.', 1)[1] if name.startswith('torch.') else name
-
-
-def _torch_dtype(dtype: str | None) -> torch.dtype:
-    if dtype not in _TORCH_DTYPES:
-        raise ValueError(f'unsupported DLSlime RDMA encoder embedding dtype: {dtype}')
-    return _TORCH_DTYPES[dtype]
 
 
 def _jsonable(value: Any):
@@ -134,7 +118,7 @@ async def _wait_dlslime_future(future):
     return wait()
 
 
-class DlslimeRdmaTransferManager:
+class DLSlimeEncoderTransferManager:
     """Owns one process-local DLSlime endpoint for encoder-output transfer."""
 
     def __init__(self,
@@ -201,7 +185,7 @@ class DlslimeRdmaTransferManager:
             token_ids=_to_int_list(prompt_input.get('input_ids') or []),
             input_embedding_ranges=layout.ranges,
             protocol=MigrationProtocol.RDMA,
-            backend=EPD_BACKEND_DLSLIME_RDMA,
+            backend=EPD_BACKEND_DLSLIME,
             transfer_id=transfer_id,
             remote_engine_id=remote_engine_id,
             remote_session_id=remote_session_id,
@@ -227,7 +211,8 @@ class DlslimeRdmaTransferManager:
         shapes = encoder_result.shape or []
         if not isinstance(shapes, list) or len(shapes) == 0 or not isinstance(shapes[0], list):
             raise ValueError('DLSlime RDMA encoder_result requires per-embedding shapes.')
-        dtype = _torch_dtype(encoder_result.dtype)
+        assert encoder_result.dtype is not None
+        dtype = getattr(torch, encoder_result.dtype)
         total_rows = sum(int(shape[0]) for shape in shapes)
         hidden_size = int(shapes[0][1])
         output = torch.empty((total_rows, hidden_size), dtype=dtype, device=self.device)
@@ -258,15 +243,15 @@ class DlslimeRdmaTransferManager:
         self._received_tensors.clear()
 
 
-_DLSLIME_RDMA_MANAGER: DlslimeRdmaTransferManager | None = None
+_DLSLIME_ENCODER_TRANSFER_MANAGER: DLSlimeEncoderTransferManager | None = None
 
 
-def set_dlslime_rdma_transfer_manager(manager: DlslimeRdmaTransferManager | None):
-    global _DLSLIME_RDMA_MANAGER
-    _DLSLIME_RDMA_MANAGER = manager
+def set_dlslime_encoder_transfer_manager(manager: DLSlimeEncoderTransferManager | None):
+    global _DLSLIME_ENCODER_TRANSFER_MANAGER
+    _DLSLIME_ENCODER_TRANSFER_MANAGER = manager
 
 
-def get_dlslime_rdma_transfer_manager() -> DlslimeRdmaTransferManager:
-    if _DLSLIME_RDMA_MANAGER is None:
-        raise ValueError('dlslime_rdma EPD transfer manager is not initialized.')
-    return _DLSLIME_RDMA_MANAGER
+def get_dlslime_encoder_transfer_manager() -> DLSlimeEncoderTransferManager:
+    if _DLSLIME_ENCODER_TRANSFER_MANAGER is None:
+        raise ValueError('dlslime EPD transfer manager is not initialized.')
+    return _DLSLIME_ENCODER_TRANSFER_MANAGER
