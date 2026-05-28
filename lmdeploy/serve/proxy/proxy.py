@@ -53,7 +53,6 @@ class Status(BaseModel):
     latency: deque = Field(default=deque(maxlen=LATENCY_DEQUE_LEN), examples=[[]])
     speed: int | None = Field(default=None, examples=[None])
     epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
-    encoder_output_receiver_address: str | None = None
     encoder_output_receiver_endpoint_info: dict | None = None
 
 
@@ -507,7 +506,6 @@ def _build_epd_encoder_request(request_dict: dict, language_url: str, language_s
     request_dict['stream'] = False
     transfer_config = build_encoder_transfer_config(
         backend=language_status.epd_transfer_backend,
-        receiver_address=language_status.encoder_output_receiver_address,
         receiver_endpoint_info=language_status.encoder_output_receiver_endpoint_info,
         receiver_engine_id=language_url,
     )

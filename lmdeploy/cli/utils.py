@@ -691,15 +691,8 @@ class ArgumentHelper:
         return parser.add_argument('--encoder-transfer-backend',
                                    type=str,
                                    default='http_json',
-                                   choices=['http_json', 'zmq_ipc', 'dlslime_rdma'],
+                                   choices=['http_json', 'dlslime_rdma'],
                                    help='encoder embedding transfer backend for EPD')
-
-    @staticmethod
-    def encoder_output_receiver_address(parser):
-        return parser.add_argument('--encoder-output-receiver-address',
-                                   type=str,
-                                   default=None,
-                                   help='address where this language node receives EPD encoder outputs')
 
     @staticmethod
     def language_only(parser):

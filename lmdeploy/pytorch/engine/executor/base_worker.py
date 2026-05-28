@@ -136,10 +136,7 @@ class WorkerWrapperBase:
 
     def compute_encoder_prompt_input(self, prompt_input: dict):
         """Compute EPD encoder embeddings in the worker-owned model."""
-        from lmdeploy.serve.epd import compute_encoder_prompt_input
-
-        with self.model_agent.all_context():
-            return compute_encoder_prompt_input(prompt_input, self.model_agent.patched_model)
+        return self.model_agent.compute_encoder_prompt_input(prompt_input)
 
     def start(self):
         """Start engine loop."""

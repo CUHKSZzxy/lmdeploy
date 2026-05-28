@@ -20,8 +20,7 @@ GPU_PD="${GPU_PD:-1}"
 TP_E="${TP_E:-1}"
 TP_PD="${TP_PD:-1}"
 
-ENCODER_TRANSFER_BACKEND="${ENCODER_TRANSFER_BACKEND:-zmq_ipc}"
-ENCODER_OUTPUT_RECEIVER_ADDRESS="${ENCODER_OUTPUT_RECEIVER_ADDRESS:-ipc:///tmp/lmdeploy_epd_${PREFILL_DECODE_PORT}.sock}"
+ENCODER_TRANSFER_BACKEND="${ENCODER_TRANSFER_BACKEND:-dlslime_rdma}"
 
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-8}"
 SESSION_LEN="${SESSION_LEN:-32768}"
@@ -118,9 +117,6 @@ pd_args=(
     --language-only
     --encoder-transfer-backend "$ENCODER_TRANSFER_BACKEND"
 )
-if [[ "$ENCODER_TRANSFER_BACKEND" == "zmq_ipc" ]]; then
-    pd_args+=(--encoder-output-receiver-address "$ENCODER_OUTPUT_RECEIVER_ADDRESS")
-fi
 
 CUDA_VISIBLE_DEVICES="$GPU_PD" "${pd_args[@]}" >"$PD_LOG" 2>&1 &
 PIDS+=("$!")

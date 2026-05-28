@@ -51,14 +51,9 @@ from lmdeploy.serve.epd import compute_encoder_prompt_input_for_engine
 from lmdeploy.serve.epd_channel import (
     EPD_BACKEND_DLSLIME_RDMA,
     EPD_BACKEND_HTTP_JSON,
-    EPD_BACKEND_ZMQ_IPC,
     EPD_TRANSFER_BACKENDS,
-    close_epd_senders,
-    default_encoder_output_receiver_address,
-    start_epd_receiver,
-    stop_epd_receiver,
 )
-from lmdeploy.serve.epd_connector import EncoderTransferConfig, publish_encoder_prompt_input
+from lmdeploy.serve.epd_connector import EncoderTransferConfig, publish_encoder_output
 from lmdeploy.serve.epd_dlslime import (
     DlslimeRdmaTransferManager,
     get_dlslime_rdma_transfer_manager,
@@ -116,7 +111,6 @@ class VariableInterface:
     proxy_url: str | None = None
     api_server_url: str | None = None
     epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON
-    encoder_output_receiver_address: str | None = None
     allow_terminate_by_client: bool = False
     enable_abort_handling: bool = False
     response_parser_cls: type[ResponseParser] | None = None
@@ -317,7 +311,7 @@ async def _create_epd_encoder_response(request: ChatCompletionRequest, raw_reque
             mm_processor_kwargs=request.mm_processor_kwargs)
         prompt_input = await compute_encoder_prompt_input_for_engine(prompt_input, VariableInterface.async_engine)
         session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
-        encoder_result = await publish_encoder_prompt_input(
+        encoder_result = await publish_encoder_output(
             prompt_input,
             remote_engine_id=VariableInterface.api_server_url or 'local',
             remote_session_id=session_id,
@@ -1294,8 +1288,6 @@ async def startup_event():
         import requests
         engine_config = VariableInterface.async_engine.backend_config
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
-        encoder_output_receiver_address = None if getattr(engine_config, 'role', None) == EngineRole.Encoder \
-            else VariableInterface.encoder_output_receiver_address
         encoder_output_receiver_endpoint_info = None
         if (VariableInterface.epd_transfer_backend == EPD_BACKEND_DLSLIME_RDMA
                 and getattr(engine_config, 'role', None) != EngineRole.Encoder):
@@ -1305,7 +1297,6 @@ async def startup_event():
             'models': get_model_list(),
             'role': engine_role,
             'epd_transfer_backend': VariableInterface.epd_transfer_backend,
-            'encoder_output_receiver_address': encoder_output_receiver_address,
             'encoder_output_receiver_endpoint_info': encoder_output_receiver_endpoint_info,
         }
         data = {'url': VariableInterface.api_server_url, 'status': status}
@@ -1382,21 +1373,14 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
     @asynccontextmanager
     async def lifespan_handler(app: FastAPI):
         task = None
-        epd_receiver_started = False
         dlslime_rdma_manager = None
         try:
-            role = getattr(backend_config, 'role', None)
             if VariableInterface.epd_transfer_backend == EPD_BACKEND_DLSLIME_RDMA:
                 dlslime_rdma_manager = DlslimeRdmaTransferManager(
                     engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
                     rank=getattr(backend_config, 'dp_rank', 0) or 0,
                 )
                 set_dlslime_rdma_transfer_manager(dlslime_rdma_manager)
-
-            if (VariableInterface.epd_transfer_backend == EPD_BACKEND_ZMQ_IPC
-                    and role != EngineRole.Encoder):
-                await start_epd_receiver(VariableInterface.encoder_output_receiver_address)
-                epd_receiver_started = True
 
             if getattr(backend_config, 'enable_metrics', False):
                 metrics_processor.start_metrics_handler(enable_metrics=True)
@@ -1418,12 +1402,9 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
         finally:
             if task:
                 task.cancel()
-            if epd_receiver_started:
-                await stop_epd_receiver()
             if dlslime_rdma_manager is not None:
                 dlslime_rdma_manager.close()
                 set_dlslime_rdma_transfer_manager(None)
-            close_epd_senders()
             await metrics_processor.stop_metrics_handler()
 
     return lifespan_handler
@@ -1453,7 +1434,6 @@ def serve(model_path: str,
           allow_terminate_by_client: bool = False,
           enable_abort_handling: bool = False,
           epd_transfer_backend: str = EPD_BACKEND_HTTP_JSON,
-          encoder_output_receiver_address: str | None = None,
           speculative_config: SpeculativeConfig | None = None,
           **kwargs):
     """An example to perform model inference through the command line
@@ -1517,7 +1497,6 @@ def serve(model_path: str,
     if epd_transfer_backend not in EPD_TRANSFER_BACKENDS:
         raise ValueError(f'unsupported EPD encoder transfer backend: {epd_transfer_backend}')
     VariableInterface.epd_transfer_backend = epd_transfer_backend
-    VariableInterface.encoder_output_receiver_address = encoder_output_receiver_address
 
     ssl_keyfile, ssl_certfile, http_or_https = None, None, 'http'
     if ssl:
@@ -1580,8 +1559,6 @@ def serve(model_path: str,
     if proxy_url is not None:
         VariableInterface.proxy_url = proxy_url
         VariableInterface.api_server_url = f'{http_or_https}://{server_name}:{server_port}'  # noqa
-    if VariableInterface.epd_transfer_backend == EPD_BACKEND_ZMQ_IPC and VariableInterface.encoder_output_receiver_address is None:
-        VariableInterface.encoder_output_receiver_address = default_encoder_output_receiver_address(server_port)
     for i in range(3):
         print(f'HINT:    Please open \033[93m\033[1m{http_or_https}://'
               f'{server_name}:{server_port}\033[0m in a browser for detailed api'

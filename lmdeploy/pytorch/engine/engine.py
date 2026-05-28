@@ -605,15 +605,10 @@ class Engine(EngineBase):
 
     async def compute_encoder_prompt_input(self, prompt_input: dict):
         """Compute EPD encoder embeddings through the executor."""
-        compute_fn = getattr(self.executor, 'compute_encoder_prompt_input', None)
-        if callable(compute_fn):
-            computed = compute_fn(prompt_input)
-            if inspect.isawaitable(computed):
-                computed = await computed
-            return computed
-
-        from lmdeploy.serve.epd import compute_encoder_prompt_input
-        return compute_encoder_prompt_input(prompt_input, self)
+        computed = self.executor.compute_encoder_prompt_input(prompt_input)
+        if inspect.isawaitable(computed):
+            computed = await computed
+        return computed
 
     def get_engine_config(self):
         return self.engine_config

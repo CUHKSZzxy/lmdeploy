@@ -14,6 +14,7 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 import lmdeploy.pytorch.nn.gated_delta as gated_delta_util
 from lmdeploy.pytorch.distributed import get_tp_world_rank
 from lmdeploy.pytorch.engine.input_process import BaseModelInputProcessor
+from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.model_inputs import StepContext, StepContextManager
 from lmdeploy.pytorch.nn import ApplyRotaryEmb, Attention, LayerNorm, RMSNorm, SiluAndMul
 from lmdeploy.pytorch.nn.gated_delta import CausalConv1d, GatedDelta, GatedDeltaMeta, build_rmsnorm_gated
@@ -1049,15 +1050,9 @@ class Qwen3_5Model(nn.Module):
                 pixel_values = pixel_values.to(dtype)
                 vis_pos_emb = (vis_pos_emb[0].to(dtype), vis_pos_emb[1].to(dtype))
 
-                # get image embeds and deepstack visual embeds
-                image_embeds = self.visual(pixel_values,
-                                           cu_seqlens=vis_cu_seqlens,
-                                           rotary_pos_emb=vis_pos_emb,
-                                           pos_embeds=pos_embeds)
-
-                # split image embeds per sample
-                split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-                image_embeds = torch.split(image_embeds, split_sizes)
+                # get image embeds
+                image_embeds = self.get_visual_embeddings(pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb,
+                                                          pos_embeds)
                 image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, dtype)
 
                 # mask and scatter to create final input embeddings
@@ -1088,6 +1083,15 @@ class Qwen3_5Model(nn.Module):
         if self.encoder_only:
             raise RuntimeError('Qwen3.5 encoder-only model does not load token embeddings.')
         return self.language_model.get_input_embeddings()
+
+    def get_visual_embeddings(self, pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb, pos_embeds):
+        """Run visual encoder and split embeddings per multimodal item."""
+        image_embeds = self.visual(pixel_values,
+                                   cu_seqlens=vis_cu_seqlens,
+                                   rotary_pos_emb=vis_pos_emb,
+                                   pos_embeds=pos_embeds)
+        split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        return torch.split(image_embeds, split_sizes)
 
 
 class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMixin):
@@ -1200,6 +1204,66 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
             raise RuntimeError('Qwen3.5 encoder-only model does not load token embeddings.')
         return self.model.get_input_embeddings()
 
+    def _prepare_visual_forward_inputs(self, mm_inputs: list, device: torch.device | None = None):
+        """Prepare the visual tensors shared by normal VLM forward and EPD encoder forward."""
+        visual = self.model.visual
+
+        pixel_values = torch.cat([inp.data for inp in mm_inputs])
+        if device is not None:
+            pixel_values = pixel_values.to(device=device)
+        grid_thw = torch.stack([torch.as_tensor(data.meta['grid_thw'], dtype=torch.long) for data in mm_inputs]).cpu()
+        vis_pos_emb = visual.rot_pos_emb(grid_thw)
+        pos_embeds = visual.fast_pos_embed_interpolate(grid_thw)
+        vis_cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
+                                                 grid_thw[:, 0]).to(pixel_values.device)
+        vis_cu_seqlens = vis_cu_seqlens.cumsum(dim=0, dtype=torch.int32)
+        vis_pos_emb = vis_pos_emb.repeat(1, 2)
+        vis_pos_emb = (vis_pos_emb.cos().to(pixel_values.device), vis_pos_emb.sin().to(pixel_values.device))
+
+        return pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb, pos_embeds
+
+    def _make_encoder_input_embeddings(self, mm_inputs: list):
+        """Compute encoder-side InputEmbeddings for already preprocessed multimodal inputs."""
+        device = next(self.model.visual.parameters()).device
+        visual_inputs = self._prepare_visual_forward_inputs(mm_inputs, device=device)
+        with torch.inference_mode():
+            split_embeddings = self.model.get_visual_embeddings(*visual_inputs)
+
+        input_embeddings = []
+        input_embedding_ranges = []
+        for embedding, mm_input in zip(split_embeddings, mm_inputs):
+            start, end = int(mm_input.start), int(mm_input.end)
+            embedding = embedding.detach().contiguous()
+            input_embeddings.append(InputEmbeddings(embedding, start=start, end=end))
+            input_embedding_ranges.append([start, end])
+        return input_embeddings, input_embedding_ranges
+
+    def compute_encoder_prompt_input(self, prompt_input: dict) -> dict:
+        """Compute EPD encoder embeddings through the model's normal multimodal processor."""
+        if prompt_input.get('input_embeddings') or not prompt_input.get('multimodal'):
+            return prompt_input
+        if self.language_only:
+            raise ValueError('Qwen3.5 language-only model cannot compute EPD encoder embeddings.')
+        vision_config = getattr(self.config, 'vision_config', None)
+        if getattr(vision_config, 'deepstack_visual_indexes', None):
+            raise ValueError('DeepStack visual embeddings are not supported by the first EPD encoder producer.')
+
+        input_ids = prompt_input['input_ids']
+        processed = self.input_processor.preprocess_input(input_ids, prompt_input['multimodal'])
+        input_ids = processed.input_ids
+        input_multimodals = processed.input_multimodals or {}
+        mm_inputs = input_multimodals.get('mm_data', [])
+        if not mm_inputs:
+            return dict(prompt_input, input_ids=input_ids)
+
+        input_embeddings, input_embedding_ranges = self._make_encoder_input_embeddings(mm_inputs)
+        prompt_input = dict(prompt_input)
+        prompt_input.pop('multimodal', None)
+        prompt_input['input_ids'] = input_ids
+        prompt_input['input_embeddings'] = input_embeddings
+        prompt_input['input_embedding_ranges'] = input_embedding_ranges
+        return prompt_input
+
     def prepare_inputs_for_generation(
         self,
         past_key_values: list[list[torch.Tensor]],
@@ -1250,15 +1314,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
                     ts_lens = torch.cat([inp.meta['ts_lens'] for inp in mm_inputs])
                     ts_sr = torch.cat([inp.meta['ts_sr'] for inp in mm_inputs])
                 else:
-                    pixel_values = torch.cat([inp.data for inp in mm_inputs])
-                    grid_thw = torch.stack([data.meta['grid_thw'] for data in mm_inputs]).cpu()
-                    vis_pos_emb = self.model.visual.rot_pos_emb(grid_thw)
-                    pos_embeds = self.model.visual.fast_pos_embed_interpolate(grid_thw)
-                    vis_cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
-                                                             grid_thw[:, 0]).to(pixel_values.device)
-                    vis_cu_seqlens = vis_cu_seqlens.cumsum(dim=0, dtype=torch.int32)
-                    vis_pos_emb = vis_pos_emb.repeat(1, 2)
-                    vis_pos_emb = (vis_pos_emb.cos(), vis_pos_emb.sin())
+                    pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb, pos_embeds = \
+                        self._prepare_visual_forward_inputs(mm_inputs)
 
         mrope_position_ids = getattr(context, 'mrope_position_ids', None)
 

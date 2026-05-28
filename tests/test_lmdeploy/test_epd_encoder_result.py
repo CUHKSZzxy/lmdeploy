@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import ctypes
 
 import numpy as np
@@ -14,23 +15,23 @@ from lmdeploy.pytorch.engine.request import RequestType, Response
 from lmdeploy.pytorch.model_inputs import BuildModelContext
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.models.patch import build_model_context
+from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
-from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
+from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON
 from lmdeploy.serve.epd_connector import (
     EncoderTransferConfig,
     build_encoder_transfer_config,
     encoder_cache_ref_to_prompt_input,
     get_encoder_transfer_connector,
     prompt_input_to_encoder_cache_ref,
-    publish_encoder_prompt_input,
+    publish_encoder_output,
 )
 from lmdeploy.serve.epd_dlslime import (
     DlslimeRdmaTransferManager,
     set_dlslime_rdma_transfer_manager,
 )
 from lmdeploy.serve.epd import (
-    compute_encoder_prompt_input,
     compute_encoder_prompt_input_for_engine,
 )
 from lmdeploy.vl.constants import Modality
@@ -144,14 +145,14 @@ def test_build_language_model_skips_module_in_encoder_only_context():
     assert model._is_dummy_mod
 
 
-def test_encoder_transfer_config_defaults_and_validates_receiver_backend():
+def test_encoder_transfer_config_defaults_and_rejects_removed_zmq_backend():
     config = EncoderTransferConfig.from_request({'encoder_transfer_backend': None})
 
     assert config.backend == EPD_BACKEND_HTTP_JSON
     assert config.to_request_fields() == {'encoder_transfer_backend': EPD_BACKEND_HTTP_JSON}
 
-    with pytest.raises(ValueError, match='receiver address'):
-        build_encoder_transfer_config(EPD_BACKEND_ZMQ_IPC)
+    with pytest.raises(ValueError, match='unsupported EPD encoder transfer backend'):
+        build_encoder_transfer_config('zmq_ipc')
 
 
 def test_dlslime_rdma_transfer_config_generates_transfer_id_and_requires_manager():
@@ -162,7 +163,6 @@ def test_dlslime_rdma_transfer_config_generates_transfer_id_and_requires_manager
 
     assert config.backend == EPD_BACKEND_DLSLIME_RDMA
     assert config.transfer_id.startswith('epd-')
-    assert config.receiver_address is None
     assert config.receiver_endpoint_info == endpoint_info
     assert config.to_request_fields() == {
         'encoder_transfer_backend': EPD_BACKEND_DLSLIME_RDMA,
@@ -287,7 +287,7 @@ def test_http_json_connector_publishes_encoder_cache_ref():
     }
 
     ref = asyncio.run(
-        publish_encoder_prompt_input(
+        publish_encoder_output(
             prompt_input,
             remote_engine_id='http://encoder',
             remote_session_id=5,
@@ -298,31 +298,6 @@ def test_http_json_connector_publishes_encoder_cache_ref():
     assert ref.remote_engine_id == 'http://encoder'
     assert ref.input_embeddings[0].start == 1
     assert ref.input_embeddings[0].data == [[1.0, 2.0], [3.0, 4.0]]
-
-
-def test_prompt_input_converts_to_zmq_encoder_cache_ref_without_http_json_data():
-    prompt_input = {
-        'input_ids': [10, 11, 12, 13],
-        'input_embeddings': [torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)],
-        'input_embedding_ranges': [[1, 3]],
-    }
-
-    ref = prompt_input_to_encoder_cache_ref(
-        prompt_input,
-        remote_engine_id='http://encoder',
-        remote_session_id=5,
-        protocol=MigrationProtocol.TCP,
-        backend=EPD_BACKEND_ZMQ_IPC,
-        transfer_id='epd-1',
-        receiver_address='ipc:///tmp/lmdeploy_epd_test.sock',
-    )
-
-    assert ref.backend == EPD_BACKEND_ZMQ_IPC
-    assert ref.transfer_id == 'epd-1'
-    assert ref.receiver_address == 'ipc:///tmp/lmdeploy_epd_test.sock'
-    assert ref.input_embedding_ranges == [[1, 3]]
-    assert ref.input_embeddings is None
-    assert ref.shape == [[2, 2]]
 
 
 def test_prompt_input_rejects_pixel_value_multimodal_without_embeddings():
@@ -362,6 +337,10 @@ class _FakeVisual(nn.Module):
 
     spatial_merge_size = 1
 
+    def __init__(self):
+        super().__init__()
+        self.dummy = nn.Parameter(torch.empty(0))
+
     def rot_pos_emb(self, grid_thw):
         return torch.zeros((int(grid_thw.prod().item()), 2), dtype=torch.float32)
 
@@ -372,17 +351,36 @@ class _FakeVisual(nn.Module):
         return torch.tensor([[10.0, 11.0], [12.0, 13.0]], dtype=torch.float32)
 
 
+class _FakeQwen35InnerModel(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.visual = _FakeVisual()
+
+    def get_visual_embeddings(self, pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb, pos_embeds):
+        image_embeds = self.visual(pixel_values,
+                                   cu_seqlens=vis_cu_seqlens,
+                                   rotary_pos_emb=vis_pos_emb,
+                                   pos_embeds=pos_embeds)
+        split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        return torch.split(image_embeds, split_sizes)
+
+
 class _FakeQwen35Model(nn.Module):
 
-    def __init__(self, deepstack_visual_indexes=None, nested_visual=False, encoder_only=False):
+    _prepare_visual_forward_inputs = Qwen3_5ForConditionalGeneration._prepare_visual_forward_inputs
+    _make_encoder_input_embeddings = Qwen3_5ForConditionalGeneration._make_encoder_input_embeddings
+    compute_encoder_prompt_input = Qwen3_5ForConditionalGeneration.compute_encoder_prompt_input
+
+    def __init__(self, deepstack_visual_indexes=None, encoder_only=False):
         super().__init__()
         self.encoder_only = encoder_only
+        self.language_only = False
         vision_config = type('VisionConfig', (), {
             'deepstack_visual_indexes': deepstack_visual_indexes or [],
         })()
         self.config = type('Config', (), {'vision_config': vision_config})()
-        visual_owner = type('InnerModel', (), {'visual': _FakeVisual()})()
-        self.model = type('OuterModel', (), {'model': visual_owner})() if nested_visual else visual_owner
+        self.model = _FakeQwen35InnerModel()
         self.input_processor = _FakeInputProcessor()
         self.embed_tokens = nn.Embedding(128, 2)
 
@@ -423,7 +421,7 @@ def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
         }],
     }
 
-    computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model())
+    computed = _FakeQwen35Model().compute_encoder_prompt_input(prompt_input)
 
     assert computed['input_ids'] == [1, 99, 99, 2]
     assert 'multimodal' not in computed
@@ -434,24 +432,6 @@ def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
     assert embedding.start == 1
     assert embedding.end == 3
     np.testing.assert_allclose(embedding.embeddings, np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
-
-
-def test_compute_encoder_prompt_input_finds_nested_visual_module():
-    prompt_input = {
-        'input_ids': [1, 99, 99, 2],
-        'multimodal': [{
-            'modality': Modality.IMAGE,
-            'pixel_values': torch.ones((2, 1)),
-            'image_grid_thw': torch.tensor([1, 1, 2]),
-            'offset': (1, 3),
-            'image_token_id': 99,
-        }],
-    }
-
-    computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(nested_visual=True))
-
-    np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
-                               np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
 def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_embeddings():
@@ -466,14 +446,16 @@ def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_em
         }],
     }
 
-    computed = compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(encoder_only=True))
+    computed = _FakeQwen35Model(encoder_only=True).compute_encoder_prompt_input(prompt_input)
 
     assert computed['input_embedding_ranges'] == [[1, 3]]
     np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
-def test_compute_encoder_prompt_input_unwraps_graph_runner_model():
+def test_model_agent_compute_encoder_prompt_input_unwraps_graph_runner_model():
+    from lmdeploy.pytorch.engine.model_agent.agent import BaseModelAgent
+
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -485,7 +467,11 @@ def test_compute_encoder_prompt_input_unwraps_graph_runner_model():
         }],
     }
 
-    computed = compute_encoder_prompt_input(prompt_input, _FakeGraphRunner(_FakeQwen35Model()))
+    agent = BaseModelAgent.__new__(BaseModelAgent)
+    agent.patched_model = _FakeGraphRunner(_FakeQwen35Model())
+    agent.all_context = lambda: contextlib.nullcontext()
+
+    computed = agent.compute_encoder_prompt_input(prompt_input)
 
     np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
@@ -596,7 +582,7 @@ def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
     prompt_input = {'input_ids': [1, 99], 'multimodal': [{'modality': Modality.IMAGE}]}
 
     with pytest.raises(ValueError, match='DeepStack'):
-        compute_encoder_prompt_input(prompt_input, _FakeQwen35Model(deepstack_visual_indexes=[5]))
+        _FakeQwen35Model(deepstack_visual_indexes=[5]).compute_encoder_prompt_input(prompt_input)
 
 
 def test_encoder_cache_ref_rejects_mismatched_http_json_embedding_range():

@@ -1067,6 +1067,15 @@ class BaseModelAgent:
         """Get input processor."""
         return self.patched_model.get_input_processor()
 
+    def compute_encoder_prompt_input(self, prompt_input: dict):
+        """Compute EPD encoder prompt input in the model context."""
+        with self.all_context():
+            model = self.patched_model
+            get_model = getattr(model, 'get_model', None)
+            if get_model is not None:
+                model = get_model()
+            return model.compute_encoder_prompt_input(prompt_input)
+
     def reset_graph_runner(self):
         """Reset graph runner to prevent tp hanging."""
         if hasattr(self.patched_model, 'reset'):

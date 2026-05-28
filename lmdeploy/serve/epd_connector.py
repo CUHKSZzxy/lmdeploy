@@ -15,12 +15,8 @@ from lmdeploy.serve.epd_dlslime import get_dlslime_rdma_transfer_manager
 from lmdeploy.serve.epd_channel import (
     EPD_BACKEND_DLSLIME_RDMA,
     EPD_BACKEND_HTTP_JSON,
-    EPD_BACKEND_ZMQ_IPC,
     EPD_TRANSFER_BACKENDS,
     EncoderTransferEmbedding,
-    EncoderTransferPayload,
-    recv_epd_payload,
-    send_epd_payload,
 )
 
 
@@ -30,19 +26,13 @@ class EncoderTransferConfig:
 
     backend: str = EPD_BACKEND_HTTP_JSON
     transfer_id: str | None = None
-    receiver_address: str | None = None
     receiver_endpoint_info: dict | None = None
     receiver_engine_id: str | None = None
 
     def __post_init__(self):
         if self.backend not in EPD_TRANSFER_BACKENDS:
             raise ValueError(f'unsupported EPD encoder transfer backend: {self.backend}')
-        if self.backend == EPD_BACKEND_ZMQ_IPC:
-            if not self.transfer_id:
-                raise ValueError('EPD encoder-output transfer requires transfer_id')
-            if not self.receiver_address:
-                raise ValueError('EPD encoder-output transfer requires receiver_address')
-        elif self.backend == EPD_BACKEND_DLSLIME_RDMA:
+        if self.backend == EPD_BACKEND_DLSLIME_RDMA:
             if not self.transfer_id:
                 raise ValueError('EPD DLSlime RDMA transfer requires transfer_id')
             if not self.receiver_endpoint_info:
@@ -54,7 +44,6 @@ class EncoderTransferConfig:
         return cls(
             backend=request_dict.get('encoder_transfer_backend') or default_backend or EPD_BACKEND_HTTP_JSON,
             transfer_id=request_dict.get('epd_transfer_id'),
-            receiver_address=request_dict.get('encoder_output_receiver_address'),
             receiver_endpoint_info=request_dict.get('encoder_output_receiver_endpoint_info'),
             receiver_engine_id=request_dict.get('encoder_output_receiver_engine_id'),
         )
@@ -64,8 +53,6 @@ class EncoderTransferConfig:
         fields = {'encoder_transfer_backend': self.backend}
         if self.transfer_id:
             fields['epd_transfer_id'] = self.transfer_id
-        if self.receiver_address:
-            fields['encoder_output_receiver_address'] = self.receiver_address
         if self.receiver_endpoint_info:
             fields['encoder_output_receiver_endpoint_info'] = self.receiver_endpoint_info
         if self.receiver_engine_id:
@@ -74,7 +61,6 @@ class EncoderTransferConfig:
 
 
 def build_encoder_transfer_config(backend: str | None,
-                                  receiver_address: str | None = None,
                                   receiver_endpoint_info: dict | None = None,
                                   receiver_engine_id: str | None = None,
                                   transfer_id: str | None = None) -> EncoderTransferConfig:
@@ -82,11 +68,6 @@ def build_encoder_transfer_config(backend: str | None,
     backend = backend or EPD_BACKEND_HTTP_JSON
     if backend not in EPD_TRANSFER_BACKENDS:
         raise ValueError(f'unsupported EPD encoder transfer backend: {backend}')
-    if backend == EPD_BACKEND_ZMQ_IPC:
-        if not receiver_address:
-            raise ValueError('language node does not advertise an encoder-output receiver address')
-        transfer_id = transfer_id or f'epd-{uuid.uuid4().hex}'
-        return EncoderTransferConfig(backend=backend, transfer_id=transfer_id, receiver_address=receiver_address)
     if backend == EPD_BACKEND_DLSLIME_RDMA:
         if not receiver_endpoint_info:
             raise ValueError('language node does not advertise encoder-output receiver_endpoint_info')
@@ -133,45 +114,6 @@ class HttpJsonEncoderTransferConnector(EncoderTransferConnector):
         return encoder_cache_ref_to_prompt_input(encoder_result)
 
 
-class ZmqIpcEncoderTransferConnector(EncoderTransferConnector):
-    """Transfer encoder embeddings through the process-global ZMQ IPC channel."""
-
-    backend = EPD_BACKEND_ZMQ_IPC
-
-    async def publish(self, prompt_input: dict, remote_engine_id: str, remote_session_id: int,
-                      transfer_config: EncoderTransferConfig) -> EncoderCacheRef:
-        await send_prompt_input_to_receiver(prompt_input, transfer_config.transfer_id, transfer_config.receiver_address)
-        return prompt_input_to_encoder_cache_ref(
-            prompt_input,
-            remote_engine_id=remote_engine_id,
-            remote_session_id=remote_session_id,
-            backend=self.backend,
-            transfer_id=transfer_config.transfer_id,
-            receiver_address=transfer_config.receiver_address,
-        )
-
-    async def receive(self, encoder_result: EncoderCacheRef) -> dict:
-        if not encoder_result.transfer_id:
-            raise ValueError('EPD encoder-output receiver requires transfer_id')
-
-        payload = await recv_epd_payload(encoder_result.transfer_id)
-        if payload.token_ids and payload.token_ids != list(encoder_result.token_ids):
-            raise ValueError('EPD encoder-output payload token_ids do not match encoder_result')
-
-        prompt_input = dict(prompt=None, input_ids=list(encoder_result.token_ids))
-        embeddings = []
-        for embedding in payload.embeddings:
-            expected_rows = embedding.end - embedding.start
-            if expected_rows != embedding.data.shape[0]:
-                raise ValueError(
-                    f'EPD encoder-output embedding range [{embedding.start}, {embedding.end}) '
-                    f'does not match embedding rows {embedding.data.shape[0]}')
-            embeddings.append(InputEmbeddings(embedding.data, start=embedding.start, end=embedding.end))
-        if embeddings:
-            prompt_input['input_embeddings'] = embeddings
-        return prompt_input
-
-
 class DlslimeRdmaEncoderTransferConnector(EncoderTransferConnector):
     """Transfer encoder embeddings through DLSlime RDMA."""
 
@@ -194,7 +136,6 @@ class DlslimeRdmaEncoderTransferConnector(EncoderTransferConnector):
 
 _CONNECTORS: dict[str, EncoderTransferConnector] = {
     EPD_BACKEND_HTTP_JSON: HttpJsonEncoderTransferConnector(),
-    EPD_BACKEND_ZMQ_IPC: ZmqIpcEncoderTransferConnector(),
     EPD_BACKEND_DLSLIME_RDMA: DlslimeRdmaEncoderTransferConnector(),
 }
 
@@ -207,14 +148,14 @@ def get_encoder_transfer_connector(backend: str) -> EncoderTransferConnector:
     return connector
 
 
-async def publish_encoder_prompt_input(prompt_input: dict, remote_engine_id: str, remote_session_id: int,
-                                       transfer_config: EncoderTransferConfig) -> EncoderCacheRef:
-    """Publish encoder prompt input through the configured backend."""
+async def publish_encoder_output(prompt_input: dict, remote_engine_id: str, remote_session_id: int,
+                                 transfer_config: EncoderTransferConfig) -> EncoderCacheRef:
+    """Publish computed encoder output through the configured backend."""
     connector = get_encoder_transfer_connector(transfer_config.backend)
     return await connector.publish(prompt_input, remote_engine_id, remote_session_id, transfer_config)
 
 
-async def encoder_cache_ref_to_prompt_input_async(encoder_result: EncoderCacheRef) -> dict:
+async def load_encoder_output_async(encoder_result: EncoderCacheRef) -> dict:
     """Convert an encoder cache ref into prompt input through its backend connector."""
     connector = get_encoder_transfer_connector(encoder_result.backend)
     return await connector.receive(encoder_result)
@@ -316,30 +257,12 @@ def encoder_cache_ref_to_prompt_input(encoder_result: EncoderCacheRef) -> dict:
     return prompt_input
 
 
-async def send_prompt_input_to_receiver(prompt_input: dict, transfer_id: str, receiver_address: str):
-    """Send computed encoder embeddings to the language node receiver."""
-    if not transfer_id:
-        raise ValueError('EPD encoder-output transfer requires transfer_id')
-    if not receiver_address:
-        raise ValueError('EPD encoder-output transfer requires receiver_address')
-    embeddings, _, _, _ = _embedding_payloads(prompt_input)
-    if not embeddings:
-        raise ValueError('EPD encoder-output transfer requires precomputed input_embeddings')
-    payload = EncoderTransferPayload(
-        transfer_id=transfer_id,
-        token_ids=_to_int_list(prompt_input.get('input_ids') or []),
-        embeddings=embeddings,
-    )
-    await send_epd_payload(receiver_address, payload)
-
-
 def prompt_input_to_encoder_cache_ref(prompt_input: dict,
                                       remote_engine_id: str,
                                       remote_session_id: int,
                                       protocol: MigrationProtocol = MigrationProtocol.TCP,
                                       backend: str = EPD_BACKEND_HTTP_JSON,
-                                      transfer_id: str | None = None,
-                                      receiver_address: str | None = None) -> EncoderCacheRef:
+                                      transfer_id: str | None = None) -> EncoderCacheRef:
     """Serialize prompt-side embeddings into an EPD encoder cache ref."""
     if backend not in EPD_TRANSFER_BACKENDS:
         raise ValueError(f'unsupported EPD encoder transfer backend: {backend}')
@@ -352,7 +275,6 @@ def prompt_input_to_encoder_cache_ref(prompt_input: dict,
                                protocol=protocol,
                                backend=backend,
                                transfer_id=transfer_id,
-                               receiver_address=receiver_address,
                                remote_engine_id=remote_engine_id,
                                remote_session_id=remote_session_id,
                                remote_block_ids=[])
@@ -375,7 +297,6 @@ def prompt_input_to_encoder_cache_ref(prompt_input: dict,
                            protocol=protocol,
                            backend=backend,
                            transfer_id=transfer_id,
-                           receiver_address=receiver_address,
                            remote_engine_id=remote_engine_id,
                            remote_session_id=remote_session_id,
                            remote_block_ids=[],
