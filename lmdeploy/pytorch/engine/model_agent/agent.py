@@ -374,6 +374,9 @@ class BaseModelAgent:
         from lmdeploy.pytorch.envs import skip_warmup
         if skip_warmup:
             return
+        if self.cache_config.role == EngineRole.Encoder:
+            logger.debug('Skip warmup for encoder engine.')
+            return
 
         with self.all_context(), torch.cuda.stream(self.stream):
             max_batches = self.cache_config.max_batches

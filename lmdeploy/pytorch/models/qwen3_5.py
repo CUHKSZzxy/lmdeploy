@@ -36,20 +36,6 @@ from .utils.cudagraph import CudaGraphMixin
 from .utils.model import DeployModelMixinV1, build_language_model, vlm_model
 
 
-def _is_qwen3_5_visual_weight(name: str) -> bool:
-    """Return whether a checkpoint tensor belongs to the visual encoder."""
-    return name.startswith('visual.') or name.startswith('model.visual.') or '.visual.' in name
-
-
-def _should_skip_qwen3_5_weight(name: str, encoder_only: bool, language_only: bool) -> bool:
-    is_visual_weight = _is_qwen3_5_visual_weight(name)
-    if encoder_only:
-        return not is_visual_weight
-    if language_only:
-        return is_visual_weight
-    return False
-
-
 class Qwen3_5VisionPatchEmbed(nn.Module):
 
     def __init__(self, config, dtype: torch.dtype | None = None, device: torch.device | None = None) -> None:
@@ -1313,6 +1299,14 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights."""
 
+        def _skip_weight_for_role(name):
+            is_visual_weight = name.startswith('visual.') or name.startswith('model.visual.') or '.visual.' in name
+            if self.encoder_only:
+                return not is_visual_weight
+            if self.language_only:
+                return is_visual_weight
+            return False
+
         def __skip_layers(name):
             """We might change the number of layers so we can debug the model
             with less gpus."""
@@ -1340,7 +1334,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
 
-            if _should_skip_qwen3_5_weight(name, self.encoder_only, self.language_only):
+            if _skip_weight_for_role(name):
                 continue
 
             if __skip_layers(name):

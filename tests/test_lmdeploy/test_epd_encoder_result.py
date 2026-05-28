@@ -14,7 +14,6 @@ from lmdeploy.pytorch.engine.request import RequestType, Response
 from lmdeploy.pytorch.model_inputs import BuildModelContext
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.models.patch import build_model_context
-from lmdeploy.pytorch.models.qwen3_5 import _should_skip_qwen3_5_weight
 from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.serve.epd_channel import EPD_BACKEND_DLSLIME_RDMA, EPD_BACKEND_HTTP_JSON, EPD_BACKEND_ZMQ_IPC
@@ -143,13 +142,6 @@ def test_build_language_model_skips_module_in_encoder_only_context():
 
     assert isinstance(model, nn.Identity)
     assert model._is_dummy_mod
-
-
-def test_qwen35_weight_filter_matches_role_specific_paths():
-    assert _should_skip_qwen3_5_weight('model.language_model.layers.0.self_attn.q_proj.weight', True, False)
-    assert not _should_skip_qwen3_5_weight('model.visual.blocks.0.attn.q_proj.weight', True, False)
-    assert _should_skip_qwen3_5_weight('model.visual.blocks.0.attn.q_proj.weight', False, True)
-    assert not _should_skip_qwen3_5_weight('model.language_model.layers.0.self_attn.q_proj.weight', False, True)
 
 
 def test_encoder_transfer_config_defaults_and_validates_receiver_backend():

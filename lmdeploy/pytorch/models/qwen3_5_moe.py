@@ -24,7 +24,6 @@ from .qwen3_5 import (
     Qwen3_5Model,
     Qwen3_5TextModel,
     Qwen3_5TextRotaryEmbedding,
-    _should_skip_qwen3_5_weight,
 )
 from .qwen3_5 import Qwen3_5VisionModel as Qwen3_5MoeVisionModel
 from .qwen3_vl import Qwen3VLInputProcessor as Qwen3_5MoeInputProcessor
@@ -341,6 +340,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights."""
 
+        def _skip_weight_for_role(name):
+            is_visual_weight = name.startswith('visual.') or name.startswith('model.visual.') or '.visual.' in name
+            if self.encoder_only:
+                return not is_visual_weight
+            if self.language_only:
+                return is_visual_weight
+            return False
+
         def __skip_layers(name):
             """We might change the number of layers so we can debug the model
             with less gpus."""
@@ -369,7 +376,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         buffers_dict = dict(self.named_buffers())
         for name, loaded_weight in weights:
 
-            if _should_skip_qwen3_5_weight(name, self.encoder_only, self.language_only):
+            if _skip_weight_for_role(name):
                 continue
 
             if __skip_layers(name):

@@ -95,6 +95,7 @@ CUDA_VISIBLE_DEVICES="$GPU_E" lmdeploy serve api_server "$MODEL" \
     --server-port "$ENCODE_PORT" \
     --proxy-url "http://${SERVER_NAME}:${PROXY_PORT}" \
     --role Encoder \
+    --encoder-only \
     --encoder-transfer-backend "$ENCODER_TRANSFER_BACKEND" \
     >"$ENC_LOG" 2>&1 &
 PIDS+=("$!")
