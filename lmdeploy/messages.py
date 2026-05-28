@@ -384,8 +384,8 @@ class PytorchEngineConfig:
         model_format: weight quantization policy, options: ['fp8'].
         hf_overrides: Huggingface overrides for the model.
             It can be used to override the default config of the model,
-        disable_vision_encoder: Whether to disable loading vision
-            encoder. Default to False.
+        language_only: Whether to load only the language path and skip
+            multimodal encoder modules. Default to False.
         logprobs_mode: The mode of logprob, options: ['raw_logits', 'raw_logprobs']
         dllm_block_length: Block size of block diffusion model.
         dllm_unmasking_strategy: Dllm unmasking strategy, options:
@@ -429,7 +429,7 @@ class PytorchEngineConfig:
     model_format: str = None
     enable_metrics: bool = True
     hf_overrides: dict[str, Any] | None = None
-    disable_vision_encoder: bool = False
+    language_only: bool = False
     logprobs_mode: str = None
     # router replay
     enable_return_routed_experts: bool = False

@@ -705,7 +705,6 @@ class ArgumentHelper:
     def language_only(parser):
         """Disable loading multimodal encoder."""
         return parser.add_argument('--language-only',
-                                   dest='disable_vision_encoder',
                                    action='store_true',
                                    default=False,
                                    help='load only the language path and disable the multimodal encoder')

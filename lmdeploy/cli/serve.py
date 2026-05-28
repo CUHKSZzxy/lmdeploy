@@ -245,7 +245,7 @@ class SubCliServe:
                 migration_backend=MigrationBackend[args.migration_backend],
                 model_format=args.model_format,
                 hf_overrides=args.hf_overrides,
-                disable_vision_encoder=args.disable_vision_encoder,
+                language_only=args.language_only,
                 logprobs_mode=args.logprobs_mode,
                 dllm_block_length=args.dllm_block_length,
                 dllm_unmasking_strategy=args.dllm_unmasking_strategy,
