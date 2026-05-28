@@ -3,19 +3,31 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+import aiohttp
 import numpy as np
 
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, EncoderHttpJsonEmbedding, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import (
+    EncoderCacheFreeRequest,
+    EncoderCacheRef,
+    EncoderHttpJsonEmbedding,
+    MigrationProtocol,
+)
 from lmdeploy.pytorch.messages import InputEmbeddings
+from lmdeploy.utils import get_logger
+
+logger = get_logger('lmdeploy')
 
 EPD_BACKEND_HTTP_JSON = 'http_json'
 EPD_BACKEND_DLSLIME = 'dlslime'
 EPD_TRANSFER_BACKENDS = (EPD_BACKEND_HTTP_JSON, EPD_BACKEND_DLSLIME)
 EPD_DEFAULT_TRANSFER_BACKEND = EPD_BACKEND_DLSLIME
+EPD_FREE_ENCODER_OUTPUT_PATH = '/epd/free_encoder_output'
+EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT = 5
 
 
 @dataclass
@@ -102,6 +114,10 @@ class EncoderTransferConnector(ABC):
         """Receive encoder outputs and return language-engine prompt input."""
         raise NotImplementedError
 
+    async def release_published(self, transfer_id: str) -> None:
+        """Release producer-side transfer state."""
+        return None
+
 
 class HttpJsonEncoderTransferConnector(EncoderTransferConnector):
     """Transfer encoder embeddings directly in the HTTP JSON response."""
@@ -142,7 +158,16 @@ class DLSlimeEncoderTransferConnector(EncoderTransferConnector):
         from .dlslime import get_dlslime_encoder_transfer_manager
 
         manager = get_dlslime_encoder_transfer_manager()
-        return await manager.receive(encoder_result)
+        try:
+            return await manager.receive(encoder_result)
+        finally:
+            asyncio.create_task(release_remote_encoder_output_async(encoder_result))
+
+    async def release_published(self, transfer_id: str) -> None:
+        from .dlslime import get_dlslime_encoder_transfer_manager
+
+        manager = get_dlslime_encoder_transfer_manager()
+        manager.release_published(transfer_id)
 
 
 _CONNECTORS: dict[str, EncoderTransferConnector] = {
@@ -170,6 +195,33 @@ async def load_encoder_output_async(encoder_result: EncoderCacheRef) -> dict:
     """Convert an encoder cache ref into prompt input through its backend connector."""
     connector = get_encoder_transfer_connector(encoder_result.backend)
     return await connector.receive(encoder_result)
+
+
+async def release_published_encoder_output_async(request: EncoderCacheFreeRequest) -> None:
+    """Release producer-side encoder output state through the backend connector."""
+    connector = get_encoder_transfer_connector(request.backend)
+    await connector.release_published(request.transfer_id)
+
+
+async def release_remote_encoder_output_async(encoder_result: EncoderCacheRef) -> None:
+    """Release remote producer state after a DLSlime transfer is consumed."""
+    if encoder_result.backend != EPD_BACKEND_DLSLIME or not encoder_result.transfer_id:
+        return
+    if not encoder_result.remote_engine_id.startswith(('http://', 'https://')):
+        logger.debug('skip EPD encoder-output release for non-http engine id %s', encoder_result.remote_engine_id)
+        return
+
+    request = EncoderCacheFreeRequest(backend=encoder_result.backend, transfer_id=encoder_result.transfer_id)
+    try:
+        timeout = aiohttp.ClientTimeout(total=EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(encoder_result.remote_engine_id.rstrip('/') + EPD_FREE_ENCODER_OUTPUT_PATH,
+                                    json=request.model_dump(mode='json')) as response:
+                if response.status != 200:
+                    logger.warning('EPD encoder-output release failed: status=%s, body=%s', response.status,
+                                   await response.text())
+    except Exception as exc:
+        logger.warning('EPD encoder-output release failed: %s', exc)
 
 
 _NUMPY_DTYPES = {

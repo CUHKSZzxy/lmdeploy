@@ -139,6 +139,13 @@ class EncoderCacheRef(BaseModel):
         return protocol.name
 
 
+class EncoderCacheFreeRequest(BaseModel):
+    """Request to release process-local encoder transfer state."""
+
+    backend: str
+    transfer_id: str
+
+
 class DistServeCacheFreeRequest(BaseModel):
     remote_engine_id: str
     remote_session_id: int

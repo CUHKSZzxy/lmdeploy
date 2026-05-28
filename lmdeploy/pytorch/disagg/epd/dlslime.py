@@ -135,7 +135,7 @@ class DLSlimeEncoderTransferManager:
         self.endpoint = endpoint or self._create_endpoint(link_type, ib_port, rank, device_name)
         self._connected_engine_ids: set[str] = set()
         self._published_tensors: dict[str, torch.Tensor] = {}
-        self._received_tensors: dict[str, torch.Tensor] = {}
+        self._published_mr_keys: dict[str, str] = {}
 
     @staticmethod
     def _create_endpoint(link_type: str, ib_port: int, rank: int, device_name: str | None):
@@ -168,6 +168,18 @@ class DLSlimeEncoderTransferManager:
         self.endpoint.connect(_jsonable(endpoint_info))
         self._connected_engine_ids.add(remote_engine_id)
 
+    def _unregister_memory_region(self, key: str):
+        unregister = getattr(self.endpoint, 'unregister_memory_region', None)
+        if callable(unregister):
+            unregister(key)
+            return
+        get_pool = getattr(self.endpoint, 'get_pool', None)
+        if callable(get_pool):
+            pool = get_pool()
+            unregister = getattr(pool, 'unregister_memory_region', None)
+            if callable(unregister):
+                unregister(key)
+
     async def publish(self,
                       prompt_input: dict,
                       remote_engine_id: str,
@@ -180,6 +192,7 @@ class DLSlimeEncoderTransferManager:
         layout = _build_embedding_layout(prompt_input, self.device)
         self.endpoint.register_memory_region(transfer_id, layout.tensor.data_ptr(), 0, layout.nbytes)
         self._published_tensors[transfer_id] = layout.tensor
+        self._published_mr_keys[transfer_id] = transfer_id
 
         return EncoderCacheRef(
             token_ids=_to_int_list(prompt_input.get('input_ids') or []),
@@ -220,11 +233,13 @@ class DLSlimeEncoderTransferManager:
         local_key = f'{encoder_result.transfer_id}:recv'
         remote_key = f'{encoder_result.transfer_id}:remote'
         local_handle = self.endpoint.register_memory_region(local_key, output.data_ptr(), 0, int(nbytes))
-        self._connect_once(encoder_result.remote_engine_id, endpoint_info)
-        remote_handle = self.endpoint.register_remote_memory_region(remote_key, _jsonable(remote_mr_info))
-        future = self.endpoint.read([(local_handle, remote_handle, 0, 0, int(nbytes))])
-        await _wait_dlslime_future(future)
-        self._received_tensors[encoder_result.transfer_id] = output
+        try:
+            self._connect_once(encoder_result.remote_engine_id, endpoint_info)
+            remote_handle = self.endpoint.register_remote_memory_region(remote_key, _jsonable(remote_mr_info))
+            future = self.endpoint.read([(local_handle, remote_handle, 0, 0, int(nbytes))])
+            await _wait_dlslime_future(future)
+        finally:
+            self._unregister_memory_region(local_key)
 
         ranges = encoder_result.input_embedding_ranges or []
         embeddings = []
@@ -235,12 +250,18 @@ class DLSlimeEncoderTransferManager:
             offset += rows
         return dict(prompt=None, input_ids=list(encoder_result.token_ids), input_embeddings=embeddings)
 
+    def release_published(self, transfer_id: str):
+        key = self._published_mr_keys.pop(transfer_id, None)
+        if key is not None:
+            self._unregister_memory_region(key)
+        self._published_tensors.pop(transfer_id, None)
+
     def close(self):
+        for transfer_id in list(self._published_tensors):
+            self.release_published(transfer_id)
         shutdown = getattr(self.endpoint, 'shutdown', None)
         if callable(shutdown):
             shutdown()
-        self._published_tensors.clear()
-        self._received_tensors.clear()
 
 
 _DLSLIME_ENCODER_TRANSFER_MANAGER: DLSlimeEncoderTransferManager | None = None

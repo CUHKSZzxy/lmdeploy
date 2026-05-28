@@ -42,6 +42,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeConnectionRequest,
     DistServeDropConnectionRequest,
     DistServeInitRequest,
+    EncoderCacheFreeRequest,
     EncoderCacheRef,
     MigrationRequest,
 )
@@ -53,6 +54,7 @@ from lmdeploy.pytorch.disagg.epd.connector import (
     EPD_DEFAULT_TRANSFER_BACKEND,
     EPD_TRANSFER_BACKENDS,
     publish_encoder_output,
+    release_published_encoder_output_async,
 )
 from lmdeploy.pytorch.disagg.epd.engine import compute_encoder_prompt_input_for_engine
 from lmdeploy.pytorch.disagg.epd.dlslime import (
@@ -1304,6 +1306,18 @@ async def free_cache(cache_free_request: DistServeCacheFreeRequest) -> JSONRespo
 
 
 """ PD Disaggregation API End """
+
+
+""" EPD Disaggregation API Begin """
+
+
+@router.post('/epd/free_encoder_output')
+async def free_encoder_output(free_request: EncoderCacheFreeRequest):
+    await release_published_encoder_output_async(free_request)
+    return {'status': 'SUCCESS'}
+
+
+""" EPD Disaggregation API End """
 
 
 @router.post('/abort_request')

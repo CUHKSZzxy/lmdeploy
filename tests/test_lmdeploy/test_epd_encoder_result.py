@@ -186,8 +186,10 @@ class _FakeDLSlimeEndpoint:
         self.name = name
         self.connected = []
         self._local_regions = {}
+        self._local_keys = {}
         self._remote_regions = {}
         self._mr_info = {}
+        self.unregistered = []
 
     def endpoint_info(self):
         return {'name': self.name}
@@ -200,6 +202,7 @@ class _FakeDLSlimeEndpoint:
 
     def register_memory_region(self, name, data_ptr, offset, length):
         handle = len(self._local_regions)
+        self._local_keys[name] = handle
         self._local_regions[handle] = {
             'addr': int(data_ptr) + int(offset),
             'length': int(length),
@@ -211,6 +214,13 @@ class _FakeDLSlimeEndpoint:
             'rkey': handle,
         }
         return handle
+
+    def unregister_memory_region(self, name):
+        self.unregistered.append(name)
+        handle = self._local_keys.pop(name, None)
+        if handle is not None:
+            self._local_regions.pop(handle, None)
+        self._mr_info.pop(name, None)
 
     def register_remote_memory_region(self, name, mr_info):
         handle = 1000 + len(self._remote_regions)
@@ -235,6 +245,24 @@ class _FakeDLSlimeEndpoint:
 
     def shutdown(self):
         return None
+
+
+class _FakeDLSlimePool:
+
+    def __init__(self):
+        self.unregistered = []
+
+    def unregister_memory_region(self, name):
+        self.unregistered.append(name)
+
+
+class _FakeDLSlimeEndpointWithPool:
+
+    def __init__(self):
+        self.pool = _FakeDLSlimePool()
+
+    def get_pool(self):
+        return self.pool
 
 
 def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
@@ -268,6 +296,20 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     assert received.start == 1
     assert received.end == 3
     torch.testing.assert_close(received.embeddings, source)
+    assert 'epd-test:recv' in consumer.endpoint.unregistered
+    producer.release_published('epd-test')
+    assert producer._published_tensors == {}
+    assert 'epd-test' in producer.endpoint.unregistered
+
+
+def test_dlslime_encoder_transfer_manager_releases_through_endpoint_pool():
+    endpoint = _FakeDLSlimeEndpointWithPool()
+    manager = DLSlimeEncoderTransferManager('encoder', endpoint=endpoint, device='cpu')
+    manager._published_mr_keys['epd-test'] = 'epd-test'
+
+    manager.release_published('epd-test')
+
+    assert endpoint.pool.unregistered == ['epd-test']
 
 
 def test_http_json_connector_publishes_encoder_cache_ref():

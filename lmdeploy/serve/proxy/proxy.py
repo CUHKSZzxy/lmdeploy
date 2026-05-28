@@ -24,7 +24,11 @@ from pydantic import BaseModel, Field
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
-from lmdeploy.pytorch.disagg.epd.connector import EPD_DEFAULT_TRANSFER_BACKEND, build_encoder_transfer_config
+from lmdeploy.pytorch.disagg.epd.connector import (
+    EPD_DEFAULT_TRANSFER_BACKEND,
+    build_encoder_transfer_config,
+    release_remote_encoder_output_async,
+)
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
@@ -500,6 +504,23 @@ def _build_epd_language_request(request_dict: dict, encoder_result: dict | Encod
     return request_dict
 
 
+async def _release_epd_encoder_result(encoder_result: dict | EncoderCacheRef | None):
+    if encoder_result is None:
+        return
+    encoder_result = EncoderCacheRef.model_validate(encoder_result)
+    await release_remote_encoder_output_async(encoder_result)
+
+
+async def _stream_epd_language_response(node_manager, request_dict: dict, node_url: str,
+                                        encoder_result: dict | EncoderCacheRef | None, start: float):
+    try:
+        async for line in node_manager.stream_generate(request_dict, node_url, '/v1/chat/completions'):
+            yield line
+    finally:
+        node_manager.post_call(node_url, start)
+        await _release_epd_encoder_result(encoder_result)
+
+
 def _build_epd_encoder_request(request_dict: dict, language_url: str, language_status: Status) -> dict:
     request_dict = copy.deepcopy(request_dict)
     request_dict['stream'] = False
@@ -728,7 +749,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                 return node_manager.handle_unavailable_model(request.model)
 
             request_dict = await raw_request.json()
-            if request_dict.get('encoder_result') is None:
+            encoder_result = request_dict.get('encoder_result')
+            if encoder_result is None:
                 language_status = node_manager.nodes[node_url]
                 try:
                     encoder_request = _build_epd_encoder_request(request_dict, node_url, language_status)
@@ -747,12 +769,14 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             logger.info(f'An EPD language request is dispatched to {node_url}')
             start = node_manager.pre_call(node_url)
             if request.stream is True:
-                response = node_manager.stream_generate(request_dict, node_url, '/v1/chat/completions')
-                background_task = node_manager.create_background_tasks(node_url, start)
-                return ProxyStreamingResponse(response, background=background_task, media_type='text/event-stream')
-            response = await node_manager.generate(request_dict, node_url, '/v1/chat/completions')
-            node_manager.post_call(node_url, start)
-            return JSONResponse(json.loads(response))
+                response = _stream_epd_language_response(node_manager, request_dict, node_url, encoder_result, start)
+                return ProxyStreamingResponse(response, media_type='text/event-stream')
+            try:
+                response = await node_manager.generate(request_dict, node_url, '/v1/chat/completions')
+                return JSONResponse(json.loads(response))
+            finally:
+                node_manager.post_call(node_url, start)
+                await _release_epd_encoder_result(encoder_result)
 
         logger.info(f'A request is dispatched to {node_url}')
         start = node_manager.pre_call(node_url)

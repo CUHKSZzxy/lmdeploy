@@ -1,3 +1,6 @@
+import asyncio
+import importlib
+
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
 from lmdeploy.pytorch.disagg.epd.connector import EPD_BACKEND_DLSLIME
@@ -6,8 +9,11 @@ from lmdeploy.serve.proxy.proxy import (
     Status,
     _build_epd_encoder_request,
     _build_epd_language_request,
+    _release_epd_encoder_result,
     _has_multimodal_chat_messages,
 )
+
+proxy_mod = importlib.import_module('lmdeploy.serve.proxy.proxy')
 
 
 def test_engine_role_has_encoder():
@@ -89,3 +95,25 @@ def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
     assert encoder_request['encoder_output_receiver_endpoint_info'] == endpoint_info
     assert encoder_request['encoder_output_receiver_engine_id'] == 'http://language'
     assert encoder_request['epd_transfer_id'].startswith('epd-')
+
+
+def test_release_epd_encoder_result_uses_connector_cleanup(monkeypatch):
+    called = {}
+
+    async def fake_release(encoder_result):
+        called['encoder_result'] = encoder_result
+
+    monkeypatch.setattr(proxy_mod, 'release_remote_encoder_output_async', fake_release)
+    encoder_result = {
+        'token_ids': [1, 2],
+        'protocol': MigrationProtocol.RDMA.name,
+        'backend': EPD_BACKEND_DLSLIME,
+        'transfer_id': 'epd-test',
+        'remote_engine_id': 'http://encoder',
+        'remote_session_id': 3,
+        'remote_block_ids': [],
+    }
+
+    asyncio.run(_release_epd_encoder_result(encoder_result))
+
+    assert called['encoder_result'].transfer_id == 'epd-test'
