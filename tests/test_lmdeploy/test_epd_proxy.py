@@ -3,7 +3,6 @@ import importlib
 
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
-from lmdeploy.pytorch.disagg.epd.connector import EPD_BACKEND_DLSLIME
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,
@@ -58,8 +57,8 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_resul
     }
     encoder_result = {
         'token_ids': [1, 2],
-        'protocol': MigrationProtocol.TCP.name,
-        'backend': 'http_json',
+        'protocol': MigrationProtocol.RDMA.name,
+        'transfer_id': 'epd-test',
         'remote_engine_id': 'http://encoder',
         'remote_session_id': 3,
         'remote_block_ids': [],
@@ -71,7 +70,7 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_resul
     assert language_request['temperature'] == 0.1
     assert language_request['stream'] is True
     assert language_request['encoder_result']['token_ids'] == [1, 2]
-    assert language_request['encoder_result']['protocol'] == 'TCP'
+    assert language_request['encoder_result']['protocol'] == 'RDMA'
 
 
 def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
@@ -84,14 +83,12 @@ def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
     language_status = Status(
         role=EngineRole.Hybrid,
         models=['m'],
-        epd_transfer_backend=EPD_BACKEND_DLSLIME,
         encoder_output_receiver_endpoint_info=endpoint_info,
     )
 
     encoder_request = _build_epd_encoder_request(request_dict, 'http://language', language_status)
 
     assert encoder_request['stream'] is False
-    assert encoder_request['encoder_transfer_backend'] == EPD_BACKEND_DLSLIME
     assert encoder_request['encoder_output_receiver_endpoint_info'] == endpoint_info
     assert encoder_request['encoder_output_receiver_engine_id'] == 'http://language'
     assert encoder_request['epd_transfer_id'].startswith('epd-')
@@ -107,7 +104,6 @@ def test_release_epd_encoder_result_uses_connector_cleanup(monkeypatch):
     encoder_result = {
         'token_ids': [1, 2],
         'protocol': MigrationProtocol.RDMA.name,
-        'backend': EPD_BACKEND_DLSLIME,
         'transfer_id': 'epd-test',
         'remote_engine_id': 'http://encoder',
         'remote_session_id': 3,

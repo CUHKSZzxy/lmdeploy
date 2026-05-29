@@ -20,11 +20,6 @@ GPU_PD="${GPU_PD:-1}"
 TP_E="${TP_E:-1}"
 TP_PD="${TP_PD:-1}"
 
-ENCODER_TRANSFER_BACKEND="${ENCODER_TRANSFER_BACKEND:-dlslime}"
-
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-8}"
-SESSION_LEN="${SESSION_LEN:-32768}"
-CACHE_MAX_ENTRY_COUNT="${CACHE_MAX_ENTRY_COUNT:-0.75}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1200}"
 
 # Optional smoke request. Example:
@@ -86,16 +81,12 @@ wait_for_url "http://${SERVER_NAME}:${PROXY_PORT}/nodes/status"
 CUDA_VISIBLE_DEVICES="$GPU_E" lmdeploy serve api_server "$MODEL" \
     --backend pytorch \
     --tp "$TP_E" \
-    --max-batch-size "$MAX_BATCH_SIZE" \
-    --cache-max-entry-count "$CACHE_MAX_ENTRY_COUNT" \
-    --session-len "$SESSION_LEN" \
     --trust-remote-code \
     --server-name "$SERVER_NAME" \
     --server-port "$ENCODE_PORT" \
     --proxy-url "http://${SERVER_NAME}:${PROXY_PORT}" \
     --role Encoder \
     --encoder-only \
-    --encoder-transfer-backend "$ENCODER_TRANSFER_BACKEND" \
     >"$ENC_LOG" 2>&1 &
 PIDS+=("$!")
 
@@ -106,16 +97,12 @@ pd_args=(
     lmdeploy serve api_server "$MODEL"
     --backend pytorch
     --tp "$TP_PD"
-    --max-batch-size "$MAX_BATCH_SIZE"
-    --cache-max-entry-count "$CACHE_MAX_ENTRY_COUNT"
-    --session-len "$SESSION_LEN"
     --trust-remote-code
     --server-name "$SERVER_NAME"
     --server-port "$PREFILL_DECODE_PORT"
     --proxy-url "http://${SERVER_NAME}:${PROXY_PORT}"
     --role Hybrid
     --language-only
-    --encoder-transfer-backend "$ENCODER_TRANSFER_BACKEND"
 )
 
 CUDA_VISIBLE_DEVICES="$GPU_PD" "${pd_args[@]}" >"$PD_LOG" 2>&1 &

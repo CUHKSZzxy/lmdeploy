@@ -24,11 +24,7 @@ from pydantic import BaseModel, Field
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
-from lmdeploy.pytorch.disagg.epd.connector import (
-    EPD_DEFAULT_TRANSFER_BACKEND,
-    build_encoder_transfer_config,
-    release_remote_encoder_output_async,
-)
+from lmdeploy.pytorch.disagg.epd.dlslime import build_encoder_transfer_config, release_remote_encoder_output_async
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
@@ -55,7 +51,6 @@ class Status(BaseModel):
     unfinished: int = 0
     latency: deque = Field(default=deque(maxlen=LATENCY_DEQUE_LEN), examples=[[]])
     speed: int | None = Field(default=None, examples=[None])
-    epd_transfer_backend: str = EPD_DEFAULT_TRANSFER_BACKEND
     encoder_output_receiver_endpoint_info: dict | None = None
 
 
@@ -525,7 +520,6 @@ def _build_epd_encoder_request(request_dict: dict, language_url: str, language_s
     request_dict = copy.deepcopy(request_dict)
     request_dict['stream'] = False
     transfer_config = build_encoder_transfer_config(
-        backend=language_status.epd_transfer_backend,
         receiver_endpoint_info=language_status.encoder_output_receiver_endpoint_info,
         receiver_engine_id=language_url,
     )

@@ -687,14 +687,6 @@ class ArgumentHelper:
                                    help='kvcache migration management backend when PD disaggregation')
 
     @staticmethod
-    def encoder_transfer_backend(parser):
-        return parser.add_argument('--encoder-transfer-backend',
-                                   type=str,
-                                   default='dlslime',
-                                   choices=['http_json', 'dlslime'],
-                                   help='encoder embedding transfer backend for EPD')
-
-    @staticmethod
     def language_only(parser):
         """Disable loading multimodal encoder."""
         return parser.add_argument('--language-only',

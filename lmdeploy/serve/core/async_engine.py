@@ -30,7 +30,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeDropConnectionRequest,
     DistServeInitRequest,
 )
-from lmdeploy.pytorch.disagg.epd.connector import load_encoder_output_async
+from lmdeploy.pytorch.disagg.epd.dlslime import load_encoder_output_async
 from lmdeploy.serve.managers import Session, SessionManager
 from lmdeploy.serve.processors import MultimodalProcessor
 from lmdeploy.tokenizer import DetokenizeState, Tokenizer

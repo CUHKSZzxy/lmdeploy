@@ -6,22 +6,72 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
+import aiohttp
 import torch
 
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheFreeRequest, EncoderCacheRef, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.utils import get_logger
 
-from .connector import EPD_BACKEND_DLSLIME
-
 logger = get_logger('lmdeploy')
+
+EPD_FREE_ENCODER_OUTPUT_PATH = '/epd/free_encoder_output'
+EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT = 5
 
 _DLSLIME_EXTRA_ENDPOINT_INFO = 'dlslime_endpoint_info'
 _DLSLIME_EXTRA_MR_INFO = 'dlslime_mr_info'
 _DLSLIME_EXTRA_NBYTES = 'dlslime_nbytes'
+
+
+@dataclass(frozen=True)
+class EncoderTransferConfig:
+    """Per-request encoder transfer configuration."""
+
+    transfer_id: str | None = None
+    receiver_endpoint_info: dict | None = None
+    receiver_engine_id: str | None = None
+
+    def __post_init__(self):
+        if not self.transfer_id:
+            raise ValueError('EPD DLSlime RDMA transfer requires transfer_id')
+        if not self.receiver_endpoint_info:
+            raise ValueError('EPD DLSlime RDMA transfer requires receiver_endpoint_info')
+
+    @classmethod
+    def from_request(cls, request_dict: dict) -> 'EncoderTransferConfig':
+        """Build transfer config from internal request fields."""
+        return cls(
+            transfer_id=request_dict.get('epd_transfer_id'),
+            receiver_endpoint_info=request_dict.get('encoder_output_receiver_endpoint_info'),
+            receiver_engine_id=request_dict.get('encoder_output_receiver_engine_id'),
+        )
+
+    def to_request_fields(self) -> dict:
+        """Serialize transfer config into internal request fields."""
+        fields = {'epd_transfer_id': self.transfer_id}
+        if self.receiver_endpoint_info:
+            fields['encoder_output_receiver_endpoint_info'] = self.receiver_endpoint_info
+        if self.receiver_engine_id:
+            fields['encoder_output_receiver_engine_id'] = self.receiver_engine_id
+        return fields
+
+
+def build_encoder_transfer_config(receiver_endpoint_info: dict | None = None,
+                                  receiver_engine_id: str | None = None,
+                                  transfer_id: str | None = None) -> EncoderTransferConfig:
+    """Create a validated encoder transfer config for a proxy-to-encoder request."""
+    if not receiver_endpoint_info:
+        raise ValueError('language node does not advertise encoder-output receiver_endpoint_info')
+    return EncoderTransferConfig(
+        transfer_id=transfer_id or f'epd-{uuid.uuid4().hex}',
+        receiver_endpoint_info=receiver_endpoint_info,
+        receiver_engine_id=receiver_engine_id,
+    )
+
 
 @dataclass
 class _EmbeddingLayout:
@@ -198,7 +248,6 @@ class DLSlimeEncoderTransferManager:
             token_ids=_to_int_list(prompt_input.get('input_ids') or []),
             input_embedding_ranges=layout.ranges,
             protocol=MigrationProtocol.RDMA,
-            backend=EPD_BACKEND_DLSLIME,
             transfer_id=transfer_id,
             remote_engine_id=remote_engine_id,
             remote_session_id=remote_session_id,
@@ -276,3 +325,51 @@ def get_dlslime_encoder_transfer_manager() -> DLSlimeEncoderTransferManager:
     if _DLSLIME_ENCODER_TRANSFER_MANAGER is None:
         raise ValueError('dlslime EPD transfer manager is not initialized.')
     return _DLSLIME_ENCODER_TRANSFER_MANAGER
+
+
+async def publish_encoder_output(prompt_input: dict, remote_engine_id: str, remote_session_id: int,
+                                 transfer_config: EncoderTransferConfig) -> EncoderCacheRef:
+    """Publish computed encoder output through DLSlime."""
+    manager = get_dlslime_encoder_transfer_manager()
+    return await manager.publish(prompt_input,
+                                 remote_engine_id,
+                                 remote_session_id,
+                                 transfer_config.transfer_id,
+                                 receiver_endpoint_info=transfer_config.receiver_endpoint_info,
+                                 receiver_engine_id=transfer_config.receiver_engine_id)
+
+
+async def load_encoder_output_async(encoder_result: EncoderCacheRef) -> dict:
+    """Convert an encoder cache ref into prompt input through DLSlime."""
+    manager = get_dlslime_encoder_transfer_manager()
+    try:
+        return await manager.receive(encoder_result)
+    finally:
+        asyncio.create_task(release_remote_encoder_output_async(encoder_result))
+
+
+async def release_published_encoder_output_async(request: EncoderCacheFreeRequest) -> None:
+    """Release producer-side encoder output state."""
+    manager = get_dlslime_encoder_transfer_manager()
+    manager.release_published(request.transfer_id)
+
+
+async def release_remote_encoder_output_async(encoder_result: EncoderCacheRef) -> None:
+    """Release remote producer state after a DLSlime transfer is consumed."""
+    if not encoder_result.transfer_id:
+        return
+    if not encoder_result.remote_engine_id.startswith(('http://', 'https://')):
+        logger.debug('skip EPD encoder-output release for non-http engine id %s', encoder_result.remote_engine_id)
+        return
+
+    request = EncoderCacheFreeRequest(transfer_id=encoder_result.transfer_id)
+    try:
+        timeout = aiohttp.ClientTimeout(total=EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(encoder_result.remote_engine_id.rstrip('/') + EPD_FREE_ENCODER_OUTPUT_PATH,
+                                    json=request.model_dump(mode='json')) as response:
+                if response.status != 200:
+                    logger.warning('EPD encoder-output release failed: status=%s, body=%s', response.status,
+                                   await response.text())
+    except Exception as exc:
+        logger.warning('EPD encoder-output release failed: %s', exc)

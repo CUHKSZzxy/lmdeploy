@@ -36,7 +36,7 @@ from lmdeploy.messages import (
 )
 from lmdeploy.metrics.metrics_processor import metrics_processor
 from lmdeploy.model import ChatTemplateConfig
-from lmdeploy.pytorch.disagg.config import DistServeEngineConfig, EngineRole
+from lmdeploy.pytorch.disagg.config import DistServeEngineConfig, EngineRole, MigrationBackend
 from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeCacheFreeRequest,
     DistServeConnectionRequest,
@@ -48,20 +48,15 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine, EngineHealthMonitor
-from lmdeploy.pytorch.disagg.epd.connector import (
-    EncoderTransferConfig,
-    EPD_BACKEND_DLSLIME,
-    EPD_DEFAULT_TRANSFER_BACKEND,
-    EPD_TRANSFER_BACKENDS,
-    publish_encoder_output,
-    release_published_encoder_output_async,
-)
-from lmdeploy.pytorch.disagg.epd.engine import compute_encoder_prompt_input_for_engine
 from lmdeploy.pytorch.disagg.epd.dlslime import (
     DLSlimeEncoderTransferManager,
+    EncoderTransferConfig,
     get_dlslime_encoder_transfer_manager,
+    publish_encoder_output,
+    release_published_encoder_output_async,
     set_dlslime_encoder_transfer_manager,
 )
+from lmdeploy.pytorch.disagg.epd.engine import compute_encoder_prompt_input_for_engine
 from lmdeploy.serve.openai.protocol import (
     AbortRequest,
     ChatCompletionRequest,
@@ -114,7 +109,6 @@ class VariableInterface:
     # following are for registering to proxy server
     proxy_url: str | None = None
     api_server_url: str | None = None
-    epd_transfer_backend: str = EPD_DEFAULT_TRANSFER_BACKEND
     allow_terminate_by_client: bool = False
     enable_abort_handling: bool = False
     response_parser_cls: type[ResponseParser] | None = None
@@ -306,10 +300,7 @@ async def _create_epd_encoder_response(request: ChatCompletionRequest, raw_reque
             logger.warning('`enable_thinking` in `chat_template_kwargs` will override the value in request.')
 
     try:
-        transfer_config = EncoderTransferConfig.from_request(
-            json_request,
-            default_backend=VariableInterface.epd_transfer_backend,
-        )
+        transfer_config = EncoderTransferConfig.from_request(json_request)
         prompt_input = await VariableInterface.async_engine.prompt_processor.get_prompt_input(
             prompt=request.messages,
             do_preprocess=do_preprocess,
@@ -1375,14 +1366,13 @@ async def startup_event():
         engine_config = VariableInterface.async_engine.backend_config
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
         encoder_output_receiver_endpoint_info = None
-        if (VariableInterface.epd_transfer_backend == EPD_BACKEND_DLSLIME
+        if (getattr(engine_config, 'migration_backend', None) == MigrationBackend.DLSlime
                 and getattr(engine_config, 'role', None) != EngineRole.Encoder):
             encoder_output_receiver_endpoint_info = get_dlslime_encoder_transfer_manager().endpoint_info
         url = f'{VariableInterface.proxy_url}/nodes/add'
         status = {
             'models': get_model_list(),
             'role': engine_role,
-            'epd_transfer_backend': VariableInterface.epd_transfer_backend,
             'encoder_output_receiver_endpoint_info': encoder_output_receiver_endpoint_info,
         }
         data = {'url': VariableInterface.api_server_url, 'status': status}
@@ -1465,7 +1455,7 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
         try:
             health_monitor.start()
             if (VariableInterface.proxy_url is not None
-                    and VariableInterface.epd_transfer_backend == EPD_BACKEND_DLSLIME):
+                    and getattr(backend_config, 'migration_backend', None) == MigrationBackend.DLSlime):
                 dlslime_encoder_transfer_manager = DLSlimeEncoderTransferManager(
                     engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
                     rank=getattr(backend_config, 'dp_rank', 0) or 0,
@@ -1526,7 +1516,6 @@ def serve(model_path: str,
           tool_call_parser: str | None = None,
           allow_terminate_by_client: bool = False,
           enable_abort_handling: bool = False,
-          epd_transfer_backend: str = EPD_DEFAULT_TRANSFER_BACKEND,
           speculative_config: SpeculativeConfig | None = None,
           **kwargs):
     """An example to perform model inference through the command line
@@ -1587,9 +1576,10 @@ def serve(model_path: str,
 
     VariableInterface.allow_terminate_by_client = allow_terminate_by_client
     VariableInterface.enable_abort_handling = enable_abort_handling
-    if epd_transfer_backend not in EPD_TRANSFER_BACKENDS:
-        raise ValueError(f'unsupported EPD encoder transfer backend: {epd_transfer_backend}')
-    VariableInterface.epd_transfer_backend = epd_transfer_backend
+    if isinstance(backend_config, PytorchEngineConfig):
+        use_epd = backend_config.role == EngineRole.Encoder or backend_config.language_only
+        if use_epd and backend_config.migration_backend != MigrationBackend.DLSlime:
+            raise ValueError('EPD encoder transfer requires --migration-backend DLSlime.')
 
     ssl_keyfile, ssl_certfile, http_or_https = None, None, 'http'
     if ssl:

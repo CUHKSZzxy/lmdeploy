@@ -92,31 +92,15 @@ class MigrationRequest(BaseModel):
     is_dummy_prefill: bool = False
 
 
-class EncoderHttpJsonEmbedding(BaseModel):
-    """HTTP JSON encoder embedding payload for the first EPD receive path.
-
-    This is intentionally a small bring-up format. A production transfer
-    backend should replace the HTTP JSON data with backend-specific cache
-    handles.
-    """
-
-    data: list[list[float]]
-    start: int
-    end: int
-    dtype: str | None = None
-
-
 class EncoderCacheRef(BaseModel):
     """Reference to encoder outputs produced by an EPD encoder node."""
 
     token_ids: list[int]
     mm_mask: list[int] | None = None
     input_embedding_ranges: list[list[int]] | None = None
-    input_embeddings: list[EncoderHttpJsonEmbedding] | None = None
     transfer_id: str | None = None
 
     protocol: MigrationProtocol
-    backend: str = 'http_json'
     remote_engine_id: str
     remote_session_id: int
     remote_block_ids: list[int] = Field(default_factory=list)
@@ -141,8 +125,6 @@ class EncoderCacheRef(BaseModel):
 
 class EncoderCacheFreeRequest(BaseModel):
     """Request to release process-local encoder transfer state."""
-
-    backend: str
     transfer_id: str
 
 
