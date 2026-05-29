@@ -8,7 +8,7 @@ from lmdeploy.serve.proxy.proxy import (
     Status,
     _build_epd_encoder_request,
     _build_epd_language_request,
-    _release_epd_encoder_result,
+    _release_epd_encoder_output_ref,
     _has_multimodal_chat_messages,
 )
 
@@ -48,14 +48,14 @@ def test_multimodal_chat_detection():
     ])
 
 
-def test_build_epd_language_request_preserves_messages_and_injects_encoder_result():
+def test_build_epd_language_request_preserves_messages_and_injects_encoder_output_ref():
     request_dict = {
         'model': 'm',
         'messages': [{'role': 'user', 'content': 'hello'}],
         'temperature': 0.1,
         'stream': True,
     }
-    encoder_result = {
+    encoder_output_ref = {
         'token_ids': [1, 2],
         'protocol': MigrationProtocol.RDMA.name,
         'transfer_id': 'epd-test',
@@ -64,13 +64,13 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_resul
         'remote_block_ids': [],
     }
 
-    language_request = _build_epd_language_request(request_dict, encoder_result)
+    language_request = _build_epd_language_request(request_dict, encoder_output_ref)
 
     assert language_request['messages'] == request_dict['messages']
     assert language_request['temperature'] == 0.1
     assert language_request['stream'] is True
-    assert language_request['encoder_result']['token_ids'] == [1, 2]
-    assert language_request['encoder_result']['protocol'] == 'RDMA'
+    assert language_request['encoder_output_ref']['token_ids'] == [1, 2]
+    assert language_request['encoder_output_ref']['protocol'] == 'RDMA'
 
 
 def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
@@ -94,14 +94,14 @@ def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
     assert encoder_request['epd_transfer_id'].startswith('epd-')
 
 
-def test_release_epd_encoder_result_uses_connector_cleanup(monkeypatch):
+def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):
     called = {}
 
-    async def fake_release(encoder_result):
-        called['encoder_result'] = encoder_result
+    async def fake_release(encoder_output_ref):
+        called['encoder_output_ref'] = encoder_output_ref
 
     monkeypatch.setattr(proxy_mod, 'release_remote_encoder_output_async', fake_release)
-    encoder_result = {
+    encoder_output_ref = {
         'token_ids': [1, 2],
         'protocol': MigrationProtocol.RDMA.name,
         'transfer_id': 'epd-test',
@@ -110,6 +110,6 @@ def test_release_epd_encoder_result_uses_connector_cleanup(monkeypatch):
         'remote_block_ids': [],
     }
 
-    asyncio.run(_release_epd_encoder_result(encoder_result))
+    asyncio.run(_release_epd_encoder_output_ref(encoder_output_ref))
 
-    assert called['encoder_result'].transfer_id == 'epd-test'
+    assert called['encoder_output_ref'].transfer_id == 'epd-test'

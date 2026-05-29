@@ -138,7 +138,7 @@ class GenerationConfig:
     with_cache: bool = False
     preserve_cache: bool = False
     migration_request: MigrationRequest | None = None
-    encoder_result: EncoderCacheRef | None = None
+    encoder_output_ref: EncoderCacheRef | None = None
 
     # router replay
     return_routed_experts: bool = False

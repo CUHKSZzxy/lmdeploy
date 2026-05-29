@@ -261,43 +261,43 @@ class DLSlimeEncoderTransferManager:
             },
         )
 
-    async def receive(self, encoder_result: EncoderCacheRef) -> dict:
-        if not encoder_result.transfer_id:
-            raise ValueError('DLSlime RDMA encoder_result requires transfer_id.')
-        endpoint_info = encoder_result.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
-        remote_mr_info = encoder_result.extra.get(_DLSLIME_EXTRA_MR_INFO)
-        nbytes = encoder_result.extra.get(_DLSLIME_EXTRA_NBYTES)
+    async def receive(self, encoder_output_ref: EncoderCacheRef) -> dict:
+        if not encoder_output_ref.transfer_id:
+            raise ValueError('DLSlime RDMA encoder_output_ref requires transfer_id.')
+        endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
+        remote_mr_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_MR_INFO)
+        nbytes = encoder_output_ref.extra.get(_DLSLIME_EXTRA_NBYTES)
         if endpoint_info is None or remote_mr_info is None or nbytes is None:
-            raise ValueError('DLSlime RDMA encoder_result is missing endpoint or memory-region metadata.')
+            raise ValueError('DLSlime RDMA encoder_output_ref is missing endpoint or memory-region metadata.')
 
-        shapes = encoder_result.shape or []
+        shapes = encoder_output_ref.shape or []
         if not isinstance(shapes, list) or len(shapes) == 0 or not isinstance(shapes[0], list):
-            raise ValueError('DLSlime RDMA encoder_result requires per-embedding shapes.')
-        assert encoder_result.dtype is not None
-        dtype = getattr(torch, encoder_result.dtype)
+            raise ValueError('DLSlime RDMA encoder_output_ref requires per-embedding shapes.')
+        assert encoder_output_ref.dtype is not None
+        dtype = getattr(torch, encoder_output_ref.dtype)
         total_rows = sum(int(shape[0]) for shape in shapes)
         hidden_size = int(shapes[0][1])
         output = torch.empty((total_rows, hidden_size), dtype=dtype, device=self.device)
 
-        local_key = f'{encoder_result.transfer_id}:recv'
-        remote_key = f'{encoder_result.transfer_id}:remote'
+        local_key = f'{encoder_output_ref.transfer_id}:recv'
+        remote_key = f'{encoder_output_ref.transfer_id}:remote'
         local_handle = self.endpoint.register_memory_region(local_key, output.data_ptr(), 0, int(nbytes))
         try:
-            self._connect_once(encoder_result.remote_engine_id, endpoint_info)
+            self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
             remote_handle = self.endpoint.register_remote_memory_region(remote_key, _jsonable(remote_mr_info))
             future = self.endpoint.read([(local_handle, remote_handle, 0, 0, int(nbytes))])
             await _wait_dlslime_future(future)
         finally:
             self._unregister_memory_region(local_key)
 
-        ranges = encoder_result.input_embedding_ranges or []
+        ranges = encoder_output_ref.input_embedding_ranges or []
         embeddings = []
         offset = 0
         for shape, (start, end) in zip(shapes, ranges):
             rows = int(shape[0])
             embeddings.append(InputEmbeddings(output[offset:offset + rows], start=int(start), end=int(end)))
             offset += rows
-        return dict(prompt=None, input_ids=list(encoder_result.token_ids), input_embeddings=embeddings)
+        return dict(prompt=None, input_ids=list(encoder_output_ref.token_ids), input_embeddings=embeddings)
 
     def release_published(self, transfer_id: str):
         key = self._published_mr_keys.pop(transfer_id, None)
@@ -339,13 +339,13 @@ async def publish_encoder_output(prompt_input: dict, remote_engine_id: str, remo
                                  receiver_engine_id=transfer_config.receiver_engine_id)
 
 
-async def load_encoder_output_async(encoder_result: EncoderCacheRef) -> dict:
+async def load_encoder_output_async(encoder_output_ref: EncoderCacheRef) -> dict:
     """Convert an encoder cache ref into prompt input through DLSlime."""
     manager = get_dlslime_encoder_transfer_manager()
     try:
-        return await manager.receive(encoder_result)
+        return await manager.receive(encoder_output_ref)
     finally:
-        asyncio.create_task(release_remote_encoder_output_async(encoder_result))
+        asyncio.create_task(release_remote_encoder_output_async(encoder_output_ref))
 
 
 async def release_published_encoder_output_async(request: EncoderCacheFreeRequest) -> None:
@@ -354,19 +354,19 @@ async def release_published_encoder_output_async(request: EncoderCacheFreeReques
     manager.release_published(request.transfer_id)
 
 
-async def release_remote_encoder_output_async(encoder_result: EncoderCacheRef) -> None:
+async def release_remote_encoder_output_async(encoder_output_ref: EncoderCacheRef) -> None:
     """Release remote producer state after a DLSlime transfer is consumed."""
-    if not encoder_result.transfer_id:
+    if not encoder_output_ref.transfer_id:
         return
-    if not encoder_result.remote_engine_id.startswith(('http://', 'https://')):
-        logger.debug('skip EPD encoder-output release for non-http engine id %s', encoder_result.remote_engine_id)
+    if not encoder_output_ref.remote_engine_id.startswith(('http://', 'https://')):
+        logger.debug('skip EPD encoder-output release for non-http engine id %s', encoder_output_ref.remote_engine_id)
         return
 
-    request = EncoderCacheFreeRequest(transfer_id=encoder_result.transfer_id)
+    request = EncoderCacheFreeRequest(transfer_id=encoder_output_ref.transfer_id)
     try:
         timeout = aiohttp.ClientTimeout(total=EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(encoder_result.remote_engine_id.rstrip('/') + EPD_FREE_ENCODER_OUTPUT_PATH,
+            async with session.post(encoder_output_ref.remote_engine_id.rstrip('/') + EPD_FREE_ENCODER_OUTPUT_PATH,
                                     json=request.model_dump(mode='json')) as response:
                 if response.status != 200:
                     logger.warning('EPD encoder-output release failed: status=%s, body=%s', response.status,

@@ -492,28 +492,28 @@ def _has_multimodal_chat_messages(messages) -> bool:
     return False
 
 
-def _build_epd_language_request(request_dict: dict, encoder_result: dict | EncoderCacheRef) -> dict:
+def _build_epd_language_request(request_dict: dict, encoder_output_ref: dict | EncoderCacheRef) -> dict:
     request_dict = copy.deepcopy(request_dict)
-    encoder_result = EncoderCacheRef.model_validate(encoder_result)
-    request_dict['encoder_result'] = encoder_result.model_dump(mode='json')
+    encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
+    request_dict['encoder_output_ref'] = encoder_output_ref.model_dump(mode='json')
     return request_dict
 
 
-async def _release_epd_encoder_result(encoder_result: dict | EncoderCacheRef | None):
-    if encoder_result is None:
+async def _release_epd_encoder_output_ref(encoder_output_ref: dict | EncoderCacheRef | None):
+    if encoder_output_ref is None:
         return
-    encoder_result = EncoderCacheRef.model_validate(encoder_result)
-    await release_remote_encoder_output_async(encoder_result)
+    encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
+    await release_remote_encoder_output_async(encoder_output_ref)
 
 
 async def _stream_epd_language_response(node_manager, request_dict: dict, node_url: str,
-                                        encoder_result: dict | EncoderCacheRef | None, start: float):
+                                        encoder_output_ref: dict | EncoderCacheRef | None, start: float):
     try:
         async for line in node_manager.stream_generate(request_dict, node_url, '/v1/chat/completions'):
             yield line
     finally:
         node_manager.post_call(node_url, start)
-        await _release_epd_encoder_result(encoder_result)
+        await _release_epd_encoder_output_ref(encoder_output_ref)
 
 
 def _build_epd_encoder_request(request_dict: dict, language_url: str, language_status: Status) -> dict:
@@ -527,18 +527,18 @@ def _build_epd_encoder_request(request_dict: dict, language_url: str, language_s
     return request_dict
 
 
-def _extract_epd_encoder_result(response_text: str | bytes) -> dict:
+def _extract_epd_encoder_output_ref(response_text: str | bytes) -> dict:
     try:
         response = json.loads(response_text)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError('encoder node returned a non-JSON response') from exc
-    if 'encoder_result' not in response:
+    if 'encoder_output_ref' not in response:
         error = response.get('error')
         if error:
             message = error.get('message') if isinstance(error, dict) else str(error)
             raise ValueError(f'encoder node error: {message}')
-        raise ValueError('encoder node response does not contain encoder_result')
-    return EncoderCacheRef.model_validate(response['encoder_result']).model_dump(mode='json')
+        raise ValueError('encoder node response does not contain encoder_output_ref')
+    return EncoderCacheRef.model_validate(response['encoder_output_ref']).model_dump(mode='json')
 
 
 app = FastAPI(docs_url='/')
@@ -743,8 +743,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                 return node_manager.handle_unavailable_model(request.model)
 
             request_dict = await raw_request.json()
-            encoder_result = request_dict.get('encoder_result')
-            if encoder_result is None:
+            encoder_output_ref = request_dict.get('encoder_output_ref')
+            if encoder_output_ref is None:
                 language_status = node_manager.nodes[node_url]
                 try:
                     encoder_request = _build_epd_encoder_request(request_dict, node_url, language_status)
@@ -755,22 +755,22 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                 encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/completions')
                 node_manager.post_call(encoder_url, start)
                 try:
-                    encoder_result = _extract_epd_encoder_result(encoder_response)
+                    encoder_output_ref = _extract_epd_encoder_output_ref(encoder_response)
                 except ValueError as exc:
                     return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
-                request_dict = _build_epd_language_request(request_dict, encoder_result)
+                request_dict = _build_epd_language_request(request_dict, encoder_output_ref)
 
             logger.info(f'An EPD language request is dispatched to {node_url}')
             start = node_manager.pre_call(node_url)
             if request.stream is True:
-                response = _stream_epd_language_response(node_manager, request_dict, node_url, encoder_result, start)
+                response = _stream_epd_language_response(node_manager, request_dict, node_url, encoder_output_ref, start)
                 return ProxyStreamingResponse(response, media_type='text/event-stream')
             try:
                 response = await node_manager.generate(request_dict, node_url, '/v1/chat/completions')
                 return JSONResponse(json.loads(response))
             finally:
                 node_manager.post_call(node_url, start)
-                await _release_epd_encoder_result(encoder_result)
+                await _release_epd_encoder_output_ref(encoder_output_ref)
 
         logger.info(f'A request is dispatched to {node_url}')
         start = node_manager.pre_call(node_url)

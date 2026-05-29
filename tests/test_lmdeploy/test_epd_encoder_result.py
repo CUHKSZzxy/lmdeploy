@@ -504,7 +504,7 @@ def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
         _FakeQwen35Model(deepstack_visual_indexes=[5]).compute_encoder_prompt_input(prompt_input)
 
 
-def test_generation_config_carries_encoder_result():
+def test_generation_config_carries_encoder_output_ref():
     ref = EncoderCacheRef(
         token_ids=[1],
         protocol=MigrationProtocol.RDMA,
@@ -514,9 +514,9 @@ def test_generation_config_carries_encoder_result():
         remote_block_ids=[],
     )
 
-    config = GenerationConfig(encoder_result=ref)
+    config = GenerationConfig(encoder_output_ref=ref)
 
-    assert config.encoder_result is ref
+    assert config.encoder_output_ref is ref
 
 
 def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeypatch):
@@ -543,7 +543,7 @@ def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeyp
     async def fake_encoder_response(request, raw_request):
         called['request'] = request
         called['raw_request'] = raw_request
-        return {'object': 'encoder_result'}
+        return {'object': 'encoder_output_ref'}
 
     monkeypatch.setattr(api_server, '_create_epd_encoder_response', fake_encoder_response)
 
@@ -552,7 +552,7 @@ def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeyp
 
     response = asyncio.run(api_server.chat_completions_v1(request, raw_request))
 
-    assert response == {'object': 'encoder_result'}
+    assert response == {'object': 'encoder_output_ref'}
     assert called == {
         'request': request,
         'raw_request': raw_request,

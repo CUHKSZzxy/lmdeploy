@@ -493,12 +493,12 @@ class AsyncEngine:
         """
         metrics_processor.increase_total_requests()
 
-        encoder_result = gen_config.encoder_result if gen_config is not None else None
-        if encoder_result is None:
+        encoder_output_ref = gen_config.encoder_output_ref if gen_config is not None else None
+        if encoder_output_ref is None:
             if (messages is not None) ^ (input_ids is None):
                 raise ValueError('You must specify exactly one of messages or input_ids')
         elif input_ids is not None:
-            raise ValueError('input_ids cannot be specified together with encoder_result')
+            raise ValueError('input_ids cannot be specified together with encoder_output_ref')
         if isinstance(session_id, Session):
             session = session_id
         elif isinstance(session_id, int):
@@ -514,10 +514,10 @@ class AsyncEngine:
             else:
                 logger.warning('chat_template_kwargs["enable_thinking"] is already set, '
                                'the value will not be overwritten by enable_thinking')
-        if encoder_result is not None:
+        if encoder_output_ref is not None:
             try:
                 prompt = messages
-                prompt_input = await load_encoder_output_async(encoder_result)
+                prompt_input = await load_encoder_output_async(encoder_output_ref)
                 input_ids = prompt_input['input_ids']
                 self.request_logger.log_inputs(session,
                                                prompt=prompt,
@@ -525,9 +525,9 @@ class AsyncEngine:
                                                gen_config=gen_config,
                                                adapter_name=adapter_name)
             except Exception:
-                logger.exception('[generate] error in encoder_result processing')
+                logger.exception('[generate] error in encoder_output_ref processing')
                 metrics_processor.increase_failed_requests('error')
-                yield GenOut(response='in encoder_result processing error',
+                yield GenOut(response='in encoder_output_ref processing error',
                              history_token_len=session.step,
                              input_token_len=len(input_ids) if input_ids is not None else 0,
                              generate_token_len=0,

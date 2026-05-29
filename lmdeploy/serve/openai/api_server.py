@@ -313,7 +313,7 @@ async def _create_epd_encoder_response(request: ChatCompletionRequest, raw_reque
             mm_processor_kwargs=request.mm_processor_kwargs)
         prompt_input = await compute_encoder_prompt_input_for_engine(prompt_input, VariableInterface.async_engine)
         session_id = 0 if request.session_id in (None, -1) else int(request.session_id)
-        encoder_result = await publish_encoder_output(
+        encoder_output_ref = await publish_encoder_output(
             prompt_input,
             remote_engine_id=VariableInterface.api_server_url or 'local',
             remote_session_id=session_id,
@@ -327,9 +327,9 @@ async def _create_epd_encoder_response(request: ChatCompletionRequest, raw_reque
 
     return {
         'id': str(request.session_id),
-        'object': 'encoder_result',
+        'object': 'encoder_output_ref',
         'model': model_name,
-        'encoder_result': encoder_result.model_dump(mode='json'),
+        'encoder_output_ref': encoder_output_ref.model_dump(mode='json'),
     }
 
 
@@ -484,12 +484,12 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             request.messages = None
 
     json_request = await raw_request.json()
-    encoder_result = json_request.pop('encoder_result', None)
+    encoder_output_ref = json_request.pop('encoder_output_ref', None)
     migration_request = json_request.pop('migration_request', None)
     with_cache = json_request.pop('with_cache', False)
     preserve_cache = json_request.pop('preserve_cache', False)
-    if encoder_result:
-        encoder_result = EncoderCacheRef.model_validate(encoder_result)
+    if encoder_output_ref:
+        encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
@@ -548,7 +548,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         min_p=request.min_p,
         random_seed=random_seed,
         spaces_between_special_tokens=request.spaces_between_special_tokens,
-        encoder_result=encoder_result,
+        encoder_output_ref=encoder_output_ref,
         migration_request=migration_request,
         with_cache=with_cache,
         preserve_cache=preserve_cache,
@@ -825,12 +825,12 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
     if error_check_ret is not None:
         return error_check_ret
     json_request = await raw_request.json()
-    encoder_result = json_request.pop('encoder_result', None)
+    encoder_output_ref = json_request.pop('encoder_output_ref', None)
     migration_request = json_request.pop('migration_request', None)
     with_cache = json_request.pop('with_cache', False)
     preserve_cache = json_request.pop('preserve_cache', False)
-    if encoder_result:
-        encoder_result = EncoderCacheRef.model_validate(encoder_result)
+    if encoder_output_ref:
+        encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
@@ -866,7 +866,7 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
         min_p=request.min_p,
         random_seed=random_seed,
         spaces_between_special_tokens=request.spaces_between_special_tokens,
-        encoder_result=encoder_result,
+        encoder_output_ref=encoder_output_ref,
         migration_request=migration_request,
         with_cache=with_cache,
         preserve_cache=preserve_cache,
