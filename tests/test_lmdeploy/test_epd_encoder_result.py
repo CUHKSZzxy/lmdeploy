@@ -9,7 +9,7 @@ from torch import nn
 
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
 from lmdeploy.pytorch.disagg.config import EngineRole
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
 from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
@@ -31,8 +31,8 @@ from lmdeploy.pytorch.disagg.epd.engine import (
 from lmdeploy.vl.constants import Modality
 
 
-def test_encoder_cache_ref_round_trip():
-    ref = EncoderCacheRef(
+def test_encoder_output_ref_round_trip():
+    ref = EncoderOutputRef(
         token_ids=[1, 2, 3],
         mm_mask=[0, 1, 0],
         input_embedding_ranges=[[1, 3]],
@@ -47,7 +47,7 @@ def test_encoder_cache_ref_round_trip():
     )
 
     dumped = ref.model_dump(mode='json')
-    loaded = EncoderCacheRef.model_validate(dumped)
+    loaded = EncoderOutputRef.model_validate(dumped)
 
     assert loaded.token_ids == [1, 2, 3]
     assert loaded.protocol is MigrationProtocol.RDMA
@@ -505,7 +505,7 @@ def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
 
 
 def test_generation_config_carries_encoder_output_ref():
-    ref = EncoderCacheRef(
+    ref = EncoderOutputRef(
         token_ids=[1],
         protocol=MigrationProtocol.RDMA,
         transfer_id='epd-test',

@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheRef, MigrationProtocol, MigrationRequest
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
 from lmdeploy.pytorch.disagg.epd.dlslime import build_encoder_transfer_config, release_remote_encoder_output_async
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
@@ -492,22 +492,22 @@ def _has_multimodal_chat_messages(messages) -> bool:
     return False
 
 
-def _build_epd_language_request(request_dict: dict, encoder_output_ref: dict | EncoderCacheRef) -> dict:
+def _build_epd_language_request(request_dict: dict, encoder_output_ref: dict | EncoderOutputRef) -> dict:
     request_dict = copy.deepcopy(request_dict)
-    encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
+    encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
     request_dict['encoder_output_ref'] = encoder_output_ref.model_dump(mode='json')
     return request_dict
 
 
-async def _release_epd_encoder_output_ref(encoder_output_ref: dict | EncoderCacheRef | None):
+async def _release_epd_encoder_output_ref(encoder_output_ref: dict | EncoderOutputRef | None):
     if encoder_output_ref is None:
         return
-    encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
+    encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
     await release_remote_encoder_output_async(encoder_output_ref)
 
 
 async def _stream_epd_language_response(node_manager, request_dict: dict, node_url: str,
-                                        encoder_output_ref: dict | EncoderCacheRef | None, start: float):
+                                        encoder_output_ref: dict | EncoderOutputRef | None, start: float):
     try:
         async for line in node_manager.stream_generate(request_dict, node_url, '/v1/chat/completions'):
             yield line
@@ -538,7 +538,7 @@ def _extract_epd_encoder_output_ref(response_text: str | bytes) -> dict:
             message = error.get('message') if isinstance(error, dict) else str(error)
             raise ValueError(f'encoder node error: {message}')
         raise ValueError('encoder node response does not contain encoder_output_ref')
-    return EncoderCacheRef.model_validate(response['encoder_output_ref']).model_dump(mode='json')
+    return EncoderOutputRef.model_validate(response['encoder_output_ref']).model_dump(mode='json')
 
 
 app = FastAPI(docs_url='/')

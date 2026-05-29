@@ -43,7 +43,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeDropConnectionRequest,
     DistServeInitRequest,
     EncoderCacheFreeRequest,
-    EncoderCacheRef,
+    EncoderOutputRef,
     MigrationRequest,
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
@@ -489,7 +489,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
     with_cache = json_request.pop('with_cache', False)
     preserve_cache = json_request.pop('preserve_cache', False)
     if encoder_output_ref:
-        encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
+        encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 
@@ -830,7 +830,7 @@ async def completions_v1(request: CompletionRequest, raw_request: Request = None
     with_cache = json_request.pop('with_cache', False)
     preserve_cache = json_request.pop('preserve_cache', False)
     if encoder_output_ref:
-        encoder_output_ref = EncoderCacheRef.model_validate(encoder_output_ref)
+        encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
     if migration_request:
         migration_request = MigrationRequest.model_validate(migration_request)
 

@@ -13,7 +13,7 @@ from typing import Any
 import aiohttp
 import torch
 
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheFreeRequest, EncoderCacheRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheFreeRequest, EncoderOutputRef, MigrationProtocol
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.utils import get_logger
 
@@ -236,7 +236,7 @@ class DLSlimeEncoderTransferManager:
                       remote_session_id: int,
                       transfer_id: str,
                       receiver_endpoint_info: dict | None = None,
-                      receiver_engine_id: str | None = None) -> EncoderCacheRef:
+                      receiver_engine_id: str | None = None) -> EncoderOutputRef:
         if receiver_endpoint_info:
             self._connect_once(receiver_engine_id or remote_engine_id, receiver_endpoint_info)
         layout = _build_embedding_layout(prompt_input, self.device)
@@ -244,7 +244,7 @@ class DLSlimeEncoderTransferManager:
         self._published_tensors[transfer_id] = layout.tensor
         self._published_mr_keys[transfer_id] = transfer_id
 
-        return EncoderCacheRef(
+        return EncoderOutputRef(
             token_ids=_to_int_list(prompt_input.get('input_ids') or []),
             input_embedding_ranges=layout.ranges,
             protocol=MigrationProtocol.RDMA,
@@ -261,7 +261,7 @@ class DLSlimeEncoderTransferManager:
             },
         )
 
-    async def receive(self, encoder_output_ref: EncoderCacheRef) -> dict:
+    async def receive(self, encoder_output_ref: EncoderOutputRef) -> dict:
         if not encoder_output_ref.transfer_id:
             raise ValueError('DLSlime RDMA encoder_output_ref requires transfer_id.')
         endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
@@ -328,7 +328,7 @@ def get_dlslime_encoder_transfer_manager() -> DLSlimeEncoderTransferManager:
 
 
 async def publish_encoder_output(prompt_input: dict, remote_engine_id: str, remote_session_id: int,
-                                 transfer_config: EncoderTransferConfig) -> EncoderCacheRef:
+                                 transfer_config: EncoderTransferConfig) -> EncoderOutputRef:
     """Publish computed encoder output through DLSlime."""
     manager = get_dlslime_encoder_transfer_manager()
     return await manager.publish(prompt_input,
@@ -339,7 +339,7 @@ async def publish_encoder_output(prompt_input: dict, remote_engine_id: str, remo
                                  receiver_engine_id=transfer_config.receiver_engine_id)
 
 
-async def load_encoder_output_async(encoder_output_ref: EncoderCacheRef) -> dict:
+async def load_encoder_output_async(encoder_output_ref: EncoderOutputRef) -> dict:
     """Convert an encoder cache ref into prompt input through DLSlime."""
     manager = get_dlslime_encoder_transfer_manager()
     try:
@@ -354,7 +354,7 @@ async def release_published_encoder_output_async(request: EncoderCacheFreeReques
     manager.release_published(request.transfer_id)
 
 
-async def release_remote_encoder_output_async(encoder_output_ref: EncoderCacheRef) -> None:
+async def release_remote_encoder_output_async(encoder_output_ref: EncoderOutputRef) -> None:
     """Release remote producer state after a DLSlime transfer is consumed."""
     if not encoder_output_ref.transfer_id:
         return

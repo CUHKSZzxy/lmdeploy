@@ -92,7 +92,7 @@ class MigrationRequest(BaseModel):
     is_dummy_prefill: bool = False
 
 
-class EncoderCacheRef(BaseModel):
+class EncoderOutputRef(BaseModel):
     """Reference to encoder outputs produced by an EPD encoder node."""
 
     token_ids: list[int]
