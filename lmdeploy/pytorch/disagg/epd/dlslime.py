@@ -186,6 +186,7 @@ class DLSlimeEncoderTransferManager:
         self._connected_engine_ids: set[str] = set()
         self._published_tensors: dict[str, torch.Tensor] = {}
         self._published_mr_keys: dict[str, str] = {}
+        self._remote_mr_lock = asyncio.Lock()
 
     @staticmethod
     def _create_endpoint(link_type: str, ib_port: int, rank: int, device_name: str | None):
@@ -240,6 +241,10 @@ class DLSlimeEncoderTransferManager:
         if receiver_endpoint_info:
             self._connect_once(receiver_engine_id or remote_engine_id, receiver_endpoint_info)
         layout = _build_embedding_layout(prompt_input, self.device)
+        # Encoder output is produced asynchronously on CUDA; wait before registering the
+        # RDMA buffer so the receiver never reads data still being written.
+        if layout.tensor.is_cuda:
+            torch.cuda.synchronize(layout.tensor.device)
         self.endpoint.register_memory_region(transfer_id, layout.tensor.data_ptr(), 0, layout.nbytes)
         self._published_tensors[transfer_id] = layout.tensor
         self._published_mr_keys[transfer_id] = transfer_id
@@ -279,16 +284,19 @@ class DLSlimeEncoderTransferManager:
         hidden_size = int(shapes[0][1])
         output = torch.empty((total_rows, hidden_size), dtype=dtype, device=self.device)
 
-        local_key = f'{encoder_output_ref.transfer_id}:recv'
-        remote_key = f'{encoder_output_ref.transfer_id}:remote'
-        local_handle = self.endpoint.register_memory_region(local_key, output.data_ptr(), 0, int(nbytes))
-        try:
-            self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
+        local_key = 'epd_encoder_output_recv'
+        remote_key = 'epd_encoder_output_remote'
+        self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
+        # Reuse fixed DLSlime MR keys to avoid accumulating remote registrations; serialize
+        # the rebind/read critical section because concurrent requests share those keys.
+        async with self._remote_mr_lock:
+            local_handle = self.endpoint.register_memory_region(local_key, output.data_ptr(), 0, int(nbytes))
             remote_handle = self.endpoint.register_remote_memory_region(remote_key, _jsonable(remote_mr_info))
-            future = self.endpoint.read([(local_handle, remote_handle, 0, 0, int(nbytes))])
-            await _wait_dlslime_future(future)
-        finally:
-            self._unregister_memory_region(local_key)
+            try:
+                future = self.endpoint.read([(local_handle, remote_handle, 0, 0, int(nbytes))])
+                await _wait_dlslime_future(future)
+            finally:
+                self._unregister_memory_region(local_key)
 
         ranges = encoder_output_ref.input_embedding_ranges or []
         embeddings = []

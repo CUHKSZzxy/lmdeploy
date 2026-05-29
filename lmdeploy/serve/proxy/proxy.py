@@ -232,7 +232,8 @@ class NodeManager:
             try:
                 response = requests.get(url, headers=headers)
                 if response.status_code != 200:
-                    to_be_deleted.append(node_url)
+                    logger.warning(f'Keep node_url: {node_url} '
+                                   f'despite health status {response.status_code}')
             except:  # noqa
                 to_be_deleted.append(node_url)
         for node_url in to_be_deleted:
@@ -737,7 +738,13 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         if not node_url:
             return node_manager.handle_unavailable_model(request.model)
 
-        if node_manager.encoder_nodes and _has_multimodal_chat_messages(request.messages):
+        has_multimodal = _has_multimodal_chat_messages(request.messages)
+        node_status = node_manager.nodes[node_url]
+        if has_multimodal and not node_manager.encoder_nodes and node_status.encoder_output_receiver_endpoint_info:
+            return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE,
+                                         'No encoder node is available for multimodal EPD request.')
+
+        if node_manager.encoder_nodes and has_multimodal:
             encoder_url = node_manager.get_node_url(request.model, EngineRole.Encoder)
             if not encoder_url:
                 return node_manager.handle_unavailable_model(request.model)
@@ -745,7 +752,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             request_dict = await raw_request.json()
             encoder_output_ref = request_dict.get('encoder_output_ref')
             if encoder_output_ref is None:
-                language_status = node_manager.nodes[node_url]
+                language_status = node_status
                 try:
                     encoder_request = _build_epd_encoder_request(request_dict, node_url, language_status)
                 except ValueError as exc:
