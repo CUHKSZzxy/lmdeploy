@@ -21,6 +21,8 @@ from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.pytorch.disagg.epd.dlslime import (
     DLSlimeEncoderTransferManager,
+    EncoderTransferConfig,
+    _build_embedding_layout,
     build_encoder_transfer_config,
     publish_encoder_output,
     set_dlslime_encoder_transfer_manager,
@@ -97,6 +99,33 @@ def test_dlslime_encoder_transfer_config_generates_transfer_id_and_requires_mana
                 remote_session_id=5,
                 transfer_config=config,
             ))
+
+
+def test_encoder_transfer_config_requires_transfer_id_and_receiver_endpoint():
+    endpoint_info = {'io_info': {'data_channel_info': []}}
+
+    with pytest.raises(ValueError, match='requires transfer_id'):
+        EncoderTransferConfig(receiver_endpoint_info=endpoint_info)
+
+    with pytest.raises(ValueError, match='requires receiver_endpoint_info'):
+        EncoderTransferConfig(transfer_id='epd-test')
+
+
+def test_build_embedding_layout_preserves_ranges_and_rejects_mismatch():
+    first = InputEmbeddings(torch.ones(2, 4), start=3, end=5)
+    second = InputEmbeddings(torch.ones(3, 4), start=10, end=13)
+
+    layout = _build_embedding_layout({'input_embeddings': [first, second]}, torch.device('cpu'))
+
+    assert layout.tensor.is_contiguous()
+    assert layout.tensor.shape == (5, 4)
+    assert layout.ranges == [[3, 5], [10, 13]]
+    assert layout.shapes == [[2, 4], [3, 4]]
+    assert layout.nbytes == layout.tensor.numel() * layout.tensor.element_size()
+
+    mismatch = InputEmbeddings(torch.ones(2, 4), start=3, end=6)
+    with pytest.raises(ValueError, match='does not match rows'):
+        _build_embedding_layout({'input_embeddings': [mismatch]}, torch.device('cpu'))
 
 
 class _FakeDLSlimeFuture:
@@ -219,7 +248,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     assert received.start == 1
     assert received.end == 3
     torch.testing.assert_close(received.embeddings, source)
-    assert 'epd-test:recv' in consumer.endpoint.unregistered
+    assert 'epd_encoder_output_recv' in consumer.endpoint.unregistered
     producer.release_published('epd-test')
     assert producer._published_tensors == {}
     assert 'epd-test' in producer.endpoint.unregistered

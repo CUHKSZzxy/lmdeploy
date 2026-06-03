@@ -1,6 +1,8 @@
 import asyncio
 import importlib
 
+import pytest
+
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
 from lmdeploy.serve.proxy.proxy import (
@@ -8,6 +10,7 @@ from lmdeploy.serve.proxy.proxy import (
     Status,
     _build_epd_encoder_request,
     _build_epd_language_request,
+    _call_epd_encoder_node,
     _release_epd_encoder_output_ref,
     _has_multimodal_chat_messages,
 )
@@ -92,6 +95,42 @@ def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
     assert encoder_request['encoder_output_receiver_endpoint_info'] == endpoint_info
     assert encoder_request['encoder_output_receiver_engine_id'] == 'http://language'
     assert encoder_request['epd_transfer_id'].startswith('epd-')
+
+
+def test_call_epd_encoder_node_balances_node_accounting_on_error():
+
+    class _FailingNodeManager:
+
+        def __init__(self):
+            self.calls = []
+
+        def pre_call(self, node_url):
+            self.calls.append(('pre', node_url))
+            return 1.0
+
+        def post_call(self, node_url, start):
+            self.calls.append(('post', node_url, start))
+
+        async def generate(self, request_dict, node_url, path):
+            raise RuntimeError('encoder failed')
+
+    endpoint_info = {'io_info': {'data_channel_info': []}}
+    language_status = Status(
+        role=EngineRole.Hybrid,
+        models=['m'],
+        encoder_output_receiver_endpoint_info=endpoint_info,
+    )
+    request_dict = {
+        'model': 'm',
+        'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}}]}],
+    }
+    manager = _FailingNodeManager()
+
+    with pytest.raises(RuntimeError, match='encoder failed'):
+        asyncio.run(_call_epd_encoder_node(manager, request_dict, 'http://encoder', 'http://language',
+                                           language_status))
+
+    assert manager.calls == [('pre', 'http://encoder'), ('post', 'http://encoder', 1.0)]
 
 
 def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):

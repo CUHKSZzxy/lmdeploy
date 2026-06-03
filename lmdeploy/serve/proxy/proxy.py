@@ -542,6 +542,33 @@ def _extract_epd_encoder_output_ref(response_text: str | bytes) -> dict:
     return EncoderOutputRef.model_validate(response['encoder_output_ref']).model_dump(mode='json')
 
 
+async def _call_epd_encoder_node(node_manager: NodeManager, request_dict: dict, encoder_url: str, language_url: str,
+                                 language_status: Status) -> dict:
+    encoder_request = _build_epd_encoder_request(request_dict, language_url, language_status)
+    logger.info(f'An Encoder request is dispatched to {encoder_url}')
+    start = node_manager.pre_call(encoder_url)
+    try:
+        encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/completions')
+    finally:
+        node_manager.post_call(encoder_url, start)
+    return _extract_epd_encoder_output_ref(encoder_response)
+
+
+async def _dispatch_epd_language_request(node_manager: NodeManager, request: ChatCompletionRequest, request_dict: dict,
+                                         language_url: str, encoder_output_ref: dict | EncoderOutputRef | None):
+    logger.info(f'An EPD language request is dispatched to {language_url}')
+    start = node_manager.pre_call(language_url)
+    if request.stream is True:
+        response = _stream_epd_language_response(node_manager, request_dict, language_url, encoder_output_ref, start)
+        return ProxyStreamingResponse(response, media_type='text/event-stream')
+    try:
+        response = await node_manager.generate(request_dict, language_url, '/v1/chat/completions')
+        return JSONResponse(json.loads(response))
+    finally:
+        node_manager.post_call(language_url, start)
+        await _release_epd_encoder_output_ref(encoder_output_ref)
+
+
 app = FastAPI(docs_url='/')
 app.add_middleware(
     CORSMiddleware,
@@ -740,44 +767,27 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
 
         has_multimodal = _has_multimodal_chat_messages(request.messages)
         node_status = node_manager.nodes[node_url]
-        if has_multimodal and not node_manager.encoder_nodes and node_status.encoder_output_receiver_endpoint_info:
+        encoder_nodes = node_manager.encoder_nodes
+        if has_multimodal and not encoder_nodes and node_status.encoder_output_receiver_endpoint_info:
             return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE,
                                          'No encoder node is available for multimodal EPD request.')
 
-        if node_manager.encoder_nodes and has_multimodal:
+        if has_multimodal and encoder_nodes:
             encoder_url = node_manager.get_node_url(request.model, EngineRole.Encoder)
             if not encoder_url:
                 return node_manager.handle_unavailable_model(request.model)
 
             request_dict = await raw_request.json()
             encoder_output_ref = request_dict.get('encoder_output_ref')
-            if encoder_output_ref is None:
-                language_status = node_status
-                try:
-                    encoder_request = _build_epd_encoder_request(request_dict, node_url, language_status)
-                except ValueError as exc:
-                    return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
-                logger.info(f'An Encoder request is dispatched to {encoder_url}')
-                start = node_manager.pre_call(encoder_url)
-                encoder_response = await node_manager.generate(encoder_request, encoder_url, '/v1/chat/completions')
-                node_manager.post_call(encoder_url, start)
-                try:
-                    encoder_output_ref = _extract_epd_encoder_output_ref(encoder_response)
-                except ValueError as exc:
-                    return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
-                request_dict = _build_epd_language_request(request_dict, encoder_output_ref)
-
-            logger.info(f'An EPD language request is dispatched to {node_url}')
-            start = node_manager.pre_call(node_url)
-            if request.stream is True:
-                response = _stream_epd_language_response(node_manager, request_dict, node_url, encoder_output_ref, start)
-                return ProxyStreamingResponse(response, media_type='text/event-stream')
             try:
-                response = await node_manager.generate(request_dict, node_url, '/v1/chat/completions')
-                return JSONResponse(json.loads(response))
-            finally:
-                node_manager.post_call(node_url, start)
-                await _release_epd_encoder_output_ref(encoder_output_ref)
+                if encoder_output_ref is None:
+                    encoder_output_ref = await _call_epd_encoder_node(node_manager, request_dict, encoder_url,
+                                                                      node_url, node_status)
+                request_dict = _build_epd_language_request(request_dict, encoder_output_ref)
+            except ValueError as exc:
+                return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+            return await _dispatch_epd_language_request(node_manager, request, request_dict, node_url,
+                                                        encoder_output_ref)
 
         logger.info(f'A request is dispatched to {node_url}')
         start = node_manager.pre_call(node_url)

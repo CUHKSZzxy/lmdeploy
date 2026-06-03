@@ -82,25 +82,6 @@ class _EmbeddingLayout:
     nbytes: int
 
 
-def _to_int_list(values) -> list[int]:
-    if hasattr(values, 'tolist'):
-        values = values.tolist()
-    return [int(value) for value in values]
-
-
-def _embedding_range(embedding, ranges, index: int) -> list[int]:
-    if ranges is not None:
-        return _to_int_list(ranges[index])
-    if hasattr(embedding, 'start') and hasattr(embedding, 'end'):
-        return [int(embedding.start), int(embedding.end)]
-    raise ValueError('input_embedding_ranges are required for DLSlime RDMA encoder embeddings.')
-
-
-def _dtype_name(dtype: torch.dtype) -> str:
-    name = str(dtype)
-    return name.split('.', 1)[1] if name.startswith('torch.') else name
-
-
 def _jsonable(value: Any):
     if isinstance(value, str):
         try:
@@ -132,7 +113,12 @@ def _build_embedding_layout(prompt_input: dict, device: torch.device) -> _Embedd
     hidden_size: int | None = None
 
     for index, embedding in enumerate(input_embeddings):
-        start, end = _embedding_range(embedding, input_embedding_ranges, index)
+        if input_embedding_ranges is not None:
+            start, end = [int(value) for value in input_embedding_ranges[index]]
+        elif hasattr(embedding, 'start') and hasattr(embedding, 'end'):
+            start, end = int(embedding.start), int(embedding.end)
+        else:
+            raise ValueError('input_embedding_ranges are required for DLSlime RDMA encoder embeddings.')
         tensor = _embedding_tensor(embedding, device)
         if tensor.ndim != 2:
             raise ValueError(f'DLSlime RDMA encoder embedding must be 2-D, got shape {tuple(tensor.shape)}')
@@ -149,11 +135,14 @@ def _build_embedding_layout(prompt_input: dict, device: torch.device) -> _Embedd
         shapes.append(list(tensor.shape))
 
     flat_tensor = torch.cat(tensors, dim=0).contiguous()
+    dtype_name = str(flat_tensor.dtype)
+    if dtype_name.startswith('torch.'):
+        dtype_name = dtype_name.split('.', 1)[1]
     return _EmbeddingLayout(
         tensor=flat_tensor,
         ranges=ranges,
         shapes=shapes,
-        dtype=_dtype_name(flat_tensor.dtype),
+        dtype=dtype_name,
         nbytes=flat_tensor.numel() * flat_tensor.element_size(),
     )
 
@@ -241,16 +230,18 @@ class DLSlimeEncoderTransferManager:
         if receiver_endpoint_info:
             self._connect_once(receiver_engine_id or remote_engine_id, receiver_endpoint_info)
         layout = _build_embedding_layout(prompt_input, self.device)
+
         # Encoder output is produced asynchronously on CUDA; wait before registering the
         # RDMA buffer so the receiver never reads data still being written.
         if layout.tensor.is_cuda:
             torch.cuda.synchronize(layout.tensor.device)
+
         self.endpoint.register_memory_region(transfer_id, layout.tensor.data_ptr(), 0, layout.nbytes)
         self._published_tensors[transfer_id] = layout.tensor
         self._published_mr_keys[transfer_id] = transfer_id
 
         return EncoderOutputRef(
-            token_ids=_to_int_list(prompt_input.get('input_ids') or []),
+            token_ids=list(prompt_input.get('input_ids') or []),
             input_embedding_ranges=layout.ranges,
             protocol=MigrationProtocol.RDMA,
             transfer_id=transfer_id,
@@ -284,19 +275,8 @@ class DLSlimeEncoderTransferManager:
         hidden_size = int(shapes[0][1])
         output = torch.empty((total_rows, hidden_size), dtype=dtype, device=self.device)
 
-        local_key = 'epd_encoder_output_recv'
-        remote_key = 'epd_encoder_output_remote'
         self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
-        # Reuse fixed DLSlime MR keys to avoid accumulating remote registrations; serialize
-        # the rebind/read critical section because concurrent requests share those keys.
-        async with self._remote_mr_lock:
-            local_handle = self.endpoint.register_memory_region(local_key, output.data_ptr(), 0, int(nbytes))
-            remote_handle = self.endpoint.register_remote_memory_region(remote_key, _jsonable(remote_mr_info))
-            try:
-                future = self.endpoint.read([(local_handle, remote_handle, 0, 0, int(nbytes))])
-                await _wait_dlslime_future(future)
-            finally:
-                self._unregister_memory_region(local_key)
+        await self._rdma_read_encoder_output(output, remote_mr_info, int(nbytes))
 
         ranges = encoder_output_ref.input_embedding_ranges or []
         embeddings = []
@@ -306,6 +286,20 @@ class DLSlimeEncoderTransferManager:
             embeddings.append(InputEmbeddings(output[offset:offset + rows], start=int(start), end=int(end)))
             offset += rows
         return dict(prompt=None, input_ids=list(encoder_output_ref.token_ids), input_embeddings=embeddings)
+
+    async def _rdma_read_encoder_output(self, output: torch.Tensor, remote_mr_info, nbytes: int):
+        local_key = 'epd_encoder_output_recv'
+        remote_key = 'epd_encoder_output_remote'
+        # Reuse fixed DLSlime MR keys to avoid accumulating remote registrations; serialize
+        # the rebind/read critical section because concurrent requests share those keys.
+        async with self._remote_mr_lock:
+            local_handle = self.endpoint.register_memory_region(local_key, output.data_ptr(), 0, nbytes)
+            remote_handle = self.endpoint.register_remote_memory_region(remote_key, _jsonable(remote_mr_info))
+            try:
+                future = self.endpoint.read([(local_handle, remote_handle, 0, 0, nbytes)])
+                await _wait_dlslime_future(future)
+            finally:
+                self._unregister_memory_region(local_key)
 
     def release_published(self, transfer_id: str):
         key = self._published_mr_keys.pop(transfer_id, None)
