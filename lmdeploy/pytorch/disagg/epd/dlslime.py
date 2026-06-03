@@ -247,7 +247,6 @@ class DLSlimeEncoderTransferManager:
             transfer_id=transfer_id,
             remote_engine_id=remote_engine_id,
             remote_session_id=remote_session_id,
-            remote_block_ids=[],
             dtype=layout.dtype,
             shape=layout.shapes,
             extra={
@@ -258,8 +257,6 @@ class DLSlimeEncoderTransferManager:
         )
 
     async def receive(self, encoder_output_ref: EncoderOutputRef) -> dict:
-        if not encoder_output_ref.transfer_id:
-            raise ValueError('DLSlime RDMA encoder_output_ref requires transfer_id.')
         endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
         remote_mr_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_MR_INFO)
         nbytes = encoder_output_ref.extra.get(_DLSLIME_EXTRA_NBYTES)
@@ -269,16 +266,27 @@ class DLSlimeEncoderTransferManager:
         shapes = encoder_output_ref.shape or []
         if not isinstance(shapes, list) or len(shapes) == 0 or not isinstance(shapes[0], list):
             raise ValueError('DLSlime RDMA encoder_output_ref requires per-embedding shapes.')
-        assert encoder_output_ref.dtype is not None
+        ranges = encoder_output_ref.input_embedding_ranges
+        if len(shapes) != len(ranges):
+            raise ValueError('DLSlime RDMA encoder_output_ref shape and embedding range counts do not match.')
         dtype = getattr(torch, encoder_output_ref.dtype)
         total_rows = sum(int(shape[0]) for shape in shapes)
         hidden_size = int(shapes[0][1])
+        for shape, (start, end) in zip(shapes, ranges):
+            if len(shape) != 2:
+                raise ValueError('DLSlime RDMA encoder_output_ref requires 2-D embedding shapes.')
+            if int(shape[1]) != hidden_size:
+                raise ValueError('DLSlime RDMA encoder_output_ref embeddings must share hidden size.')
+            if int(end) - int(start) != int(shape[0]):
+                raise ValueError('DLSlime RDMA encoder_output_ref range length does not match embedding shape.')
         output = torch.empty((total_rows, hidden_size), dtype=dtype, device=self.device)
+        expected_nbytes = output.numel() * output.element_size()
+        if int(nbytes) != expected_nbytes:
+            raise ValueError('DLSlime RDMA encoder_output_ref byte size does not match embedding shape and dtype.')
 
         self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
         await self._rdma_read_encoder_output(output, remote_mr_info, int(nbytes))
 
-        ranges = encoder_output_ref.input_embedding_ranges or []
         embeddings = []
         offset = 0
         for shape, (start, end) in zip(shapes, ranges):

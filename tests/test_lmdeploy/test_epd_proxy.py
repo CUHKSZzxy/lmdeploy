@@ -60,11 +60,13 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_outpu
     }
     encoder_output_ref = {
         'token_ids': [1, 2],
+        'input_embedding_ranges': [[0, 2]],
         'protocol': MigrationProtocol.RDMA.name,
         'transfer_id': 'epd-test',
         'remote_engine_id': 'http://encoder',
         'remote_session_id': 3,
-        'remote_block_ids': [],
+        'dtype': 'float32',
+        'shape': [[2, 4]],
     }
 
     language_request = _build_epd_language_request(request_dict, encoder_output_ref)
@@ -142,11 +144,13 @@ def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):
     monkeypatch.setattr(proxy_mod, 'release_remote_encoder_output_async', fake_release)
     encoder_output_ref = {
         'token_ids': [1, 2],
+        'input_embedding_ranges': [[0, 2]],
         'protocol': MigrationProtocol.RDMA.name,
         'transfer_id': 'epd-test',
         'remote_engine_id': 'http://encoder',
         'remote_session_id': 3,
-        'remote_block_ids': [],
+        'dtype': 'float32',
+        'shape': [[2, 4]],
     }
 
     asyncio.run(_release_epd_encoder_output_ref(encoder_output_ref))

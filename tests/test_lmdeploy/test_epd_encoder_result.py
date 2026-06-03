@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 import ctypes
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -8,7 +10,7 @@ import torch
 from torch import nn
 
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
-from lmdeploy.pytorch.disagg.config import EngineRole
+from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
 from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
@@ -36,16 +38,13 @@ from lmdeploy.vl.constants import Modality
 def test_encoder_output_ref_round_trip():
     ref = EncoderOutputRef(
         token_ids=[1, 2, 3],
-        mm_mask=[0, 1, 0],
         input_embedding_ranges=[[1, 3]],
         transfer_id='epd-test',
         protocol=MigrationProtocol.RDMA,
         remote_engine_id='encoder-0',
         remote_session_id=7,
-        remote_block_ids=[11, 12],
         dtype='float32',
         shape=[[2, 2]],
-        modality='image',
     )
 
     dumped = ref.model_dump(mode='json')
@@ -252,6 +251,43 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     producer.release_published('epd-test')
     assert producer._published_tensors == {}
     assert 'epd-test' in producer.endpoint.unregistered
+
+
+def test_dlslime_encoder_transfer_manager_rejects_bad_receive_metadata():
+    source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    prompt_input = {
+        'input_ids': [10, 11, 12, 13],
+        'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
+    }
+    producer = DLSlimeEncoderTransferManager('encoder', endpoint=_FakeDLSlimeEndpoint('encoder'), device='cpu')
+    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+
+    ref = asyncio.run(
+        producer.publish(
+            prompt_input,
+            remote_engine_id='http://encoder',
+            remote_session_id=5,
+            transfer_id='epd-test',
+            receiver_endpoint_info=consumer.endpoint_info,
+            receiver_engine_id='http://language',
+        ))
+
+    bad_nbytes = ref.model_copy(deep=True)
+    bad_nbytes.extra['dlslime_nbytes'] = int(bad_nbytes.extra['dlslime_nbytes']) + 4
+    with pytest.raises(ValueError, match='byte size'):
+        asyncio.run(consumer.receive(bad_nbytes))
+
+    bad_ranges = ref.model_copy(deep=True)
+    bad_ranges.input_embedding_ranges = []
+    with pytest.raises(ValueError, match='counts do not match'):
+        asyncio.run(consumer.receive(bad_ranges))
+
+    bad_range_len = ref.model_copy(deep=True)
+    bad_range_len.input_embedding_ranges = [[1, 4]]
+    with pytest.raises(ValueError, match='range length'):
+        asyncio.run(consumer.receive(bad_range_len))
+
+    producer.release_published('epd-test')
 
 
 def test_dlslime_encoder_transfer_manager_releases_through_endpoint_pool():
@@ -536,11 +572,13 @@ def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
 def test_generation_config_carries_encoder_output_ref():
     ref = EncoderOutputRef(
         token_ids=[1],
+        input_embedding_ranges=[[0, 1]],
         protocol=MigrationProtocol.RDMA,
         transfer_id='epd-test',
         remote_engine_id='encoder-0',
         remote_session_id=1,
-        remote_block_ids=[],
+        dtype='float32',
+        shape=[[1, 4]],
     )
 
     config = GenerationConfig(encoder_output_ref=ref)
@@ -586,6 +624,116 @@ def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeyp
         'request': request,
         'raw_request': raw_request,
     }
+
+
+def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
+    from lmdeploy.serve.openai import api_server
+
+    class _FakeHealthMonitor:
+
+        def __init__(self, async_engine):
+            self.async_engine = async_engine
+
+        def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    class _FakeTransferManager:
+
+        def __init__(self, engine_id, rank):
+            self.engine_id = engine_id
+            created.append((engine_id, rank))
+
+        def close(self):
+            closed.append(self.engine_id)
+
+    async def _fake_stop_metrics_handler():
+        return None
+
+    def _config(role=EngineRole.Hybrid, language_only=False):
+        return type('FakeBackendConfig', (), {
+            'role': role,
+            'language_only': language_only,
+            'migration_backend': MigrationBackend.DLSlime,
+            'dp_rank': 0,
+            'enable_metrics': False,
+        })()
+
+    async def _run_lifespan(config):
+        handler = api_server.create_lifespan_handler(config, object())
+        async with handler(None):
+            pass
+
+    created = []
+    closed = []
+    set_managers = []
+    monkeypatch.setattr(api_server.VariableInterface, 'proxy_url', 'http://proxy')
+    monkeypatch.setattr(api_server.VariableInterface, 'api_server_url', 'http://language')
+    monkeypatch.setattr(api_server, 'EngineHealthMonitor', _FakeHealthMonitor)
+    monkeypatch.setattr(api_server, 'DLSlimeEncoderTransferManager', _FakeTransferManager)
+    monkeypatch.setattr(api_server, 'set_dlslime_encoder_transfer_manager', set_managers.append)
+    monkeypatch.setattr(api_server.metrics_processor, 'stop_metrics_handler', _fake_stop_metrics_handler)
+
+    asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_only=False)))
+    assert created == []
+    assert set_managers == []
+
+    asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_only=True)))
+    asyncio.run(_run_lifespan(_config(role=EngineRole.Encoder, language_only=False)))
+
+    assert created == [('http://language', 0), ('http://language', 0)]
+    assert closed == ['http://language', 'http://language']
+    assert len(set_managers) == 4
+    assert set_managers[1] is None
+    assert set_managers[3] is None
+
+
+def test_startup_event_advertises_encoder_receiver_only_for_language_only(monkeypatch):
+    from lmdeploy.serve.openai import api_server
+
+    class _FakeEngine:
+        is_dummy = False
+
+    class _FakeAsyncEngine:
+        model_name = 'm'
+        engine = _FakeEngine()
+
+        def __init__(self, backend_config):
+            self.backend_config = backend_config
+
+        def start_loop(self, loop, use_async_api=True):
+            return None
+
+    def _config(language_only=False):
+        return type('FakeBackendConfig', (), {
+            'role': EngineRole.Hybrid,
+            'language_only': language_only,
+            'migration_backend': MigrationBackend.DLSlime,
+            'adapters': [],
+            'logprobs_mode': None,
+        })()
+
+    posts = []
+
+    def _fake_post(url, headers, json):
+        posts.append(json)
+        return type('FakeResponse', (), {'status_code': 200, 'text': ''})()
+
+    monkeypatch.setitem(sys.modules, 'requests', types.SimpleNamespace(post=_fake_post))
+    monkeypatch.setattr(api_server.VariableInterface, 'proxy_url', 'http://proxy')
+    monkeypatch.setattr(api_server.VariableInterface, 'api_server_url', 'http://node')
+    monkeypatch.setattr(api_server, 'get_dlslime_encoder_transfer_manager',
+                        lambda: type('FakeManager', (), {'endpoint_info': {'rdma': 'endpoint'}})())
+
+    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_only=False)))
+    asyncio.run(api_server.startup_event())
+    assert posts[-1]['status']['encoder_output_receiver_endpoint_info'] is None
+
+    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_only=True)))
+    asyncio.run(api_server.startup_event())
+    assert posts[-1]['status']['encoder_output_receiver_endpoint_info'] == {'rdma': 'endpoint'}
 
 
 def test_engine_instance_forwards_input_embeddings_to_add_message():

@@ -1405,7 +1405,7 @@ async def startup_event():
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
         encoder_output_receiver_endpoint_info = None
         if (getattr(engine_config, 'migration_backend', None) == MigrationBackend.DLSlime
-                and getattr(engine_config, 'role', None) != EngineRole.Encoder):
+                and getattr(engine_config, 'language_only', False)):
             encoder_output_receiver_endpoint_info = get_dlslime_encoder_transfer_manager().endpoint_info
         url = f'{VariableInterface.proxy_url}/nodes/add'
         status = {
@@ -1495,8 +1495,12 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
         VariableInterface.health_monitor = health_monitor
         try:
             health_monitor.start()
+
+            use_epd = (getattr(backend_config, 'role', None) == EngineRole.Encoder
+                       or getattr(backend_config, 'language_only', False))
             if (VariableInterface.proxy_url is not None
-                    and getattr(backend_config, 'migration_backend', None) == MigrationBackend.DLSlime):
+                and getattr(backend_config, 'migration_backend', None) == MigrationBackend.DLSlime
+                and use_epd):
                 dlslime_encoder_transfer_manager = DLSlimeEncoderTransferManager(
                     engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
                     rank=getattr(backend_config, 'dp_rank', 0) or 0,

@@ -96,19 +96,15 @@ class EncoderOutputRef(BaseModel):
     """Reference to encoder outputs produced by an EPD encoder node."""
 
     token_ids: list[int]
-    mm_mask: list[int] | None = None
-    input_embedding_ranges: list[list[int]] | None = None
-    transfer_id: str | None = None
+    input_embedding_ranges: list[list[int]]
+    transfer_id: str
 
     protocol: MigrationProtocol
     remote_engine_id: str
     remote_session_id: int
-    remote_block_ids: list[int] = Field(default_factory=list)
 
-    dtype: str | None = None
-    shape: list[int] | list[list[int]] | None = None
-    modality: str | list[str] | None = None
-    cache_key: str | None = None
+    dtype: str
+    shape: list[list[int]]
     extra: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator('protocol', mode='before')
