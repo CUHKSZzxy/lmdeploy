@@ -647,6 +647,14 @@ class ArgumentHelper:
                                    'If True, cuda graph would be disabled')
 
     @staticmethod
+    def disable_vision_encoder(parser):
+        """Disable loading vision encoder."""
+        return parser.add_argument('--disable-vision-encoder',
+                                   action='store_true',
+                                   default=False,
+                                   help='disable multimodal encoder')
+
+    @staticmethod
     def communicator(parser):
         return parser.add_argument('--communicator',
                                    type=str,
