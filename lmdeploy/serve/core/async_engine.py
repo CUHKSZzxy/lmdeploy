@@ -548,9 +548,14 @@ class AsyncEngine:
                                                prompt_token_ids=input_ids,
                                                gen_config=gen_config,
                                                adapter_name=adapter_name)
+            except (asyncio.CancelledError, GeneratorExit):
+                metrics_processor.increase_failed_requests('cancel')
+                remove_session_once()
+                raise
             except Exception:
                 logger.exception('[generate] error in encoder_output_ref processing')
                 metrics_processor.increase_failed_requests('error')
+                remove_session_once()
                 yield GenOut(response='in encoder_output_ref processing error',
                              history_token_len=session.step,
                              input_token_len=len(input_ids) if input_ids is not None else 0,

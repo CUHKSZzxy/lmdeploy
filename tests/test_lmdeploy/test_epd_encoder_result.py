@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import ctypes
+import importlib
 import sys
 import types
 
@@ -9,18 +10,10 @@ import pytest
 import torch
 from torch import nn
 
+from lmdeploy.archs import get_task
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol
-from lmdeploy.pytorch.engine.engine_instance import EngineInstance
-from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
-from lmdeploy.pytorch.engine.request import RequestType, Response
-from lmdeploy.pytorch.model_inputs import BuildModelContext
-from lmdeploy.pytorch.messages import InputEmbeddings
-from lmdeploy.pytorch.models.patch import build_model_context
-from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-from lmdeploy.pytorch.models.utils.model import build_language_model
-from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.pytorch.disagg.epd.dlslime import (
     DLSlimeEncoderTransferManager,
     EncoderTransferConfig,
@@ -32,7 +25,19 @@ from lmdeploy.pytorch.disagg.epd.dlslime import (
 from lmdeploy.pytorch.disagg.epd.engine import (
     compute_encoder_prompt_input_for_engine,
 )
+from lmdeploy.pytorch.engine.engine_instance import EngineInstance
+from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
+from lmdeploy.pytorch.engine.request import RequestType, Response
+from lmdeploy.pytorch.model_inputs import BuildModelContext
+from lmdeploy.pytorch.messages import InputEmbeddings
+from lmdeploy.pytorch.models.patch import build_model_context
+from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+from lmdeploy.pytorch.models.utils.model import build_language_model
+from lmdeploy.pytorch.multimodal.data_type import MultiModalData
+from lmdeploy.serve.core import AsyncEngine
 from lmdeploy.vl.constants import Modality
+
+async_engine_mod = importlib.import_module('lmdeploy.serve.core.async_engine')
 
 
 def test_encoder_output_ref_round_trip():
@@ -59,6 +64,66 @@ def test_encoder_output_ref_round_trip():
 def test_engine_config_rejects_language_only_with_encoder_only():
     with pytest.raises(ValueError, match='language_only and encoder_only'):
         PytorchEngineConfig(language_only=True, encoder_only=True)
+
+
+def test_get_task_uses_language_only_without_legacy_disable_flag():
+    task, pipeline_class = get_task('pytorch', 'unused', backend_config=PytorchEngineConfig(language_only=True))
+
+    assert task == 'llm'
+    assert pipeline_class is AsyncEngine
+
+
+def test_async_engine_removes_session_when_encoder_output_ref_load_fails(monkeypatch):
+
+    class _FakeSession:
+        session_id = 7
+        step = 0
+
+    class _FakeSessionManager:
+
+        def __init__(self):
+            self.session = _FakeSession()
+            self.removed = []
+
+        def get(self, session_id, step=0):
+            return self.session
+
+        def remove(self, session):
+            self.removed.append(session)
+
+    async def _fail_load_encoder_output(encoder_output_ref):
+        raise ValueError('stale encoder output')
+
+    monkeypatch.setattr(async_engine_mod, 'load_encoder_output_async', _fail_load_encoder_output)
+
+    session_mgr = _FakeSessionManager()
+    engine = AsyncEngine.__new__(AsyncEngine)
+    engine.session_mgr = session_mgr
+    engine.request_logger = object()
+    encoder_output_ref = EncoderOutputRef(
+        token_ids=[1, 2],
+        input_embedding_ranges=[[0, 2]],
+        transfer_id='epd-test',
+        protocol=MigrationProtocol.RDMA,
+        remote_engine_id='http://encoder',
+        remote_session_id=3,
+        dtype='float32',
+        shape=[[2, 4]],
+    )
+
+    async def _run():
+        return [
+            output async for output in engine.generate(
+                messages=[{'role': 'user', 'content': 'hello'}],
+                session_id=7,
+                gen_config=GenerationConfig(max_new_tokens=1, encoder_output_ref=encoder_output_ref),
+            )
+        ]
+
+    outputs = asyncio.run(_run())
+
+    assert outputs[0].finish_reason == 'error'
+    assert session_mgr.removed == [session_mgr.session]
 
 
 def test_build_language_model_skips_module_in_encoder_only_context():

@@ -3,8 +3,9 @@ import importlib
 
 import pytest
 
-from lmdeploy.pytorch.disagg.config import EngineRole
+from lmdeploy.pytorch.disagg.config import EngineRole, ServingStrategy
 from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
+from lmdeploy.serve.openai.protocol import ChatCompletionRequest
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,
@@ -133,6 +134,61 @@ def test_call_epd_encoder_node_balances_node_accounting_on_error():
                                            language_status))
 
     assert manager.calls == [('pre', 'http://encoder'), ('post', 'http://encoder', 1.0)]
+
+
+def test_multimodal_hybrid_request_falls_back_when_selected_node_is_not_epd_capable(monkeypatch):
+
+    class _FakeNodeManager:
+        serving_strategy = ServingStrategy.Hybrid
+
+        def __init__(self):
+            self.nodes = {
+                'http://normal': Status(role=EngineRole.Hybrid, models=['m']),
+                'http://encoder': Status(role=EngineRole.Encoder, models=['m']),
+            }
+            self.forwarded = None
+
+        @property
+        def encoder_nodes(self):
+            return {'http://encoder': self.nodes['http://encoder']}
+
+        async def check_request_model(self, model):
+            return None
+
+        def get_node_url(self, model, role=EngineRole.Hybrid):
+            if role == EngineRole.Encoder:
+                return 'http://encoder'
+            return 'http://normal'
+
+        def pre_call(self, node_url):
+            return 1.0
+
+        def post_call(self, node_url, start):
+            pass
+
+        async def forward_raw_request_generate(self, raw_request, node_url, endpoint):
+            self.forwarded = (node_url, endpoint)
+            return '{"ok": true}'
+
+    manager = _FakeNodeManager()
+    monkeypatch.setattr(proxy_mod, 'node_manager', manager)
+    request = ChatCompletionRequest(
+        model='m',
+        messages=[{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': 'describe'},
+                {'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}},
+            ],
+        }],
+        stream=False,
+    )
+
+    response = asyncio.run(proxy_mod.chat_completions_v1(request, raw_request=object()))
+
+    assert response.status_code == 200
+    assert response.body == b'{"ok":true}'
+    assert manager.forwarded == ('http://normal', '/v1/chat/completions')
 
 
 def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):

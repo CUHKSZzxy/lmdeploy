@@ -768,11 +768,10 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         has_multimodal = _has_multimodal_chat_messages(request.messages)
         node_status = node_manager.nodes[node_url]
         encoder_nodes = node_manager.encoder_nodes
-        if has_multimodal and not encoder_nodes and node_status.encoder_output_receiver_endpoint_info:
-            return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE,
-                                         'No encoder node is available for multimodal EPD request.')
-
-        if has_multimodal and encoder_nodes:
+        if has_multimodal and node_status.encoder_output_receiver_endpoint_info:
+            if not encoder_nodes:
+                return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE,
+                                             'No encoder node is available for multimodal EPD request.')
             encoder_url = node_manager.get_node_url(request.model, EngineRole.Encoder)
             if not encoder_url:
                 return node_manager.handle_unavailable_model(request.model)
