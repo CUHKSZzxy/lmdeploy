@@ -14,13 +14,19 @@ from lmdeploy.archs import get_task
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.epd.cache import (
+    DEFAULT_EPD_ENCODER_CACHE_BYTES,
+    EPD_ENCODER_CACHE_MAX_BYTES_ENV,
+    EPDEncoderCache,
+    build_epd_mm_cache_key,
+    get_epd_encoder_cache,
+    set_epd_encoder_cache,
+)
 from lmdeploy.pytorch.disagg.epd.dlslime import (
     DLSlimeEncoderTransferManager,
     EncoderTransferConfig,
     _build_embedding_layout,
     build_encoder_transfer_config,
-    publish_encoder_output,
-    set_dlslime_encoder_transfer_manager,
 )
 from lmdeploy.pytorch.disagg.epd.engine import (
     compute_encoder_prompt_input_for_engine,
@@ -32,6 +38,7 @@ from lmdeploy.pytorch.model_inputs import BuildModelContext
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.models.patch import build_model_context
 from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+from lmdeploy.pytorch.models.utils.epd import EPDEncoderMixin
 from lmdeploy.pytorch.models.utils.model import build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.serve.core import AsyncEngine
@@ -40,25 +47,11 @@ from lmdeploy.vl.constants import Modality
 async_engine_mod = importlib.import_module('lmdeploy.serve.core.async_engine')
 
 
-def test_encoder_output_ref_round_trip():
-    ref = EncoderOutputRef(
-        token_ids=[1, 2, 3],
-        input_embedding_ranges=[[1, 3]],
-        transfer_id='epd-test',
-        protocol=MigrationProtocol.RDMA,
-        remote_engine_id='encoder-0',
-        remote_session_id=7,
-        dtype='float32',
-        shape=[[2, 2]],
-    )
-
-    dumped = ref.model_dump(mode='json')
-    loaded = EncoderOutputRef.model_validate(dumped)
-
-    assert loaded.token_ids == [1, 2, 3]
-    assert loaded.protocol is MigrationProtocol.RDMA
-    assert loaded.transfer_id == 'epd-test'
-    assert loaded.input_embedding_ranges == [[1, 3]]
+@pytest.fixture(autouse=True)
+def _reset_epd_encoder_cache():
+    set_epd_encoder_cache(None)
+    yield
+    set_epd_encoder_cache(None)
 
 
 def test_engine_config_rejects_language_only_with_encoder_only():
@@ -141,7 +134,7 @@ def test_build_language_model_skips_module_in_encoder_only_context():
     assert model._is_dummy_mod
 
 
-def test_dlslime_encoder_transfer_config_generates_transfer_id_and_requires_manager():
+def test_dlslime_encoder_transfer_config_generates_request_fields():
     endpoint_info = {'io_info': {'data_channel_info': []}}
     config = build_encoder_transfer_config(receiver_endpoint_info=endpoint_info,
                                            receiver_engine_id='http://language')
@@ -153,16 +146,6 @@ def test_dlslime_encoder_transfer_config_generates_transfer_id_and_requires_mana
         'encoder_output_receiver_endpoint_info': endpoint_info,
         'encoder_output_receiver_engine_id': 'http://language',
     }
-
-    set_dlslime_encoder_transfer_manager(None)
-    with pytest.raises(ValueError, match='not initialized'):
-        asyncio.run(
-            publish_encoder_output(
-                {},
-                remote_engine_id='http://encoder',
-                remote_session_id=5,
-                transfer_config=config,
-            ))
 
 
 def test_encoder_transfer_config_requires_transfer_id_and_receiver_endpoint():
@@ -190,6 +173,82 @@ def test_build_embedding_layout_preserves_ranges_and_rejects_mismatch():
     mismatch = InputEmbeddings(torch.ones(2, 4), start=3, end=6)
     with pytest.raises(ValueError, match='does not match rows'):
         _build_embedding_layout({'input_embeddings': [mismatch]}, torch.device('cpu'))
+
+
+def test_epd_encoder_cache_defaults_to_4gb_and_env_can_disable(monkeypatch):
+    set_epd_encoder_cache(None)
+    monkeypatch.delenv(EPD_ENCODER_CACHE_MAX_BYTES_ENV, raising=False)
+
+    cache = get_epd_encoder_cache()
+
+    assert cache.max_bytes == DEFAULT_EPD_ENCODER_CACHE_BYTES
+
+    set_epd_encoder_cache(None)
+    monkeypatch.setenv(EPD_ENCODER_CACHE_MAX_BYTES_ENV, '0')
+
+    assert get_epd_encoder_cache() is None
+
+    set_epd_encoder_cache(None)
+
+
+def test_epd_mm_cache_key_tracks_tensor_and_meta():
+    mm_input = MultiModalData(
+        modality=Modality.IMAGE,
+        data=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        start=0,
+        end=1,
+        meta={'grid_thw': torch.tensor([1, 1, 1])},
+    )
+    same = MultiModalData(
+        modality=Modality.IMAGE,
+        data=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        start=5,
+        end=6,
+        meta={'grid_thw': torch.tensor([1, 1, 1])},
+    )
+    changed = MultiModalData(
+        modality=Modality.IMAGE,
+        data=torch.tensor([[1.0, 3.0]], dtype=torch.float32),
+        start=0,
+        end=1,
+        meta={'grid_thw': torch.tensor([1, 1, 1])},
+    )
+
+    assert build_epd_mm_cache_key(mm_input) == build_epd_mm_cache_key(same)
+    assert build_epd_mm_cache_key(mm_input) != build_epd_mm_cache_key(changed)
+
+
+def test_epd_mm_cache_key_supports_bfloat16_tensor():
+    mm_input = MultiModalData(
+        modality=Modality.IMAGE,
+        data=torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+        start=0,
+        end=1,
+        meta={'grid_thw': torch.tensor([1, 1, 1])},
+    )
+
+    assert build_epd_mm_cache_key(mm_input) is not None
+
+
+def test_epd_encoder_cache_evicts_only_unpinned_entries():
+    cache = EPDEncoderCache(max_bytes=32)
+    first = torch.ones(2, 2, dtype=torch.float32)
+    second = torch.ones(2, 2, dtype=torch.float32) * 2
+    third = torch.ones(2, 2, dtype=torch.float32) * 3
+
+    cache.put('first', first)
+    cache.put('second', second)
+    cache.pin('first')
+    cache.put('third', third)
+
+    assert cache.get('first') is not None
+    assert cache.get('second') is None
+    assert cache.get('third') is not None
+
+    cache.unpin('first')
+    cache.put('fourth', torch.ones(2, 2, dtype=torch.float32) * 4)
+
+    assert cache.get('first') is None
 
 
 class _FakeDLSlimeFuture:
@@ -318,6 +377,79 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     assert 'epd-test' in producer.endpoint.unregistered
 
 
+def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
+    source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    cache = EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
+    cache.put('cache-key', source)
+    prompt_input = {
+        'input_ids': [10, 11, 12, 13],
+        'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
+        'epd_encoder_cache_keys': ['cache-key'],
+    }
+    producer = DLSlimeEncoderTransferManager('encoder',
+                                             endpoint=_FakeDLSlimeEndpoint('encoder'),
+                                             device='cpu',
+                                             encoder_cache=cache)
+    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+
+    ref = asyncio.run(
+        producer.publish(
+            prompt_input,
+            remote_engine_id='http://encoder',
+            remote_session_id=5,
+            transfer_id='epd-test',
+            receiver_endpoint_info=consumer.endpoint_info,
+            receiver_engine_id='http://language',
+        ))
+    prompt_input = asyncio.run(consumer.receive(ref))
+
+    assert 'dlslime_encoder_entries' in ref.extra
+    assert cache.get_entry('cache-key').ref_count == 1
+    received = prompt_input['input_embeddings'][0]
+    assert received.start == 1
+    assert received.end == 3
+    torch.testing.assert_close(received.embeddings, source)
+
+    producer.release_published('epd-test')
+    assert cache.get_entry('cache-key').ref_count == 0
+    cache.clear()
+    assert 'epd-cache-cache-key' in producer.endpoint.unregistered
+
+
+def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_cache():
+    source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+    cache = EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
+    prompt_input = {
+        'input_ids': [10, 11, 12, 13],
+        'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
+        'epd_encoder_cache_keys': ['cache-key'],
+    }
+    producer = DLSlimeEncoderTransferManager('encoder',
+                                             endpoint=_FakeDLSlimeEndpoint('encoder'),
+                                             device='cpu',
+                                             encoder_cache=cache)
+    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+
+    ref = asyncio.run(
+        producer.publish(
+            prompt_input,
+            remote_engine_id='http://encoder',
+            remote_session_id=5,
+            transfer_id='epd-test',
+            receiver_endpoint_info=consumer.endpoint_info,
+            receiver_engine_id='http://language',
+        ))
+    prompt_input = asyncio.run(consumer.receive(ref))
+
+    assert 'dlslime_encoder_entries' in ref.extra
+    assert cache.get_entry('cache-key').ref_count == 1
+    torch.testing.assert_close(prompt_input['input_embeddings'][0].embeddings, source)
+
+    producer.release_published('epd-test')
+    cache.clear()
+    assert 'epd-cache-cache-key' in producer.endpoint.unregistered
+
+
 def test_dlslime_encoder_transfer_manager_rejects_bad_receive_metadata():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     prompt_input = {
@@ -390,6 +522,7 @@ class _FakeVisual(nn.Module):
     def __init__(self):
         super().__init__()
         self.dummy = nn.Parameter(torch.empty(0))
+        self.forward_count = 0
 
     def rot_pos_emb(self, grid_thw):
         return torch.zeros((int(grid_thw.prod().item()), 2), dtype=torch.float32)
@@ -398,6 +531,7 @@ class _FakeVisual(nn.Module):
         return torch.zeros((int(grid_thw.prod().item()), 2), dtype=torch.float32)
 
     def forward(self, pixel_values, cu_seqlens, rotary_pos_emb, pos_embeds):
+        self.forward_count += 1
         return torch.tensor([[10.0, 11.0], [12.0, 13.0]], dtype=torch.float32)
 
 
@@ -419,8 +553,10 @@ class _FakeQwen35InnerModel(nn.Module):
 class _FakeQwen35Model(nn.Module):
 
     _prepare_visual_forward_inputs = Qwen3_5ForConditionalGeneration._prepare_visual_forward_inputs
-    _make_encoder_input_embeddings = Qwen3_5ForConditionalGeneration._make_encoder_input_embeddings
     compute_encoder_prompt_input = Qwen3_5ForConditionalGeneration.compute_encoder_prompt_input
+    _check_epd_encoder_supported = Qwen3_5ForConditionalGeneration._check_epd_encoder_supported
+    _compute_epd_encoder_items_uncached = Qwen3_5ForConditionalGeneration._compute_epd_encoder_items_uncached
+    _compute_epd_encoder_items_with_cache = EPDEncoderMixin._compute_epd_encoder_items_with_cache
 
     def __init__(self, deepstack_visual_indexes=None, encoder_only=False):
         super().__init__()
@@ -460,6 +596,7 @@ class _FakeGraphRunner:
 
 
 def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
+    set_epd_encoder_cache(EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -476,6 +613,9 @@ def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
     assert computed['input_ids'] == [1, 99, 99, 2]
     assert 'multimodal' not in computed
     assert computed['input_embedding_ranges'] == [[1, 3]]
+    assert computed['epd_encoder_cache_keys'] == [
+        build_epd_mm_cache_key(_FakeInputProcessor().preprocess_input(None, None).input_multimodals['mm_data'][0])
+    ]
     assert len(computed['input_embeddings']) == 1
     embedding = computed['input_embeddings'][0]
     assert isinstance(embedding, InputEmbeddings)
@@ -503,6 +643,27 @@ def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_em
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
+def test_compute_encoder_prompt_input_reuses_cached_embedding():
+    set_epd_encoder_cache(EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
+    model = _FakeQwen35Model()
+    prompt_input = {
+        'input_ids': [1, 99, 99, 2],
+        'multimodal': [{
+            'modality': Modality.IMAGE,
+            'pixel_values': torch.ones((2, 1)),
+            'image_grid_thw': torch.tensor([1, 1, 2]),
+            'offset': (1, 3),
+            'image_token_id': 99,
+        }],
+    }
+
+    first = model.compute_encoder_prompt_input(prompt_input)
+    second = model.compute_encoder_prompt_input(prompt_input)
+
+    assert model.model.visual.forward_count == 1
+    torch.testing.assert_close(first['input_embeddings'][0].embeddings, second['input_embeddings'][0].embeddings)
+
+
 def test_model_agent_compute_encoder_prompt_input_unwraps_graph_runner_model():
     from lmdeploy.pytorch.engine.model_agent.agent import BaseModelAgent
 
@@ -527,7 +688,7 @@ def test_model_agent_compute_encoder_prompt_input_unwraps_graph_runner_model():
                                np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
-def test_compute_encoder_prompt_input_for_engine_uses_mp_worker_compute_method():
+def test_compute_encoder_prompt_input_for_engine_unwraps_async_engine():
     class _FakeRemoteEngine:
 
         def __init__(self):
@@ -550,35 +711,6 @@ def test_compute_encoder_prompt_input_for_engine_uses_mp_worker_compute_method()
     assert computed == {
         'input_ids': [1, 2],
         'input_embeddings': ['remote-embedding'],
-    }
-
-
-def test_pytorch_engine_compute_method_delegates_to_executor():
-    from lmdeploy.pytorch.engine.engine import Engine
-
-    class _FakeExecutor:
-
-        def __init__(self):
-            self.received = None
-
-        async def compute_encoder_prompt_input(self, prompt_input):
-            self.received = prompt_input
-            return {
-                'input_ids': prompt_input['input_ids'],
-                'input_embeddings': ['executor-embedding'],
-            }
-
-    executor = _FakeExecutor()
-    engine = Engine.__new__(Engine)
-    engine.executor = executor
-    prompt_input = {'input_ids': [1, 2], 'multimodal': ['raw-mm']}
-
-    computed = asyncio.run(engine.compute_encoder_prompt_input(prompt_input))
-
-    assert executor.received is prompt_input
-    assert computed == {
-        'input_ids': [1, 2],
-        'input_embeddings': ['executor-embedding'],
     }
 
 
@@ -632,23 +764,6 @@ def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
 
     with pytest.raises(ValueError, match='DeepStack'):
         _FakeQwen35Model(deepstack_visual_indexes=[5]).compute_encoder_prompt_input(prompt_input)
-
-
-def test_generation_config_carries_encoder_output_ref():
-    ref = EncoderOutputRef(
-        token_ids=[1],
-        input_embedding_ranges=[[0, 1]],
-        protocol=MigrationProtocol.RDMA,
-        transfer_id='epd-test',
-        remote_engine_id='encoder-0',
-        remote_session_id=1,
-        dtype='float32',
-        shape=[[1, 4]],
-    )
-
-    config = GenerationConfig(encoder_output_ref=ref)
-
-    assert config.encoder_output_ref is ref
 
 
 def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeypatch):

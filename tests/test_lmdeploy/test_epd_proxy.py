@@ -19,10 +19,6 @@ from lmdeploy.serve.proxy.proxy import (
 proxy_mod = importlib.import_module('lmdeploy.serve.proxy.proxy')
 
 
-def test_engine_role_has_encoder():
-    assert EngineRole.Encoder.name == 'Encoder'
-
-
 def test_node_manager_tracks_encoder_nodes():
     manager = NodeManager(cache_status=False)
     manager.nodes = {

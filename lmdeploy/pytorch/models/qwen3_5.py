@@ -13,7 +13,6 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 import lmdeploy.pytorch.nn.gated_delta as gated_delta_util
 from lmdeploy.pytorch.distributed import get_tp_world_rank
 from lmdeploy.pytorch.engine.input_process import BaseModelInputProcessor
-from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.model_inputs import StepContext, StepContextManager
 from lmdeploy.pytorch.nn import ApplyRotaryEmb, Attention, LayerNorm, RMSNorm, SiluAndMul
 from lmdeploy.pytorch.nn.gated_delta import CausalConv1d, GatedDelta, GatedDeltaMeta, build_rmsnorm_gated
@@ -33,6 +32,7 @@ from .qwen2_5_vl import Qwen2_5_VisionRotaryEmbedding as Qwen3_5VisionRotaryEmbe
 from .qwen2_5_vl import Qwen2_5_VLVisionAttention as Qwen3_5VisionAttention
 from .qwen3_vl import Qwen3VLInputProcessor as Qwen3_5InputProcessor
 from .utils.cudagraph import CudaGraphMixin
+from .utils.epd import EPDEncoderItem, EPDEncoderMixin
 from .utils.model import DeployModelMixinV1, build_language_model, vlm_model
 
 
@@ -1089,7 +1089,7 @@ class Qwen3_5Model(nn.Module):
         return torch.split(image_embeds, split_sizes)
 
 
-class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMixin):
+class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMixin, EPDEncoderMixin):
     """ModelForCausalLM."""
 
     packed_modules_mapping = {
@@ -1217,47 +1217,25 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
 
         return pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb, pos_embeds
 
-    def _make_encoder_input_embeddings(self, mm_inputs: list):
-        """Compute encoder-side InputEmbeddings for already preprocessed multimodal inputs."""
+    def _compute_epd_encoder_items_uncached(self, mm_inputs: list):
+        """Compute encoder-side items for already preprocessed multimodal inputs."""
         device = next(self.model.visual.parameters()).device
         visual_inputs = self._prepare_visual_forward_inputs(mm_inputs, device=device)
         with torch.inference_mode():
             split_embeddings = self.model.get_visual_embeddings(*visual_inputs)
 
-        input_embeddings = []
-        input_embedding_ranges = []
+        encoder_items = []
         for embedding, mm_input in zip(split_embeddings, mm_inputs):
             start, end = int(mm_input.start), int(mm_input.end)
             embedding = embedding.detach().contiguous()
-            input_embeddings.append(InputEmbeddings(embedding, start=start, end=end))
-            input_embedding_ranges.append([start, end])
-        return input_embeddings, input_embedding_ranges
+            encoder_items.append(EPDEncoderItem(embedding=embedding, start=start, end=end))
+        return encoder_items
 
-    def compute_encoder_prompt_input(self, prompt_input: dict) -> dict:
-        """Compute EPD encoder embeddings through the model's normal multimodal processor."""
-        if prompt_input.get('input_embeddings') or not prompt_input.get('multimodal'):
-            return prompt_input
-        if self.language_only:
-            raise ValueError('Qwen3.5 language-only model cannot compute EPD encoder embeddings.')
+    def _check_epd_encoder_supported(self):
+        """Validate Qwen3.5-specific EPD constraints."""
         vision_config = getattr(self.config, 'vision_config', None)
         if getattr(vision_config, 'deepstack_visual_indexes', None):
             raise ValueError('DeepStack visual embeddings are not supported by the first EPD encoder producer.')
-
-        input_ids = prompt_input['input_ids']
-        processed = self.input_processor.preprocess_input(input_ids, prompt_input['multimodal'])
-        input_ids = processed.input_ids
-        input_multimodals = processed.input_multimodals or {}
-        mm_inputs = input_multimodals.get('mm_data', [])
-        if not mm_inputs:
-            return dict(prompt_input, input_ids=input_ids)
-
-        input_embeddings, input_embedding_ranges = self._make_encoder_input_embeddings(mm_inputs)
-        prompt_input = dict(prompt_input)
-        prompt_input.pop('multimodal', None)
-        prompt_input['input_ids'] = input_ids
-        prompt_input['input_embeddings'] = input_embeddings
-        prompt_input['input_embedding_ranges'] = input_embedding_ranges
-        return prompt_input
 
     def prepare_inputs_for_generation(
         self,

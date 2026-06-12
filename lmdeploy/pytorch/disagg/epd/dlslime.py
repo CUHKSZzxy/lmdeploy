@@ -14,6 +14,7 @@ import aiohttp
 import torch
 
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheFreeRequest, EncoderOutputRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.epd.cache import EPDEncoderCache, get_epd_encoder_cache
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.utils import get_logger
 
@@ -25,6 +26,7 @@ EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT = 5
 _DLSLIME_EXTRA_ENDPOINT_INFO = 'dlslime_endpoint_info'
 _DLSLIME_EXTRA_MR_INFO = 'dlslime_mr_info'
 _DLSLIME_EXTRA_NBYTES = 'dlslime_nbytes'
+_DLSLIME_EXTRA_ENCODER_ENTRIES = 'dlslime_encoder_entries'
 
 
 @dataclass(frozen=True)
@@ -135,14 +137,11 @@ def _build_embedding_layout(prompt_input: dict, device: torch.device) -> _Embedd
         shapes.append(list(tensor.shape))
 
     flat_tensor = torch.cat(tensors, dim=0).contiguous()
-    dtype_name = str(flat_tensor.dtype)
-    if dtype_name.startswith('torch.'):
-        dtype_name = dtype_name.split('.', 1)[1]
     return _EmbeddingLayout(
         tensor=flat_tensor,
         ranges=ranges,
         shapes=shapes,
-        dtype=dtype_name,
+        dtype=str(flat_tensor.dtype).replace('torch.', ''),
         nbytes=flat_tensor.numel() * flat_tensor.element_size(),
     )
 
@@ -168,13 +167,16 @@ class DLSlimeEncoderTransferManager:
                  link_type: str = 'RoCE',
                  ib_port: int = 1,
                  rank: int = 0,
-                 device_name: str | None = None):
+                 device_name: str | None = None,
+                 encoder_cache: EPDEncoderCache | None = None):
         self.engine_id = engine_id
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.endpoint = endpoint or self._create_endpoint(link_type, ib_port, rank, device_name)
+        self.encoder_cache = encoder_cache if encoder_cache is not None else get_epd_encoder_cache()
         self._connected_engine_ids: set[str] = set()
         self._published_tensors: dict[str, torch.Tensor] = {}
         self._published_mr_keys: dict[str, str] = {}
+        self._transfer_pins: dict[str, list[str]] = {}
         self._remote_mr_lock = asyncio.Lock()
 
     @staticmethod
@@ -229,6 +231,117 @@ class DLSlimeEncoderTransferManager:
                       receiver_engine_id: str | None = None) -> EncoderOutputRef:
         if receiver_endpoint_info:
             self._connect_once(receiver_engine_id or remote_engine_id, receiver_endpoint_info)
+        if not self._can_publish_cached(prompt_input):
+            self._cache_prompt_embeddings(prompt_input)
+        if self._can_publish_cached(prompt_input):
+            return self._publish_cached_entries(prompt_input, remote_engine_id, remote_session_id, transfer_id)
+        return self._publish_flat_one_shot(prompt_input, remote_engine_id, remote_session_id, transfer_id)
+
+    def _can_publish_cached(self, prompt_input: dict) -> bool:
+        cache = self.encoder_cache
+        if cache is None:
+            return False
+        input_embeddings = prompt_input.get('input_embeddings') or []
+        cache_keys = prompt_input.get('epd_encoder_cache_keys') or []
+        if len(input_embeddings) == 0 or len(input_embeddings) != len(cache_keys):
+            return False
+        for cache_key in cache_keys:
+            if cache_key is None or cache.get_entry(cache_key) is None:
+                return False
+        return True
+
+    def _cache_prompt_embeddings(self, prompt_input: dict):
+        cache = self.encoder_cache
+        if cache is None:
+            return
+        input_embeddings = prompt_input.get('input_embeddings') or []
+        cache_keys = prompt_input.get('epd_encoder_cache_keys') or []
+        if len(input_embeddings) == 0 or len(input_embeddings) != len(cache_keys):
+            return
+
+        for embedding, cache_key in zip(input_embeddings, cache_keys):
+            if cache_key is None or cache.get_entry(cache_key) is not None:
+                continue
+            start, end = int(embedding.start), int(embedding.end)
+            tensor = _embedding_tensor(embedding, self.device)
+            if tensor.ndim != 2:
+                raise ValueError(f'DLSlime RDMA encoder embedding must be 2-D, got shape {tuple(tensor.shape)}')
+            if end - start != tensor.shape[0]:
+                raise ValueError(
+                    f'DLSlime RDMA encoder embedding range [{start}, {end}) does not match rows {tensor.shape[0]}')
+            try:
+                cache.put(cache_key, tensor)
+            except RuntimeError:
+                return
+
+    def _publish_cached_entries(self, prompt_input: dict, remote_engine_id: str, remote_session_id: int,
+                                transfer_id: str) -> EncoderOutputRef:
+        input_embeddings = prompt_input.get('input_embeddings') or []
+        cache_keys = prompt_input.get('epd_encoder_cache_keys') or []
+        entries = []
+        pinned_keys = []
+        assert self.encoder_cache is not None
+
+        try:
+            for embedding, cache_key in zip(input_embeddings, cache_keys):
+                entry = self.encoder_cache.get_entry(cache_key)
+                assert entry is not None
+                tensor = entry.tensor
+                start, end = int(embedding.start), int(embedding.end)
+                if tensor.ndim != 2:
+                    raise ValueError(f'DLSlime RDMA encoder embedding must be 2-D, got shape {tuple(tensor.shape)}')
+                if end - start != tensor.shape[0]:
+                    raise ValueError(
+                        f'DLSlime RDMA encoder embedding range [{start}, {end}) does not match rows {tensor.shape[0]}'
+                    )
+
+                if tensor.is_cuda:
+                    torch.cuda.synchronize(tensor.device)
+                if entry.mr_key is None:
+                    mr_key = f'epd-cache-{cache_key}'
+                    self.endpoint.register_memory_region(mr_key, tensor.data_ptr(), 0, entry.nbytes)
+                    entry.mr_key = mr_key
+
+                    def _unregister_cache_entry(mr_key=entry.mr_key):
+                        self._unregister_memory_region(mr_key)
+
+                    entry.on_evict = _unregister_cache_entry
+
+                self.encoder_cache.pin(cache_key)
+                pinned_keys.append(cache_key)
+                entries.append({
+                    'cache_key': cache_key,
+                    'mr_key': entry.mr_key,
+                    'mr_info': self._mr_info(entry.mr_key),
+                    'shape': list(tensor.shape),
+                    'dtype': str(tensor.dtype).replace('torch.', ''),
+                    'nbytes': entry.nbytes,
+                    'range': [start, end],
+                })
+        except Exception:
+            for cache_key in pinned_keys:
+                self.encoder_cache.unpin(cache_key)
+            raise
+
+        self._transfer_pins[transfer_id] = pinned_keys
+
+        return EncoderOutputRef(
+            token_ids=list(prompt_input.get('input_ids') or []),
+            input_embedding_ranges=[entry['range'] for entry in entries],
+            protocol=MigrationProtocol.RDMA,
+            transfer_id=transfer_id,
+            remote_engine_id=remote_engine_id,
+            remote_session_id=remote_session_id,
+            dtype=entries[0]['dtype'],
+            shape=[entry['shape'] for entry in entries],
+            extra={
+                _DLSLIME_EXTRA_ENDPOINT_INFO: self.endpoint_info,
+                _DLSLIME_EXTRA_ENCODER_ENTRIES: entries,
+            },
+        )
+
+    def _publish_flat_one_shot(self, prompt_input: dict, remote_engine_id: str, remote_session_id: int,
+                               transfer_id: str) -> EncoderOutputRef:
         layout = _build_embedding_layout(prompt_input, self.device)
 
         # Encoder output is produced asynchronously on CUDA; wait before registering the
@@ -257,6 +370,37 @@ class DLSlimeEncoderTransferManager:
         )
 
     async def receive(self, encoder_output_ref: EncoderOutputRef) -> dict:
+        entries = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENCODER_ENTRIES)
+        if entries is not None:
+            return await self._receive_cached_entries(encoder_output_ref, entries)
+        return await self._receive_flat_one_shot(encoder_output_ref)
+
+    async def _receive_cached_entries(self, encoder_output_ref: EncoderOutputRef, entries: list[dict]) -> dict:
+        endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
+        if endpoint_info is None:
+            raise ValueError('DLSlime RDMA encoder_output_ref is missing endpoint metadata.')
+        if len(entries) != len(encoder_output_ref.input_embedding_ranges):
+            raise ValueError('DLSlime RDMA encoder_output_ref entry and embedding range counts do not match.')
+
+        self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
+        embeddings = []
+        for entry, (start, end) in zip(entries, encoder_output_ref.input_embedding_ranges):
+            shape = entry['shape']
+            if len(shape) != 2:
+                raise ValueError('DLSlime RDMA encoder_output_ref requires 2-D embedding shapes.')
+            dtype = getattr(torch, entry['dtype'])
+            output = torch.empty(tuple(int(dim) for dim in shape), dtype=dtype, device=self.device)
+            expected_nbytes = output.numel() * output.element_size()
+            nbytes = int(entry['nbytes'])
+            if nbytes != expected_nbytes:
+                raise ValueError('DLSlime RDMA encoder_output_ref byte size does not match embedding shape and dtype.')
+            if int(end) - int(start) != int(shape[0]):
+                raise ValueError('DLSlime RDMA encoder_output_ref range length does not match embedding shape.')
+            await self._rdma_read_encoder_output(output, entry['mr_info'], nbytes)
+            embeddings.append(InputEmbeddings(output, start=int(start), end=int(end)))
+        return dict(prompt=None, input_ids=list(encoder_output_ref.token_ids), input_embeddings=embeddings)
+
+    async def _receive_flat_one_shot(self, encoder_output_ref: EncoderOutputRef) -> dict:
         endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
         remote_mr_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_MR_INFO)
         nbytes = encoder_output_ref.extra.get(_DLSLIME_EXTRA_NBYTES)
@@ -310,6 +454,9 @@ class DLSlimeEncoderTransferManager:
                 self._unregister_memory_region(local_key)
 
     def release_published(self, transfer_id: str):
+        for cache_key in self._transfer_pins.pop(transfer_id, []):
+            if self.encoder_cache is not None:
+                self.encoder_cache.unpin(cache_key)
         key = self._published_mr_keys.pop(transfer_id, None)
         if key is not None:
             self._unregister_memory_region(key)
@@ -318,6 +465,8 @@ class DLSlimeEncoderTransferManager:
     def close(self):
         for transfer_id in list(self._published_tensors):
             self.release_published(transfer_id)
+        if self.encoder_cache is not None:
+            self.encoder_cache.clear()
         shutdown = getattr(self.endpoint, 'shutdown', None)
         if callable(shutdown):
             shutdown()
