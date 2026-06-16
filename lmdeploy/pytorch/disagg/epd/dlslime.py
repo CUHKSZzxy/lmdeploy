@@ -13,21 +13,18 @@ from typing import Any
 import aiohttp
 import torch
 
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderCacheFreeRequest, EncoderOutputRef, MigrationProtocol
-from lmdeploy.pytorch.disagg.epd.cache import EPDEncoderCache, get_epd_encoder_cache
+from lmdeploy.pytorch.disagg.conn.protocol import (
+    EncoderCacheFreeRequest,
+    EncoderOutputEntry,
+    EncoderOutputMetadata,
+    EncoderOutputRef,
+    MigrationProtocol,
+)
+from lmdeploy.pytorch.disagg.epd.cache import EncoderCache, get_epd_encoder_cache
 from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.utils import get_logger
 
 logger = get_logger('lmdeploy')
-
-EPD_FREE_ENCODER_OUTPUT_PATH = '/epd/free_encoder_output'
-EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT = 5
-
-_DLSLIME_EXTRA_ENDPOINT_INFO = 'dlslime_endpoint_info'
-_DLSLIME_EXTRA_MR_INFO = 'dlslime_mr_info'
-_DLSLIME_EXTRA_NBYTES = 'dlslime_nbytes'
-_DLSLIME_EXTRA_ENCODER_ENTRIES = 'dlslime_encoder_entries'
-
 
 @dataclass(frozen=True)
 class EncoderTransferConfig:
@@ -168,7 +165,7 @@ class DLSlimeEncoderTransferManager:
                  ib_port: int = 1,
                  rank: int = 0,
                  device_name: str | None = None,
-                 encoder_cache: EPDEncoderCache | None = None):
+                 encoder_cache: EncoderCache | None = None):
         self.engine_id = engine_id
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.endpoint = endpoint or self._create_endpoint(link_type, ib_port, rank, device_name)
@@ -278,7 +275,7 @@ class DLSlimeEncoderTransferManager:
                                 transfer_id: str) -> EncoderOutputRef:
         input_embeddings = prompt_input.get('input_embeddings') or []
         cache_keys = prompt_input.get('epd_encoder_cache_keys') or []
-        entries = []
+        entries: list[EncoderOutputEntry] = []
         pinned_keys = []
         assert self.encoder_cache is not None
 
@@ -309,15 +306,16 @@ class DLSlimeEncoderTransferManager:
 
                 self.encoder_cache.pin(cache_key)
                 pinned_keys.append(cache_key)
-                entries.append({
-                    'cache_key': cache_key,
-                    'mr_key': entry.mr_key,
-                    'mr_info': self._mr_info(entry.mr_key),
-                    'shape': list(tensor.shape),
-                    'dtype': str(tensor.dtype).replace('torch.', ''),
-                    'nbytes': entry.nbytes,
-                    'range': [start, end],
-                })
+                entries.append(
+                    EncoderOutputEntry(
+                        cache_key=cache_key,
+                        mr_key=entry.mr_key,
+                        mr_info=self._mr_info(entry.mr_key),
+                        shape=list(tensor.shape),
+                        dtype=str(tensor.dtype).replace('torch.', ''),
+                        nbytes=entry.nbytes,
+                        input_embedding_range=[start, end],
+                    ))
         except Exception:
             for cache_key in pinned_keys:
                 self.encoder_cache.unpin(cache_key)
@@ -327,17 +325,14 @@ class DLSlimeEncoderTransferManager:
 
         return EncoderOutputRef(
             token_ids=list(prompt_input.get('input_ids') or []),
-            input_embedding_ranges=[entry['range'] for entry in entries],
+            input_embedding_ranges=[entry.input_embedding_range for entry in entries],
             protocol=MigrationProtocol.RDMA,
             transfer_id=transfer_id,
             remote_engine_id=remote_engine_id,
             remote_session_id=remote_session_id,
-            dtype=entries[0]['dtype'],
-            shape=[entry['shape'] for entry in entries],
-            extra={
-                _DLSLIME_EXTRA_ENDPOINT_INFO: self.endpoint_info,
-                _DLSLIME_EXTRA_ENCODER_ENTRIES: entries,
-            },
+            dtype=entries[0].dtype,
+            shape=[entry.shape for entry in entries],
+            transfer_metadata=EncoderOutputMetadata(endpoint_info=self.endpoint_info, entries=entries),
         )
 
     def _publish_flat_one_shot(self, prompt_input: dict, remote_engine_id: str, remote_session_id: int,
@@ -362,48 +357,48 @@ class DLSlimeEncoderTransferManager:
             remote_session_id=remote_session_id,
             dtype=layout.dtype,
             shape=layout.shapes,
-            extra={
-                _DLSLIME_EXTRA_ENDPOINT_INFO: self.endpoint_info,
-                _DLSLIME_EXTRA_MR_INFO: self._mr_info(transfer_id),
-                _DLSLIME_EXTRA_NBYTES: layout.nbytes,
-            },
+            transfer_metadata=EncoderOutputMetadata(
+                endpoint_info=self.endpoint_info,
+                mr_info=self._mr_info(transfer_id),
+                nbytes=layout.nbytes,
+            ),
         )
 
     async def receive(self, encoder_output_ref: EncoderOutputRef) -> dict:
-        entries = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENCODER_ENTRIES)
+        entries = encoder_output_ref.transfer_metadata.entries
         if entries is not None:
             return await self._receive_cached_entries(encoder_output_ref, entries)
         return await self._receive_flat_one_shot(encoder_output_ref)
 
-    async def _receive_cached_entries(self, encoder_output_ref: EncoderOutputRef, entries: list[dict]) -> dict:
-        endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
-        if endpoint_info is None:
-            raise ValueError('DLSlime RDMA encoder_output_ref is missing endpoint metadata.')
+    async def _receive_cached_entries(self, encoder_output_ref: EncoderOutputRef,
+                                      entries: list[EncoderOutputEntry]) -> dict:
+        endpoint_info = encoder_output_ref.transfer_metadata.endpoint_info
         if len(entries) != len(encoder_output_ref.input_embedding_ranges):
             raise ValueError('DLSlime RDMA encoder_output_ref entry and embedding range counts do not match.')
 
         self._connect_once(encoder_output_ref.remote_engine_id, endpoint_info)
         embeddings = []
-        for entry, (start, end) in zip(entries, encoder_output_ref.input_embedding_ranges):
-            shape = entry['shape']
+        for entry in entries:
+            start, end = entry.input_embedding_range
+            shape = entry.shape
             if len(shape) != 2:
                 raise ValueError('DLSlime RDMA encoder_output_ref requires 2-D embedding shapes.')
-            dtype = getattr(torch, entry['dtype'])
+            dtype = getattr(torch, entry.dtype)
             output = torch.empty(tuple(int(dim) for dim in shape), dtype=dtype, device=self.device)
             expected_nbytes = output.numel() * output.element_size()
-            nbytes = int(entry['nbytes'])
+            nbytes = int(entry.nbytes)
             if nbytes != expected_nbytes:
                 raise ValueError('DLSlime RDMA encoder_output_ref byte size does not match embedding shape and dtype.')
             if int(end) - int(start) != int(shape[0]):
                 raise ValueError('DLSlime RDMA encoder_output_ref range length does not match embedding shape.')
-            await self._rdma_read_encoder_output(output, entry['mr_info'], nbytes)
+            await self._rdma_read_encoder_output(output, entry.mr_info, nbytes)
             embeddings.append(InputEmbeddings(output, start=int(start), end=int(end)))
         return dict(prompt=None, input_ids=list(encoder_output_ref.token_ids), input_embeddings=embeddings)
 
     async def _receive_flat_one_shot(self, encoder_output_ref: EncoderOutputRef) -> dict:
-        endpoint_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_ENDPOINT_INFO)
-        remote_mr_info = encoder_output_ref.extra.get(_DLSLIME_EXTRA_MR_INFO)
-        nbytes = encoder_output_ref.extra.get(_DLSLIME_EXTRA_NBYTES)
+        endpoint_info = encoder_output_ref.transfer_metadata.endpoint_info
+        remote_mr_info = encoder_output_ref.transfer_metadata.mr_info
+        nbytes = encoder_output_ref.transfer_metadata.nbytes
         if endpoint_info is None or remote_mr_info is None or nbytes is None:
             raise ValueError('DLSlime RDMA encoder_output_ref is missing endpoint or memory-region metadata.')
 
@@ -504,31 +499,31 @@ async def load_encoder_output_async(encoder_output_ref: EncoderOutputRef) -> dic
     try:
         return await manager.receive(encoder_output_ref)
     finally:
-        asyncio.create_task(release_remote_encoder_output_async(encoder_output_ref))
+        asyncio.create_task(free_remote_encoder_cache_ref_async(encoder_output_ref))
 
 
-async def release_published_encoder_output_async(request: EncoderCacheFreeRequest) -> None:
-    """Release producer-side encoder output state."""
+async def free_published_encoder_cache_ref_async(request: EncoderCacheFreeRequest) -> None:
+    """Free producer-side encoder cache reference state."""
     manager = get_dlslime_encoder_transfer_manager()
     manager.release_published(request.transfer_id)
 
 
-async def release_remote_encoder_output_async(encoder_output_ref: EncoderOutputRef) -> None:
-    """Release remote producer state after a DLSlime transfer is consumed."""
+async def free_remote_encoder_cache_ref_async(encoder_output_ref: EncoderOutputRef) -> None:
+    """Free remote producer state after a DLSlime transfer is consumed."""
     if not encoder_output_ref.transfer_id:
         return
     if not encoder_output_ref.remote_engine_id.startswith(('http://', 'https://')):
-        logger.debug('skip EPD encoder-output release for non-http engine id %s', encoder_output_ref.remote_engine_id)
+        logger.debug('skip EPD encoder cache ref free for non-http engine id %s', encoder_output_ref.remote_engine_id)
         return
 
     request = EncoderCacheFreeRequest(transfer_id=encoder_output_ref.transfer_id)
     try:
-        timeout = aiohttp.ClientTimeout(total=EPD_ENCODER_OUTPUT_RELEASE_TIMEOUT)
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(encoder_output_ref.remote_engine_id.rstrip('/') + EPD_FREE_ENCODER_OUTPUT_PATH,
+            async with session.post(encoder_output_ref.remote_engine_id.rstrip('/') + '/epd/free_encoder_cache_ref',
                                     json=request.model_dump(mode='json')) as response:
                 if response.status != 200:
-                    logger.warning('EPD encoder-output release failed: status=%s, body=%s', response.status,
+                    logger.warning('EPD encoder cache ref free failed: status=%s, body=%s', response.status,
                                    await response.text())
     except Exception as exc:
-        logger.warning('EPD encoder-output release failed: %s', exc)
+        logger.warning('EPD encoder cache ref free failed: %s', exc)

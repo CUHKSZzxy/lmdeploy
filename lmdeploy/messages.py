@@ -399,6 +399,8 @@ class PytorchEngineConfig:
             multimodal encoder modules. Default to False.
         encoder_only: Whether to load only the multimodal encoder path and skip
             language model modules. Default to False.
+        encoder_cache_size_gb: Multimodal encoder-output cache size in GiB.
+            Set to 0 to disable the cache. Default to 4.
         logprobs_mode: The mode of logprob, options: ['raw_logits', 'raw_logprobs']
         dllm_block_length: Block size of block diffusion model.
         dllm_unmasking_strategy: Dllm unmasking strategy, options:
@@ -444,6 +446,7 @@ class PytorchEngineConfig:
     hf_overrides: dict[str, Any] | None = None
     language_only: bool = False
     encoder_only: bool = False
+    encoder_cache_size_gb: float = 4.0
     logprobs_mode: str = None
     # router replay
     enable_return_routed_experts: bool = False
@@ -495,6 +498,7 @@ class PytorchEngineConfig:
                            'setting both to 16.')
         if self.language_only and self.encoder_only:
             raise ValueError('language_only and encoder_only cannot both be enabled.')
+        assert self.encoder_cache_size_gb >= 0, 'invalid encoder_cache_size_gb'
 
 
 class ResponseType(enum.Enum):

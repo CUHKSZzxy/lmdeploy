@@ -64,6 +64,11 @@ def test_build_epd_language_request_preserves_messages_and_injects_encoder_outpu
         'remote_session_id': 3,
         'dtype': 'float32',
         'shape': [[2, 4]],
+        'transfer_metadata': {
+            'endpoint_info': {'name': 'encoder'},
+            'mr_info': {'addr': 0, 'length': 32},
+            'nbytes': 32,
+        },
     }
 
     language_request = _build_epd_language_request(request_dict, encoder_output_ref)
@@ -193,7 +198,7 @@ def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):
     async def fake_release(encoder_output_ref):
         called['encoder_output_ref'] = encoder_output_ref
 
-    monkeypatch.setattr(proxy_mod, 'release_remote_encoder_output_async', fake_release)
+    monkeypatch.setattr(proxy_mod, 'free_remote_encoder_cache_ref_async', fake_release)
     encoder_output_ref = {
         'token_ids': [1, 2],
         'input_embedding_ranges': [[0, 2]],
@@ -203,6 +208,11 @@ def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):
         'remote_session_id': 3,
         'dtype': 'float32',
         'shape': [[2, 4]],
+        'transfer_metadata': {
+            'endpoint_info': {'name': 'encoder'},
+            'mr_info': {'addr': 0, 'length': 32},
+            'nbytes': 32,
+        },
     }
 
     asyncio.run(_release_epd_encoder_output_ref(encoder_output_ref))

@@ -141,6 +141,8 @@ class DeployModelMixinV1(DeployModelMixin):
                       **kwargs):
         """Build LM Head."""
         bm_ctx = get_build_model_context()
+        if bm_ctx.encoder_only:
+            return None
         head_dtype = torch.float32 if bm_ctx.fp32_lm_head else dtype
         lm_head = build_rowwise_linear(
             hidden_size,

@@ -46,14 +46,15 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     EncoderOutputRef,
     MigrationRequest,
 )
+from lmdeploy.pytorch.disagg.epd.cache import EncoderCache
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine, EngineHealthMonitor
 from lmdeploy.pytorch.disagg.epd.dlslime import (
     DLSlimeEncoderTransferManager,
     EncoderTransferConfig,
     get_dlslime_encoder_transfer_manager,
+    free_published_encoder_cache_ref_async,
     publish_encoder_output,
-    release_published_encoder_output_async,
     set_dlslime_encoder_transfer_manager,
 )
 from lmdeploy.pytorch.disagg.epd.engine import compute_encoder_prompt_input_for_engine
@@ -1358,9 +1359,9 @@ async def free_cache(cache_free_request: DistServeCacheFreeRequest) -> JSONRespo
 """ EPD Disaggregation API Begin """
 
 
-@router.post('/epd/free_encoder_output')
-async def free_encoder_output(free_request: EncoderCacheFreeRequest):
-    await release_published_encoder_output_async(free_request)
+@router.post('/epd/free_encoder_cache_ref')
+async def free_encoder_cache_ref(free_request: EncoderCacheFreeRequest):
+    await free_published_encoder_cache_ref_async(free_request)
     return {'status': 'SUCCESS'}
 
 
@@ -1522,6 +1523,7 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
                 dlslime_encoder_transfer_manager = DLSlimeEncoderTransferManager(
                     engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
                     rank=getattr(backend_config, 'dp_rank', 0) or 0,
+                    encoder_cache=EncoderCache.from_config(backend_config),
                 )
                 set_dlslime_encoder_transfer_manager(dlslime_encoder_transfer_manager)
 

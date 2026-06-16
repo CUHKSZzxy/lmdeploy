@@ -538,6 +538,7 @@ class MiscConfig:
     hf_overrides: dict[str, Any] = None
     language_only: bool = False
     encoder_only: bool = False
+    encoder_cache_size_gb: float = 4.0
     logprobs_mode: str = None
     dllm_config: DLLMConfig = None
     enable_return_routed_experts: bool = False
@@ -559,6 +560,7 @@ class MiscConfig:
             hf_overrides=engine_config.hf_overrides,
             language_only=engine_config.language_only,
             encoder_only=engine_config.encoder_only,
+            encoder_cache_size_gb=engine_config.encoder_cache_size_gb,
             logprobs_mode=engine_config.logprobs_mode,
             dllm_config=dllm_config,
             enable_return_routed_experts=engine_config.enable_return_routed_experts,

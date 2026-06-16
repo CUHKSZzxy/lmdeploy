@@ -714,6 +714,14 @@ class ArgumentHelper:
                                    help='load only the multimodal encoder path and disable the language model')
 
     @staticmethod
+    def encoder_cache_size_gb(parser):
+        """Add argument encoder_cache_size_gb to parser."""
+        return parser.add_argument('--encoder-cache-size-gb',
+                                   type=float,
+                                   default=4.0,
+                                   help='multimodal encoder-output cache size in GiB; set 0 to disable')
+
+    @staticmethod
     def logprobs_mode(parser):
         """The mode of logprobs."""
         return parser.add_argument('--logprobs-mode',

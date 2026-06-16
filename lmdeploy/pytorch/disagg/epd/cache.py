@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -18,11 +17,10 @@ import torch
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 
 DEFAULT_EPD_ENCODER_CACHE_BYTES = 4 * 1024**3
-EPD_ENCODER_CACHE_MAX_BYTES_ENV = 'LMDEPLOY_EPD_ENCODER_CACHE_MAX_BYTES'
 
 
 @dataclass
-class EPDEncoderCacheEntry:
+class EncoderCacheEntry:
     """GPU-resident encoder output cached by one multimodal input hash."""
 
     key: str
@@ -33,24 +31,26 @@ class EPDEncoderCacheEntry:
     on_evict: Callable[[], None] | None = None
 
 
-class EPDEncoderCache:
+class EncoderCache:
     """Byte-limited LRU cache for encoder output tensors."""
 
     def __init__(self, max_bytes: int):
         self.max_bytes = max_bytes
         self.used_bytes = 0
-        self.entries: OrderedDict[str, EPDEncoderCacheEntry] = OrderedDict()
+        self.entries: OrderedDict[str, EncoderCacheEntry] = OrderedDict()
 
     @classmethod
-    def from_env(cls) -> 'EPDEncoderCache':
-        max_bytes = int(os.getenv(EPD_ENCODER_CACHE_MAX_BYTES_ENV, DEFAULT_EPD_ENCODER_CACHE_BYTES))
-        return cls(max_bytes=max_bytes)
+    def from_config(cls, config) -> 'EncoderCache | None':
+        cache_size_gb = config.encoder_cache_size_gb
+        if cache_size_gb <= 0:
+            return None
+        return cls(max_bytes=int(cache_size_gb * 1024**3))
 
     def get(self, key: str) -> torch.Tensor | None:
         entry = self.get_entry(key)
         return None if entry is None else entry.tensor
 
-    def get_entry(self, key: str) -> EPDEncoderCacheEntry | None:
+    def get_entry(self, key: str) -> EncoderCacheEntry | None:
         entry = self.entries.get(key)
         if entry is not None:
             self.entries.move_to_end(key)
@@ -67,7 +67,7 @@ class EPDEncoderCache:
             return self.entries[key].tensor
 
         self._evict_until_fits(nbytes)
-        self.entries[key] = EPDEncoderCacheEntry(key=key, tensor=tensor, nbytes=nbytes)
+        self.entries[key] = EncoderCacheEntry(key=key, tensor=tensor, nbytes=nbytes)
         self.used_bytes += nbytes
         return tensor
 
@@ -85,7 +85,7 @@ class EPDEncoderCache:
         self.entries.clear()
         self.used_bytes = 0
 
-    def _evict_entry(self, entry: EPDEncoderCacheEntry):
+    def _evict_entry(self, entry: EncoderCacheEntry):
         if entry.on_evict is not None:
             entry.on_evict()
             entry.on_evict = None
@@ -101,24 +101,23 @@ class EPDEncoderCache:
             self.used_bytes -= victim.nbytes
 
 
-_EPD_ENCODER_CACHE: EPDEncoderCache | None = None
+_EPD_ENCODER_CACHE: EncoderCache | None = None
 
 
-def get_epd_encoder_cache() -> EPDEncoderCache | None:
+def get_epd_encoder_cache() -> EncoderCache | None:
     """Return the process-local producer cache, or None when disabled."""
-    global _EPD_ENCODER_CACHE
-    if _EPD_ENCODER_CACHE is None:
-        cache = EPDEncoderCache.from_env()
-        if cache.max_bytes == 0:
-            return None
-        _EPD_ENCODER_CACHE = cache
     return _EPD_ENCODER_CACHE
 
 
-def set_epd_encoder_cache(cache: EPDEncoderCache | None):
+def set_epd_encoder_cache(cache: EncoderCache | None):
     """Set the process-local cache; intended for lifecycle setup and tests."""
     global _EPD_ENCODER_CACHE
     _EPD_ENCODER_CACHE = cache
+
+
+def set_epd_encoder_cache_from_config(config):
+    """Set the process-local cache from engine configuration."""
+    set_epd_encoder_cache(EncoderCache.from_config(config))
 
 
 def _normalize_cache_meta(value: Any):

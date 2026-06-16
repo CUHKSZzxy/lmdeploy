@@ -17,6 +17,7 @@ from lmdeploy.pytorch.backends import get_backend
 from lmdeploy.pytorch.config import BackendConfig, CacheConfig, MiscConfig, ModelConfig, SpecDecodeConfig
 from lmdeploy.pytorch.devices import DeviceContext, get_device_manager
 from lmdeploy.pytorch.disagg.config import EngineRole
+from lmdeploy.pytorch.disagg.epd.cache import set_epd_encoder_cache_from_config
 from lmdeploy.pytorch.distributed import DistContext, get_dist_manager
 from lmdeploy.pytorch.engine.cache_engine import CacheEngine, StateCacheEngine
 from lmdeploy.pytorch.engine.guided_process import GuidedDecodingManager
@@ -257,6 +258,7 @@ class BaseModelAgent:
         self.backend_config = backend_config
         self.misc_config = misc_config
         self.dist_config = dist_ctx.dist_config
+        set_epd_encoder_cache_from_config(misc_config)
         rank = dist_ctx.rank
 
         self.model_path = model_path

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol, MigrationRequest
 from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
-from lmdeploy.pytorch.disagg.epd.dlslime import build_encoder_transfer_config, release_remote_encoder_output_async
+from lmdeploy.pytorch.disagg.epd.dlslime import build_encoder_transfer_config, free_remote_encoder_cache_ref_async
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
@@ -504,7 +504,7 @@ async def _release_epd_encoder_output_ref(encoder_output_ref: dict | EncoderOutp
     if encoder_output_ref is None:
         return
     encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
-    await release_remote_encoder_output_async(encoder_output_ref)
+    await free_remote_encoder_cache_ref_async(encoder_output_ref)
 
 
 async def _stream_epd_language_response(node_manager, request_dict: dict, node_url: str,

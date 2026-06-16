@@ -101,6 +101,7 @@ class SubCliServe:
         ArgumentHelper.eager_mode(pt_group)
         ArgumentHelper.language_only(pt_group)
         ArgumentHelper.encoder_only(pt_group)
+        ArgumentHelper.encoder_cache_size_gb(pt_group)
         ArgumentHelper.logprobs_mode(pt_group)
         ArgumentHelper.dllm_block_length(pt_group)
         ArgumentHelper.dllm_unmasking_strategy(pt_group)
@@ -246,6 +247,7 @@ class SubCliServe:
                 hf_overrides=args.hf_overrides,
                 language_only=args.language_only,
                 encoder_only=args.encoder_only,
+                encoder_cache_size_gb=args.encoder_cache_size_gb,
                 logprobs_mode=args.logprobs_mode,
                 dllm_block_length=args.dllm_block_length,
                 dllm_unmasking_strategy=args.dllm_unmasking_strategy,

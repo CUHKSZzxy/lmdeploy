@@ -224,9 +224,6 @@ class Qwen3_5MoeModel(Qwen3_5Model):
                  device: torch.device | None = None,
                  prefix: str = ''):
         nn.Module.__init__(self)
-        bm_ctx = get_build_model_context()
-        self.encoder_only = bm_ctx.encoder_only
-        self.language_only = bm_ctx.language_only
 
         self.visual = Qwen3_5MoeVisionModel(config.vision_config,
                                             dtype=dtype,
@@ -241,6 +238,7 @@ class Qwen3_5MoeModel(Qwen3_5Model):
         # build time series model
         if hasattr(config, 'ts_config'):
             self.time_series = InternS1ProTimeSeriesModel(config.ts_config, dtype=dtype, device=device)
+
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     """ModelForCausalLM."""
@@ -276,14 +274,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         # build model
         self.model = Qwen3_5MoeModel(config, dtype=dtype, device=device, prefix=add_prefix('model', prefix))
         # build lm_head
-        if self.encoder_only:
-            self.lm_head = None
-        else:
-            self.lm_head = self.build_lm_head(config.text_config.hidden_size,
-                                              config.text_config.vocab_size,
-                                              bias=False,
-                                              dtype=dtype,
-                                              device=device)
+        self.lm_head = self.build_lm_head(config.text_config.hidden_size,
+                                          config.text_config.vocab_size,
+                                          bias=False,
+                                          dtype=dtype,
+                                          device=device)
         # for router replay
         self.enable_return_routed_experts = bm_ctx.enable_return_routed_experts
         self.is_spec_decoding = bm_ctx.num_spec_tokens > 0

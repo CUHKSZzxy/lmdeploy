@@ -2,7 +2,7 @@
 import enum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, field_serializer, field_validator
 
 from lmdeploy.pytorch.disagg.config import (
     DistServeEngineConfig,
@@ -92,6 +92,27 @@ class MigrationRequest(BaseModel):
     is_dummy_prefill: bool = False
 
 
+class EncoderOutputEntry(BaseModel):
+    """Metadata for one cached encoder-output tensor."""
+
+    mr_info: dict[str, Any]
+    shape: list[int]
+    dtype: str
+    nbytes: int
+    input_embedding_range: list[int]
+    cache_key: str | None = None
+    mr_key: str | None = None
+
+
+class EncoderOutputMetadata(BaseModel):
+    """Metadata needed to load encoder outputs from a producer."""
+
+    endpoint_info: dict[str, Any]
+    mr_info: dict[str, Any] | None = None
+    nbytes: int | None = None
+    entries: list[EncoderOutputEntry] | None = None
+
+
 class EncoderOutputRef(BaseModel):
     """Reference to encoder outputs produced by an EPD encoder node."""
 
@@ -105,7 +126,7 @@ class EncoderOutputRef(BaseModel):
 
     dtype: str
     shape: list[list[int]]
-    extra: dict[str, Any] = Field(default_factory=dict)
+    transfer_metadata: EncoderOutputMetadata
 
     @field_validator('protocol', mode='before')
     @classmethod
@@ -120,7 +141,7 @@ class EncoderOutputRef(BaseModel):
 
 
 class EncoderCacheFreeRequest(BaseModel):
-    """Request to release process-local encoder transfer state."""
+    """Request to free process-local encoder transfer state."""
     transfer_id: str
 
 

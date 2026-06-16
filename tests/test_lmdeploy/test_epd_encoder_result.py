@@ -13,14 +13,14 @@ from torch import nn
 from lmdeploy.archs import get_task
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputMetadata, EncoderOutputRef, MigrationProtocol
 from lmdeploy.pytorch.disagg.epd.cache import (
     DEFAULT_EPD_ENCODER_CACHE_BYTES,
-    EPD_ENCODER_CACHE_MAX_BYTES_ENV,
-    EPDEncoderCache,
+    EncoderCache,
     build_epd_mm_cache_key,
     get_epd_encoder_cache,
     set_epd_encoder_cache,
+    set_epd_encoder_cache_from_config,
 )
 from lmdeploy.pytorch.disagg.epd.dlslime import (
     DLSlimeEncoderTransferManager,
@@ -39,7 +39,7 @@ from lmdeploy.pytorch.messages import InputEmbeddings
 from lmdeploy.pytorch.models.patch import build_model_context
 from lmdeploy.pytorch.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from lmdeploy.pytorch.models.utils.epd import EPDEncoderMixin
-from lmdeploy.pytorch.models.utils.model import build_language_model
+from lmdeploy.pytorch.models.utils.model import DeployModelMixinV1, build_language_model
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.serve.core import AsyncEngine
 from lmdeploy.vl.constants import Modality
@@ -102,6 +102,7 @@ def test_async_engine_removes_session_when_encoder_output_ref_load_fails(monkeyp
         remote_session_id=3,
         dtype='float32',
         shape=[[2, 4]],
+        transfer_metadata=EncoderOutputMetadata(endpoint_info={'name': 'encoder'}),
     )
 
     async def _run():
@@ -132,6 +133,13 @@ def test_build_language_model_skips_module_in_encoder_only_context():
 
     assert isinstance(model, nn.Identity)
     assert model._is_dummy_mod
+
+
+def test_build_lm_head_skips_module_in_encoder_only_context():
+    with build_model_context(BuildModelContext(encoder_only=True)):
+        lm_head = DeployModelMixinV1().build_lm_head(hidden_size=1, vocab_size=1)
+
+    assert lm_head is None
 
 
 def test_dlslime_encoder_transfer_config_generates_request_fields():
@@ -175,20 +183,18 @@ def test_build_embedding_layout_preserves_ranges_and_rejects_mismatch():
         _build_embedding_layout({'input_embeddings': [mismatch]}, torch.device('cpu'))
 
 
-def test_epd_encoder_cache_defaults_to_4gb_and_env_can_disable(monkeypatch):
-    set_epd_encoder_cache(None)
-    monkeypatch.delenv(EPD_ENCODER_CACHE_MAX_BYTES_ENV, raising=False)
+def test_epd_encoder_cache_is_configured_explicitly():
+    assert PytorchEngineConfig().encoder_cache_size_gb == 4.0
+    assert PytorchEngineConfig(encoder_cache_size_gb=0).encoder_cache_size_gb == 0
 
-    cache = get_epd_encoder_cache()
+    with pytest.raises(AssertionError, match='invalid encoder_cache_size_gb'):
+        PytorchEngineConfig(encoder_cache_size_gb=-1)
 
-    assert cache.max_bytes == DEFAULT_EPD_ENCODER_CACHE_BYTES
+    set_epd_encoder_cache_from_config(PytorchEngineConfig())
+    assert get_epd_encoder_cache().max_bytes == DEFAULT_EPD_ENCODER_CACHE_BYTES
 
-    set_epd_encoder_cache(None)
-    monkeypatch.setenv(EPD_ENCODER_CACHE_MAX_BYTES_ENV, '0')
-
+    set_epd_encoder_cache_from_config(PytorchEngineConfig(encoder_cache_size_gb=0))
     assert get_epd_encoder_cache() is None
-
-    set_epd_encoder_cache(None)
 
 
 def test_epd_mm_cache_key_tracks_tensor_and_meta():
@@ -231,7 +237,7 @@ def test_epd_mm_cache_key_supports_bfloat16_tensor():
 
 
 def test_epd_encoder_cache_evicts_only_unpinned_entries():
-    cache = EPDEncoderCache(max_bytes=32)
+    cache = EncoderCache(max_bytes=32)
     first = torch.ones(2, 2, dtype=torch.float32)
     second = torch.ones(2, 2, dtype=torch.float32) * 2
     third = torch.ones(2, 2, dtype=torch.float32) * 3
@@ -365,6 +371,8 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     assert ref.protocol is MigrationProtocol.RDMA
     assert ref.input_embedding_ranges == [[1, 3]]
     assert ref.shape == [[2, 2]]
+    reloaded = EncoderOutputRef.model_validate_json(ref.model_dump_json())
+    assert reloaded.transfer_metadata.nbytes == ref.transfer_metadata.nbytes
     assert prompt_input['input_ids'] == [10, 11, 12, 13]
     assert len(prompt_input['input_embeddings']) == 1
     received = prompt_input['input_embeddings'][0]
@@ -379,7 +387,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
 
 def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
-    cache = EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
+    cache = EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
     cache.put('cache-key', source)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
@@ -403,7 +411,8 @@ def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
         ))
     prompt_input = asyncio.run(consumer.receive(ref))
 
-    assert 'dlslime_encoder_entries' in ref.extra
+    assert ref.transfer_metadata.entries is not None
+    assert ref.transfer_metadata.entries[0].cache_key == 'cache-key'
     assert cache.get_entry('cache-key').ref_count == 1
     received = prompt_input['input_embeddings'][0]
     assert received.start == 1
@@ -418,7 +427,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
 
 def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_cache():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
-    cache = EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
+    cache = EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
@@ -441,7 +450,8 @@ def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_ca
         ))
     prompt_input = asyncio.run(consumer.receive(ref))
 
-    assert 'dlslime_encoder_entries' in ref.extra
+    assert ref.transfer_metadata.entries is not None
+    assert ref.transfer_metadata.entries[0].cache_key == 'cache-key'
     assert cache.get_entry('cache-key').ref_count == 1
     torch.testing.assert_close(prompt_input['input_embeddings'][0].embeddings, source)
 
@@ -470,7 +480,7 @@ def test_dlslime_encoder_transfer_manager_rejects_bad_receive_metadata():
         ))
 
     bad_nbytes = ref.model_copy(deep=True)
-    bad_nbytes.extra['dlslime_nbytes'] = int(bad_nbytes.extra['dlslime_nbytes']) + 4
+    bad_nbytes.transfer_metadata.nbytes = int(bad_nbytes.transfer_metadata.nbytes) + 4
     with pytest.raises(ValueError, match='byte size'):
         asyncio.run(consumer.receive(bad_nbytes))
 
@@ -552,7 +562,6 @@ class _FakeQwen35InnerModel(nn.Module):
 
 class _FakeQwen35Model(nn.Module):
 
-    _prepare_visual_forward_inputs = Qwen3_5ForConditionalGeneration._prepare_visual_forward_inputs
     compute_encoder_prompt_input = Qwen3_5ForConditionalGeneration.compute_encoder_prompt_input
     _check_epd_encoder_supported = Qwen3_5ForConditionalGeneration._check_epd_encoder_supported
     _compute_epd_encoder_items_uncached = Qwen3_5ForConditionalGeneration._compute_epd_encoder_items_uncached
@@ -596,7 +605,7 @@ class _FakeGraphRunner:
 
 
 def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
-    set_epd_encoder_cache(EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
+    set_epd_encoder_cache(EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -644,7 +653,7 @@ def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_em
 
 
 def test_compute_encoder_prompt_input_reuses_cached_embedding():
-    set_epd_encoder_cache(EPDEncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
+    set_epd_encoder_cache(EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
     model = _FakeQwen35Model()
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
@@ -822,9 +831,9 @@ def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
 
     class _FakeTransferManager:
 
-        def __init__(self, engine_id, rank):
+        def __init__(self, engine_id, rank, encoder_cache):
             self.engine_id = engine_id
-            created.append((engine_id, rank))
+            created.append((engine_id, rank, None if encoder_cache is None else encoder_cache.max_bytes))
 
         def close(self):
             closed.append(self.engine_id)
@@ -839,6 +848,7 @@ def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
             'migration_backend': MigrationBackend.DLSlime,
             'dp_rank': 0,
             'enable_metrics': False,
+            'encoder_cache_size_gb': 0.5,
         })()
 
     async def _run_lifespan(config):
@@ -863,7 +873,10 @@ def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
     asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_only=True)))
     asyncio.run(_run_lifespan(_config(role=EngineRole.Encoder, language_only=False)))
 
-    assert created == [('http://language', 0), ('http://language', 0)]
+    assert created == [
+        ('http://language', 0, int(0.5 * 1024**3)),
+        ('http://language', 0, int(0.5 * 1024**3)),
+    ]
     assert closed == ['http://language', 'http://language']
     assert len(set_managers) == 4
     assert set_managers[1] is None
