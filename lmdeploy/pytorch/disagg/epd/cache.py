@@ -16,8 +16,6 @@ import torch
 
 from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 
-DEFAULT_EPD_ENCODER_CACHE_BYTES = 4 * 1024**3
-
 
 @dataclass
 class EncoderCacheEntry:

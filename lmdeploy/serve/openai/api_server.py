@@ -46,7 +46,6 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     EncoderOutputRef,
     MigrationRequest,
 )
-from lmdeploy.pytorch.disagg.epd.cache import EncoderCache
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine, EngineHealthMonitor
 from lmdeploy.pytorch.disagg.epd.dlslime import (
@@ -1523,7 +1522,6 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
                 dlslime_encoder_transfer_manager = DLSlimeEncoderTransferManager(
                     engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
                     rank=getattr(backend_config, 'dp_rank', 0) or 0,
-                    encoder_cache=EncoderCache.from_config(backend_config),
                 )
                 set_dlslime_encoder_transfer_manager(dlslime_encoder_transfer_manager)
 

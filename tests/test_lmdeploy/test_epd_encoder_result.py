@@ -15,7 +15,6 @@ from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseTyp
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputMetadata, EncoderOutputRef, MigrationProtocol
 from lmdeploy.pytorch.disagg.epd.cache import (
-    DEFAULT_EPD_ENCODER_CACHE_BYTES,
     EncoderCache,
     build_epd_mm_cache_key,
     get_epd_encoder_cache,
@@ -190,8 +189,9 @@ def test_epd_encoder_cache_is_configured_explicitly():
     with pytest.raises(AssertionError, match='invalid encoder_cache_size_gb'):
         PytorchEngineConfig(encoder_cache_size_gb=-1)
 
-    set_epd_encoder_cache_from_config(PytorchEngineConfig())
-    assert get_epd_encoder_cache().max_bytes == DEFAULT_EPD_ENCODER_CACHE_BYTES
+    config = PytorchEngineConfig()
+    set_epd_encoder_cache_from_config(config)
+    assert get_epd_encoder_cache().max_bytes == int(config.encoder_cache_size_gb * 1024**3)
 
     set_epd_encoder_cache_from_config(PytorchEngineConfig(encoder_cache_size_gb=0))
     assert get_epd_encoder_cache() is None
@@ -387,7 +387,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
 
 def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
-    cache = EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
+    cache = EncoderCache(max_bytes=1024)
     cache.put('cache-key', source)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
@@ -427,7 +427,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
 
 def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_cache():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
-    cache = EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES)
+    cache = EncoderCache(max_bytes=1024)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
@@ -605,7 +605,7 @@ class _FakeGraphRunner:
 
 
 def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
-    set_epd_encoder_cache(EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
+    set_epd_encoder_cache(EncoderCache(max_bytes=1024))
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -653,7 +653,7 @@ def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_em
 
 
 def test_compute_encoder_prompt_input_reuses_cached_embedding():
-    set_epd_encoder_cache(EncoderCache(max_bytes=DEFAULT_EPD_ENCODER_CACHE_BYTES))
+    set_epd_encoder_cache(EncoderCache(max_bytes=1024))
     model = _FakeQwen35Model()
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
@@ -831,9 +831,9 @@ def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
 
     class _FakeTransferManager:
 
-        def __init__(self, engine_id, rank, encoder_cache):
+        def __init__(self, engine_id, rank, **kwargs):
             self.engine_id = engine_id
-            created.append((engine_id, rank, None if encoder_cache is None else encoder_cache.max_bytes))
+            created.append((engine_id, rank, kwargs))
 
         def close(self):
             closed.append(self.engine_id)
@@ -874,8 +874,8 @@ def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
     asyncio.run(_run_lifespan(_config(role=EngineRole.Encoder, language_only=False)))
 
     assert created == [
-        ('http://language', 0, int(0.5 * 1024**3)),
-        ('http://language', 0, int(0.5 * 1024**3)),
+        ('http://language', 0, {}),
+        ('http://language', 0, {}),
     ]
     assert closed == ['http://language', 'http://language']
     assert len(set_managers) == 4
