@@ -34,6 +34,13 @@ class DistServeConnectionStatus(enum.Enum):
     FAIL = enum.auto()
 
 
+class EPDConnectionStatus(enum.Enum):
+    """EPD connection status."""
+
+    SUCCESS = enum.auto()
+    FAIL = enum.auto()
+
+
 class DistServeInitRequest(BaseModel):
     local_engine_id: str
     local_engine_config: DistServeEngineConfig
@@ -79,6 +86,68 @@ class DistServeConnectionRequest(BaseModel):
 
 class DistServeConnectionResponse(BaseModel):
     status: DistServeConnectionStatus
+
+
+class EncoderTransferEndpointInfo(BaseModel):
+    """Endpoint metadata for encoder-output transfer."""
+
+    protocol: MigrationProtocol
+    endpoint_info: dict[str, Any]
+
+    @field_validator('protocol', mode='before')
+    @classmethod
+    def _validate_protocol(cls, value):
+        if isinstance(value, str):
+            return MigrationProtocol[value]
+        return value
+
+    @field_serializer('protocol')
+    def _serialize_protocol(self, protocol: MigrationProtocol):
+        return protocol.name
+
+
+class EPDInitRequest(BaseModel):
+    local_engine_id: str
+    remote_engine_id: str
+    protocol: MigrationProtocol
+    rdma_config: DistServeRDMAConfig | None = None
+
+    @field_validator('protocol', mode='before')
+    @classmethod
+    def _validate_protocol(cls, value):
+        if isinstance(value, str):
+            return MigrationProtocol[value]
+        return value
+
+    @field_serializer('protocol')
+    def _serialize_protocol(self, protocol: MigrationProtocol):
+        return protocol.name
+
+
+class EPDInitResponse(BaseModel):
+    status: EPDConnectionStatus
+    encoder_transfer_endpoint_info: EncoderTransferEndpointInfo
+
+
+class EPDConnectionRequest(BaseModel):
+    protocol: MigrationProtocol
+    remote_engine_id: str
+    remote_encoder_transfer_endpoint_info: EncoderTransferEndpointInfo
+
+    @field_validator('protocol', mode='before')
+    @classmethod
+    def _validate_protocol(cls, value):
+        if isinstance(value, str):
+            return MigrationProtocol[value]
+        return value
+
+    @field_serializer('protocol')
+    def _serialize_protocol(self, protocol: MigrationProtocol):
+        return protocol.name
+
+
+class EPDConnectionResponse(BaseModel):
+    status: EPDConnectionStatus
 
 
 class MigrationRequest(BaseModel):
@@ -148,6 +217,11 @@ class EncoderCacheFreeRequest(BaseModel):
 class DistServeCacheFreeRequest(BaseModel):
     remote_engine_id: str
     remote_session_id: int
+
+
+class EPDDropConnectionRequest(BaseModel):
+    engine_id: str
+    remote_engine_id: str
 
 
 class DistServeDropConnectionRequest(BaseModel):

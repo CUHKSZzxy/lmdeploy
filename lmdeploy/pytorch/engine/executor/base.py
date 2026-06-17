@@ -345,6 +345,18 @@ class ExecutorBase:
         """Update cache config."""
         self._adjust_block_size()
         self._sync_spec_cache_block_size()
+
+        if self.misc_config.encoder_only:
+            # Encoder-only servers do not decode, so avoid reserving LLM KV/state cache.
+            cache_config = self.cache_config
+            cache_config.states_shapes = []
+            cache_config.num_state_caches = 0
+            cache_config.num_gpu_blocks = cache_config.num_reserved_gpu_blocks + 2
+            cache_config.max_prefill_token_num = min(cache_config.max_prefill_token_num, cache_config.block_size)
+            self.set_cache_config(cache_config, None)
+            self.set_model_config(self.model_config, None)
+            return
+
         self.cache_config.states_shapes = self.model_config.states_shapes
 
         spec_cache_config, spec_model_config = self._get_spec_configs()

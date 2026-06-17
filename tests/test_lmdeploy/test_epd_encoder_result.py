@@ -13,7 +13,16 @@ from torch import nn
 from lmdeploy.archs import get_task
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, ResponseType
 from lmdeploy.pytorch.disagg.config import EngineRole, MigrationBackend
-from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputMetadata, EncoderOutputRef, MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import (
+    EPDConnectionRequest,
+    EPDConnectionStatus,
+    EPDDropConnectionRequest,
+    EPDInitRequest,
+    EncoderOutputMetadata,
+    EncoderOutputRef,
+    EncoderTransferEndpointInfo,
+    MigrationProtocol,
+)
 from lmdeploy.pytorch.disagg.epd.cache import (
     EncoderCache,
     build_epd_mm_cache_key,
@@ -21,15 +30,19 @@ from lmdeploy.pytorch.disagg.epd.cache import (
     set_epd_encoder_cache,
     set_epd_encoder_cache_from_config,
 )
-from lmdeploy.pytorch.disagg.epd.dlslime import (
-    DLSlimeEncoderTransferManager,
+from lmdeploy.pytorch.disagg.epd.control import (
     EncoderTransferConfig,
-    _build_embedding_layout,
     build_encoder_transfer_config,
+)
+from lmdeploy.pytorch.disagg.epd.manager import (
+    EncoderTransferManager,
+    _build_embedding_layout,
 )
 from lmdeploy.pytorch.disagg.epd.engine import (
     compute_encoder_prompt_input_for_engine,
 )
+from lmdeploy.pytorch.config import CacheConfig
+from lmdeploy.pytorch.engine.executor.base import ExecutorBase
 from lmdeploy.pytorch.engine.engine_instance import EngineInstance
 from lmdeploy.pytorch.engine.input_process import PreprocessInputResult
 from lmdeploy.pytorch.engine.request import RequestType, Response
@@ -141,27 +154,73 @@ def test_build_lm_head_skips_module_in_encoder_only_context():
     assert lm_head is None
 
 
-def test_dlslime_encoder_transfer_config_generates_request_fields():
-    endpoint_info = {'io_info': {'data_channel_info': []}}
-    config = build_encoder_transfer_config(receiver_endpoint_info=endpoint_info,
-                                           receiver_engine_id='http://language')
+def test_executor_caps_cache_config_for_encoder_only():
+
+    class _Executor(ExecutorBase):
+
+        def gather_free_mem(self):
+            raise AssertionError('encoder-only config should not size cache from free memory')
+
+        def set_cache_config(self, cache_config, spec_cache_config=None):
+            self.updated_cache_config = cache_config
+            self.updated_spec_cache_config = spec_cache_config
+
+        def set_model_config(self, model_config, spec_model_config=None):
+            self.updated_model_config = model_config
+            self.updated_spec_model_config = spec_model_config
+
+    model_config = types.SimpleNamespace(
+        sliding_window=-1,
+        k_head_dim=128,
+        states_shapes=[((4, 8), torch.float32)],
+        use_flash_mla=False,
+    )
+    cache_config = CacheConfig(
+        max_batches=32,
+        block_size=64,
+        num_cpu_blocks=0,
+        num_gpu_blocks=0,
+        kernel_block_size=64,
+        max_prefill_token_num=8192,
+        num_reserved_gpu_blocks=1,
+        role=EngineRole.Encoder,
+    )
+    executor = _Executor(
+        'unused',
+        model_config=model_config,
+        cache_config=cache_config,
+        backend_config=types.SimpleNamespace(),
+        dist_config=types.SimpleNamespace(dp=1, world_size=1),
+        misc_config=types.SimpleNamespace(encoder_only=True),
+    )
+
+    executor.update_configs()
+
+    assert cache_config.num_gpu_blocks == 3
+    assert cache_config.max_prefill_token_num == 64
+    assert cache_config.states_shapes == []
+    assert cache_config.num_state_caches == 0
+    assert executor.updated_cache_config is cache_config
+    assert executor.updated_spec_cache_config is None
+    assert executor.updated_model_config is model_config
+    assert executor.updated_spec_model_config is None
+
+
+def test_encoder_transfer_config_generates_request_fields():
+    config = build_encoder_transfer_config(receiver_engine_id='http://language')
 
     assert config.transfer_id.startswith('epd-')
-    assert config.receiver_endpoint_info == endpoint_info
     assert config.to_request_fields() == {
         'epd_transfer_id': config.transfer_id,
-        'encoder_output_receiver_endpoint_info': endpoint_info,
         'encoder_output_receiver_engine_id': 'http://language',
     }
 
 
-def test_encoder_transfer_config_requires_transfer_id_and_receiver_endpoint():
-    endpoint_info = {'io_info': {'data_channel_info': []}}
-
+def test_encoder_transfer_config_requires_transfer_id_and_receiver_engine():
     with pytest.raises(ValueError, match='requires transfer_id'):
-        EncoderTransferConfig(receiver_endpoint_info=endpoint_info)
+        EncoderTransferConfig(receiver_engine_id='http://language')
 
-    with pytest.raises(ValueError, match='requires receiver_endpoint_info'):
+    with pytest.raises(ValueError, match='requires receiver_engine_id'):
         EncoderTransferConfig(transfer_id='epd-test')
 
 
@@ -359,14 +418,32 @@ class _FakeDLSlimeEndpointWithPool:
         return self.pool
 
 
-def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
+def _connect_transfer_managers(producer: EncoderTransferManager, consumer: EncoderTransferManager):
+    producer_endpoint_info = producer.p2p_initialize(
+        EPDInitRequest(
+            protocol=MigrationProtocol.RDMA,
+            local_engine_id='http://encoder',
+            remote_engine_id='http://language',
+        ))
+    consumer_endpoint_info = consumer.p2p_initialize(
+        EPDInitRequest(
+            protocol=MigrationProtocol.RDMA,
+            local_engine_id='http://language',
+            remote_engine_id='http://encoder',
+        ))
+    producer.p2p_connect('http://language', consumer_endpoint_info)
+    consumer.p2p_connect('http://encoder', producer_endpoint_info)
+
+
+def test_encoder_transfer_manager_round_trip_with_fake_endpoint():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
     }
-    producer = DLSlimeEncoderTransferManager('encoder', endpoint=_FakeDLSlimeEndpoint('encoder'), device='cpu')
-    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    producer = EncoderTransferManager('encoder', endpoint=_FakeDLSlimeEndpoint('encoder'), device='cpu')
+    consumer = EncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    _connect_transfer_managers(producer, consumer)
 
     ref = asyncio.run(
         producer.publish(
@@ -374,8 +451,6 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
             remote_engine_id='http://encoder',
             remote_session_id=5,
             transfer_id='epd-test',
-            receiver_endpoint_info=consumer.endpoint_info,
-            receiver_engine_id='http://language',
         ))
     prompt_input = asyncio.run(consumer.receive(ref))
 
@@ -396,7 +471,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_with_fake_endpoint():
     assert 'epd-test' in producer.endpoint.unregistered
 
 
-def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
+def test_encoder_transfer_manager_round_trip_from_cached_entry():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     cache = EncoderCache(max_bytes=1024)
     cache.put('cache-key', source)
@@ -405,11 +480,12 @@ def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
         'epd_encoder_cache_keys': ['cache-key'],
     }
-    producer = DLSlimeEncoderTransferManager('encoder',
-                                             endpoint=_FakeDLSlimeEndpoint('encoder'),
-                                             device='cpu',
-                                             encoder_cache=cache)
-    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    producer = EncoderTransferManager('encoder',
+                                      endpoint=_FakeDLSlimeEndpoint('encoder'),
+                                      device='cpu',
+                                      encoder_cache=cache)
+    consumer = EncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    _connect_transfer_managers(producer, consumer)
 
     ref = asyncio.run(
         producer.publish(
@@ -417,8 +493,6 @@ def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
             remote_engine_id='http://encoder',
             remote_session_id=5,
             transfer_id='epd-test',
-            receiver_endpoint_info=consumer.endpoint_info,
-            receiver_engine_id='http://language',
         ))
     prompt_input = asyncio.run(consumer.receive(ref))
 
@@ -436,7 +510,7 @@ def test_dlslime_encoder_transfer_manager_round_trip_from_cached_entry():
     assert 'epd-cache-cache-key' in producer.endpoint.unregistered
 
 
-def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_cache():
+def test_encoder_transfer_manager_materializes_keyed_prompt_embedding_cache():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     cache = EncoderCache(max_bytes=1024)
     prompt_input = {
@@ -444,11 +518,12 @@ def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_ca
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
         'epd_encoder_cache_keys': ['cache-key'],
     }
-    producer = DLSlimeEncoderTransferManager('encoder',
-                                             endpoint=_FakeDLSlimeEndpoint('encoder'),
-                                             device='cpu',
-                                             encoder_cache=cache)
-    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    producer = EncoderTransferManager('encoder',
+                                      endpoint=_FakeDLSlimeEndpoint('encoder'),
+                                      device='cpu',
+                                      encoder_cache=cache)
+    consumer = EncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    _connect_transfer_managers(producer, consumer)
 
     ref = asyncio.run(
         producer.publish(
@@ -456,8 +531,6 @@ def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_ca
             remote_engine_id='http://encoder',
             remote_session_id=5,
             transfer_id='epd-test',
-            receiver_endpoint_info=consumer.endpoint_info,
-            receiver_engine_id='http://language',
         ))
     prompt_input = asyncio.run(consumer.receive(ref))
 
@@ -471,14 +544,15 @@ def test_dlslime_encoder_transfer_manager_materializes_keyed_prompt_embedding_ca
     assert 'epd-cache-cache-key' in producer.endpoint.unregistered
 
 
-def test_dlslime_encoder_transfer_manager_rejects_bad_receive_metadata():
+def test_encoder_transfer_manager_rejects_bad_receive_metadata():
     source = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
     prompt_input = {
         'input_ids': [10, 11, 12, 13],
         'input_embeddings': [InputEmbeddings(source, start=1, end=3)],
     }
-    producer = DLSlimeEncoderTransferManager('encoder', endpoint=_FakeDLSlimeEndpoint('encoder'), device='cpu')
-    consumer = DLSlimeEncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    producer = EncoderTransferManager('encoder', endpoint=_FakeDLSlimeEndpoint('encoder'), device='cpu')
+    consumer = EncoderTransferManager('language', endpoint=_FakeDLSlimeEndpoint('language'), device='cpu')
+    _connect_transfer_managers(producer, consumer)
 
     ref = asyncio.run(
         producer.publish(
@@ -486,8 +560,6 @@ def test_dlslime_encoder_transfer_manager_rejects_bad_receive_metadata():
             remote_engine_id='http://encoder',
             remote_session_id=5,
             transfer_id='epd-test',
-            receiver_endpoint_info=consumer.endpoint_info,
-            receiver_engine_id='http://language',
         ))
 
     bad_nbytes = ref.model_copy(deep=True)
@@ -508,9 +580,9 @@ def test_dlslime_encoder_transfer_manager_rejects_bad_receive_metadata():
     producer.release_published('epd-test')
 
 
-def test_dlslime_encoder_transfer_manager_releases_through_endpoint_pool():
+def test_encoder_transfer_manager_releases_through_endpoint_pool():
     endpoint = _FakeDLSlimeEndpointWithPool()
-    manager = DLSlimeEncoderTransferManager('encoder', endpoint=endpoint, device='cpu')
+    manager = EncoderTransferManager('encoder', endpoint=endpoint, device='cpu')
     manager._published_mr_keys['epd-test'] = 'epd-test'
 
     manager.release_published('epd-test')
@@ -815,7 +887,61 @@ def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeyp
     }
 
 
-def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
+def test_epd_control_endpoints_call_transfer_manager(monkeypatch):
+    from lmdeploy.serve.openai import api_server
+
+    class _FakeTransferManager:
+
+        def __init__(self):
+            self.calls = []
+
+        def p2p_initialize(self, init_request):
+            self.calls.append(('init', init_request.remote_engine_id))
+            return EncoderTransferEndpointInfo(protocol=init_request.protocol, endpoint_info={'name': 'local'})
+
+        def p2p_connect(self, remote_engine_id, endpoint_info):
+            self.calls.append(('connect', remote_engine_id, endpoint_info.endpoint_info))
+
+        def p2p_drop_connect(self, remote_engine_id):
+            self.calls.append(('drop', remote_engine_id))
+
+    manager = _FakeTransferManager()
+    monkeypatch.setattr(api_server, 'get_encoder_transfer_manager', lambda: manager)
+
+    init_response = asyncio.run(
+        api_server.epd_p2p_initialize(
+            EPDInitRequest(
+                protocol=MigrationProtocol.RDMA,
+                local_engine_id='http://encoder',
+                remote_engine_id='http://language',
+            )))
+    assert init_response.status is EPDConnectionStatus.SUCCESS
+    assert init_response.encoder_transfer_endpoint_info.endpoint_info == {'name': 'local'}
+
+    conn_response = asyncio.run(
+        api_server.epd_p2p_connect(
+            EPDConnectionRequest(
+                protocol=MigrationProtocol.RDMA,
+                remote_engine_id='http://language',
+                remote_encoder_transfer_endpoint_info=EncoderTransferEndpointInfo(
+                    protocol=MigrationProtocol.RDMA,
+                    endpoint_info={'name': 'language'},
+                ),
+            )))
+    assert conn_response.status is EPDConnectionStatus.SUCCESS
+
+    drop_response = asyncio.run(
+        api_server.epd_p2p_drop_connect(
+            EPDDropConnectionRequest(engine_id='http://encoder', remote_engine_id='http://language')))
+    assert drop_response == {'status': 'SUCCESS'}
+    assert manager.calls == [
+        ('init', 'http://language'),
+        ('connect', 'http://language', {'name': 'language'}),
+        ('drop', 'http://language'),
+    ]
+
+
+def test_lifespan_initializes_transfer_manager_only_for_epd_nodes(monkeypatch):
     from lmdeploy.serve.openai import api_server
 
     class _FakeHealthMonitor:
@@ -862,8 +988,8 @@ def test_lifespan_initializes_dlslime_only_for_epd_nodes(monkeypatch):
     monkeypatch.setattr(api_server.VariableInterface, 'proxy_url', 'http://proxy')
     monkeypatch.setattr(api_server.VariableInterface, 'api_server_url', 'http://language')
     monkeypatch.setattr(api_server, 'EngineHealthMonitor', _FakeHealthMonitor)
-    monkeypatch.setattr(api_server, 'DLSlimeEncoderTransferManager', _FakeTransferManager)
-    monkeypatch.setattr(api_server, 'set_dlslime_encoder_transfer_manager', set_managers.append)
+    monkeypatch.setattr(api_server, 'EncoderTransferManager', _FakeTransferManager)
+    monkeypatch.setattr(api_server, 'set_encoder_transfer_manager', set_managers.append)
     monkeypatch.setattr(api_server.metrics_processor, 'stop_metrics_handler', _fake_stop_metrics_handler)
 
     asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_only=False)))
@@ -917,7 +1043,7 @@ def test_startup_event_advertises_encoder_receiver_only_for_language_only(monkey
     monkeypatch.setitem(sys.modules, 'requests', types.SimpleNamespace(post=_fake_post))
     monkeypatch.setattr(api_server.VariableInterface, 'proxy_url', 'http://proxy')
     monkeypatch.setattr(api_server.VariableInterface, 'api_server_url', 'http://node')
-    monkeypatch.setattr(api_server, 'get_dlslime_encoder_transfer_manager',
+    monkeypatch.setattr(api_server, 'get_encoder_transfer_manager',
                         lambda: type('FakeManager', (), {'endpoint_info': {'rdma': 'endpoint'}})())
 
     monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_only=False)))

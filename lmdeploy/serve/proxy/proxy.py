@@ -23,8 +23,8 @@ from pydantic import BaseModel, Field
 
 from lmdeploy.pytorch.disagg.config import DistServeRDMAConfig, EngineRole, RDMALinkType, ServingStrategy
 from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol, MigrationRequest
-from lmdeploy.pytorch.disagg.conn.proxy_conn import PDConnectionPool
-from lmdeploy.pytorch.disagg.epd.dlslime import build_encoder_transfer_config, free_remote_encoder_cache_ref_async
+from lmdeploy.pytorch.disagg.conn.proxy_conn import EPDConnectionPool, PDConnectionPool
+from lmdeploy.pytorch.disagg.epd.control import build_encoder_transfer_config, free_remote_encoder_cache_ref_async
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
 from lmdeploy.serve.openai.api_server import create_error_response
 from lmdeploy.serve.openai.protocol import (
@@ -120,6 +120,7 @@ class NodeManager:
         self.migration_protocol = MigrationProtocol[migration_protocol]
         self.rdma_config = DistServeRDMAConfig(with_gdr=with_gdr, link_type=RDMALinkType[link_type])
         self.pd_connection_pool = PDConnectionPool()
+        self.epd_connection_pool = EPDConnectionPool(self.migration_protocol)
         self.dummy_prefill = False
 
     def get_nodes(self, role: EngineRole) -> dict[str, Status]:
@@ -190,6 +191,7 @@ class NodeManager:
             self.nodes.pop(node_url)
             self.update_config_file()
             self.pd_connection_pool.dereg_instance(node_url)
+            self.epd_connection_pool.dereg_instance(node_url)
 
     def terminate_node(self, node_url: str):
         """Terminate a node."""
@@ -482,14 +484,11 @@ def _extract_epd_encoder_output_ref(response_text: str | bytes) -> EncoderOutput
     return EncoderOutputRef.model_validate(response['encoder_output_ref'])
 
 
-async def _call_epd_encoder_node(node_manager: NodeManager, request_dict: dict, encoder_url: str, language_url: str,
-                                 language_status: Status) -> EncoderOutputRef:
+async def _call_epd_encoder_node(node_manager: NodeManager, request_dict: dict, encoder_url: str,
+                                 language_url: str) -> EncoderOutputRef:
     encoder_request = copy.deepcopy(request_dict)
     encoder_request['stream'] = False
-    transfer_config = build_encoder_transfer_config(
-        receiver_endpoint_info=language_status.encoder_output_receiver_endpoint_info,
-        receiver_engine_id=language_url,
-    )
+    transfer_config = build_encoder_transfer_config(receiver_engine_id=language_url)
     encoder_request.update(transfer_config.to_request_fields())
 
     logger.info(f'An Encoder request is dispatched to {encoder_url}')
@@ -733,16 +732,19 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
             if not encoder_url:
                 return node_manager.handle_unavailable_model(request.model)
 
-            request_dict = await raw_request.json()
-            encoder_output_ref = request_dict.get('encoder_output_ref')
             try:
+                await node_manager.epd_connection_pool.connect(encoder_url, node_url)
+                request_dict = await raw_request.json()
+                encoder_output_ref = request_dict.get('encoder_output_ref')
                 if encoder_output_ref is None:
-                    encoder_output_ref = await _call_epd_encoder_node(node_manager, request_dict, encoder_url,
-                                                                      node_url, node_status)
+                    encoder_output_ref = await _call_epd_encoder_node(node_manager, request_dict, encoder_url, node_url)
                 else:
                     encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
             except ValueError as exc:
                 return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
+            except Exception as exc:
+                logger.exception('EPD control plane request failed')
+                return create_error_response(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
             return await _dispatch_epd_language_request(node_manager, request, request_dict, node_url,
                                                         encoder_output_ref)
 

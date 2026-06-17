@@ -42,19 +42,25 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeConnectionRequest,
     DistServeDropConnectionRequest,
     DistServeInitRequest,
+    EPDConnectionRequest,
+    EPDConnectionResponse,
+    EPDConnectionStatus,
+    EPDDropConnectionRequest,
+    EPDInitRequest,
+    EPDInitResponse,
     EncoderCacheFreeRequest,
     EncoderOutputRef,
     MigrationRequest,
 )
 from lmdeploy.serve.anthropic import create_anthropic_router
 from lmdeploy.serve.core import AsyncEngine, EngineHealthMonitor
-from lmdeploy.pytorch.disagg.epd.dlslime import (
-    DLSlimeEncoderTransferManager,
-    EncoderTransferConfig,
-    get_dlslime_encoder_transfer_manager,
+from lmdeploy.pytorch.disagg.epd.control import EncoderTransferConfig
+from lmdeploy.pytorch.disagg.epd.manager import (
+    EncoderTransferManager,
+    get_encoder_transfer_manager,
     free_published_encoder_cache_ref_async,
     publish_encoder_output,
-    set_dlslime_encoder_transfer_manager,
+    set_encoder_transfer_manager,
 )
 from lmdeploy.pytorch.disagg.epd.engine import compute_encoder_prompt_input_for_engine
 from lmdeploy.serve.openai.protocol import (
@@ -1364,6 +1370,25 @@ async def free_encoder_cache_ref(free_request: EncoderCacheFreeRequest):
     return {'status': 'SUCCESS'}
 
 
+@router.post('/epd/p2p_initialize')
+async def epd_p2p_initialize(init_request: EPDInitRequest):
+    endpoint_info = get_encoder_transfer_manager().p2p_initialize(init_request)
+    return EPDInitResponse(status=EPDConnectionStatus.SUCCESS, encoder_transfer_endpoint_info=endpoint_info)
+
+
+@router.post('/epd/p2p_connect')
+async def epd_p2p_connect(conn_request: EPDConnectionRequest):
+    get_encoder_transfer_manager().p2p_connect(conn_request.remote_engine_id,
+                                               conn_request.remote_encoder_transfer_endpoint_info)
+    return EPDConnectionResponse(status=EPDConnectionStatus.SUCCESS)
+
+
+@router.post('/epd/p2p_drop_connect')
+async def epd_p2p_drop_connect(drop_conn_request: EPDDropConnectionRequest):
+    get_encoder_transfer_manager().p2p_drop_connect(drop_conn_request.remote_engine_id)
+    return {'status': 'SUCCESS'}
+
+
 """ EPD Disaggregation API End """
 
 
@@ -1424,7 +1449,7 @@ async def startup_event():
         encoder_output_receiver_endpoint_info = None
         if (getattr(engine_config, 'migration_backend', None) == MigrationBackend.DLSlime
                 and getattr(engine_config, 'language_only', False)):
-            encoder_output_receiver_endpoint_info = get_dlslime_encoder_transfer_manager().endpoint_info
+            encoder_output_receiver_endpoint_info = get_encoder_transfer_manager().endpoint_info
         url = f'{VariableInterface.proxy_url}/nodes/add'
         status = {
             'models': get_model_list(),
@@ -1508,7 +1533,7 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
     @asynccontextmanager
     async def lifespan_handler(app: FastAPI):
         task = None
-        dlslime_encoder_transfer_manager = None
+        encoder_transfer_manager = None
         health_monitor = EngineHealthMonitor(async_engine)
         VariableInterface.health_monitor = health_monitor
         try:
@@ -1519,11 +1544,11 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
             if (VariableInterface.proxy_url is not None
                 and getattr(backend_config, 'migration_backend', None) == MigrationBackend.DLSlime
                 and use_epd):
-                dlslime_encoder_transfer_manager = DLSlimeEncoderTransferManager(
+                encoder_transfer_manager = EncoderTransferManager(
                     engine_id=VariableInterface.api_server_url or f'local:{os.getpid()}',
                     rank=getattr(backend_config, 'dp_rank', 0) or 0,
                 )
-                set_dlslime_encoder_transfer_manager(dlslime_encoder_transfer_manager)
+                set_encoder_transfer_manager(encoder_transfer_manager)
 
             if getattr(backend_config, 'enable_metrics', False):
                 metrics_processor.start_metrics_handler(enable_metrics=True)
@@ -1548,9 +1573,9 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
                 VariableInterface.health_monitor = None
             if task:
                 task.cancel()
-            if dlslime_encoder_transfer_manager is not None:
-                dlslime_encoder_transfer_manager.close()
-                set_dlslime_encoder_transfer_manager(None)
+            if encoder_transfer_manager is not None:
+                encoder_transfer_manager.close()
+                set_encoder_transfer_manager(None)
             await metrics_processor.stop_metrics_handler()
 
     return lifespan_handler

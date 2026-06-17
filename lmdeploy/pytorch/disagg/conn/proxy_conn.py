@@ -16,6 +16,13 @@ from lmdeploy.pytorch.disagg.conn.protocol import (
     DistServeDropConnectionRequest,
     DistServeInitRequest,
     DistServeInitResponse,
+    EPDConnectionRequest,
+    EPDConnectionResponse,
+    EPDConnectionStatus,
+    EPDDropConnectionRequest,
+    EPDInitRequest,
+    EPDInitResponse,
+    MigrationProtocol,
 )
 from lmdeploy.pytorch.disagg.messages import PDConnectionMessage
 
@@ -46,6 +53,97 @@ class PDConnectionState:
 
 def get_server_api(url: str, api: str):
     return f'{url}/{api}'
+
+
+class EPDConnectionPool:
+    """Construct long-lived EPD transfer links between Encoder and Language nodes."""
+
+    def __init__(self, migration_protocol: MigrationProtocol = MigrationProtocol.RDMA):
+        self.migration_protocol = migration_protocol
+        self.pool: set[tuple[str, str]] = set()
+        self.conn_lock = asyncio.Lock()
+        self.aiotimeout = aiohttp.ClientTimeout(total=AIOHTTP_TIMEOUT)
+
+    def is_connected(self, encoder_url: str, language_url: str):
+        return (encoder_url, language_url) in self.pool
+
+    async def _post(self, node_url: str, api: str, payload):
+        async with aiohttp.ClientSession(timeout=self.aiotimeout) as session:
+            async with session.post(get_server_api(node_url, api),
+                                    json=payload.model_dump(mode='json'),
+                                    timeout=self.aiotimeout) as resp:
+                result = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f'EPD connection request failed: status={resp.status}, body={result}')
+                return result
+
+    async def connect(self, encoder_url: str, language_url: str):
+        if self.is_connected(encoder_url, language_url):
+            return
+        async with self.conn_lock:
+            if self.is_connected(encoder_url, language_url):
+                return
+
+            encoder_resp = EPDInitResponse.model_validate(
+                await self._post(
+                    encoder_url,
+                    'epd/p2p_initialize',
+                    EPDInitRequest(
+                        protocol=self.migration_protocol,
+                        local_engine_id=encoder_url,
+                        remote_engine_id=language_url,
+                    )))
+            language_resp = EPDInitResponse.model_validate(
+                await self._post(
+                    language_url,
+                    'epd/p2p_initialize',
+                    EPDInitRequest(
+                        protocol=self.migration_protocol,
+                        local_engine_id=language_url,
+                        remote_engine_id=encoder_url,
+                    )))
+
+            encoder_conn = EPDConnectionResponse.model_validate(
+                await self._post(
+                    encoder_url,
+                    'epd/p2p_connect',
+                    EPDConnectionRequest(
+                        protocol=self.migration_protocol,
+                        remote_engine_id=language_url,
+                        remote_encoder_transfer_endpoint_info=language_resp.encoder_transfer_endpoint_info,
+                    )))
+            language_conn = EPDConnectionResponse.model_validate(
+                await self._post(
+                    language_url,
+                    'epd/p2p_connect',
+                    EPDConnectionRequest(
+                        protocol=self.migration_protocol,
+                        remote_engine_id=encoder_url,
+                        remote_encoder_transfer_endpoint_info=encoder_resp.encoder_transfer_endpoint_info,
+                    )))
+
+            if (encoder_resp.status is not EPDConnectionStatus.SUCCESS
+                    or language_resp.status is not EPDConnectionStatus.SUCCESS
+                    or encoder_conn.status is not EPDConnectionStatus.SUCCESS
+                    or language_conn.status is not EPDConnectionStatus.SUCCESS):
+                raise RuntimeError('EPD connection failed.')
+            self.pool.add((encoder_url, language_url))
+
+    def dereg_instance(self, node_url: str):
+        for key in list(self.pool):
+            if node_url in key:
+                self.drop(key)
+
+    def drop(self, key: tuple[str, str]):
+        encoder_url, language_url = key
+        for local_url, remote_url in ((encoder_url, language_url), (language_url, encoder_url)):
+            try:
+                drop_req = EPDDropConnectionRequest(engine_id=local_url, remote_engine_id=remote_url)
+                requests.post(get_server_api(local_url, 'epd/p2p_drop_connect'),
+                              json=drop_req.model_dump(mode='json'))
+            except Exception as e:
+                logger.warning(f'error drop epd connection {local_url, remote_url}. ErrorMsg: {str(e)}')
+        self.pool.discard(key)
 
 
 class PDConnectionPool:
