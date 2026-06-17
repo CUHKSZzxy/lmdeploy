@@ -1,19 +1,17 @@
 import asyncio
 import importlib
+import json
 
 import pytest
 
 from lmdeploy.pytorch.disagg.config import EngineRole, ServingStrategy
-from lmdeploy.pytorch.disagg.conn.protocol import MigrationProtocol
+from lmdeploy.pytorch.disagg.conn.protocol import EncoderOutputRef, MigrationProtocol
 from lmdeploy.serve.openai.protocol import ChatCompletionRequest
 from lmdeploy.serve.proxy.proxy import (
     NodeManager,
     Status,
-    _build_epd_encoder_request,
-    _build_epd_language_request,
     _call_epd_encoder_node,
-    _release_epd_encoder_output_ref,
-    _has_multimodal_chat_messages,
+    _dispatch_epd_language_request,
 )
 
 proxy_mod = importlib.import_module('lmdeploy.serve.proxy.proxy')
@@ -30,75 +28,60 @@ def test_node_manager_tracks_encoder_nodes():
     assert manager.get_node_url('m', EngineRole.Encoder) == 'http://encoder'
 
 
-def test_multimodal_chat_detection():
-    assert _has_multimodal_chat_messages([
-        {
-            'role': 'user',
-            'content': [
-                {'type': 'text', 'text': 'describe'},
-                {'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}},
-            ],
-        }
-    ])
-    assert not _has_multimodal_chat_messages([
-        {
-            'role': 'user',
-            'content': 'hello',
-        }
-    ])
+def test_call_epd_encoder_node_uses_language_transfer_config():
 
+    class _NodeManager:
 
-def test_build_epd_language_request_preserves_messages_and_injects_encoder_output_ref():
-    request_dict = {
-        'model': 'm',
-        'messages': [{'role': 'user', 'content': 'hello'}],
-        'temperature': 0.1,
-        'stream': True,
-    }
-    encoder_output_ref = {
-        'token_ids': [1, 2],
-        'input_embedding_ranges': [[0, 2]],
-        'protocol': MigrationProtocol.RDMA.name,
-        'transfer_id': 'epd-test',
-        'remote_engine_id': 'http://encoder',
-        'remote_session_id': 3,
-        'dtype': 'float32',
-        'shape': [[2, 4]],
-        'transfer_metadata': {
-            'endpoint_info': {'name': 'encoder'},
-            'mr_info': {'addr': 0, 'length': 32},
-            'nbytes': 32,
-        },
-    }
+        def __init__(self):
+            self.request = None
 
-    language_request = _build_epd_language_request(request_dict, encoder_output_ref)
+        def pre_call(self, node_url):
+            return 1.0
 
-    assert language_request['messages'] == request_dict['messages']
-    assert language_request['temperature'] == 0.1
-    assert language_request['stream'] is True
-    assert language_request['encoder_output_ref']['token_ids'] == [1, 2]
-    assert language_request['encoder_output_ref']['protocol'] == 'RDMA'
+        def post_call(self, node_url, start):
+            pass
 
+        async def generate(self, request_dict, node_url, path):
+            self.request = request_dict
+            return json.dumps({
+                'encoder_output_ref': {
+                    'token_ids': [1, 2],
+                    'input_embedding_ranges': [[0, 2]],
+                    'protocol': MigrationProtocol.RDMA.name,
+                    'transfer_id': 'epd-test',
+                    'remote_engine_id': 'http://encoder',
+                    'remote_session_id': 3,
+                    'dtype': 'float32',
+                    'shape': [[2, 4]],
+                    'transfer_metadata': {
+                        'endpoint_info': {'name': 'encoder'},
+                        'mr_info': {'addr': 0, 'length': 32},
+                        'nbytes': 32,
+                    },
+                }
+            })
 
-def test_build_epd_encoder_request_uses_language_rdma_endpoint_info():
-    request_dict = {
-        'model': 'm',
-        'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}}]}],
-        'stream': True,
-    }
     endpoint_info = {'io_info': {'data_channel_info': []}}
     language_status = Status(
         role=EngineRole.Hybrid,
         models=['m'],
         encoder_output_receiver_endpoint_info=endpoint_info,
     )
+    request_dict = {
+        'model': 'm',
+        'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'file:///tmp/a.jpg'}}]}],
+        'stream': True,
+    }
+    manager = _NodeManager()
 
-    encoder_request = _build_epd_encoder_request(request_dict, 'http://language', language_status)
+    encoder_output_ref = asyncio.run(
+        _call_epd_encoder_node(manager, request_dict, 'http://encoder', 'http://language', language_status))
 
-    assert encoder_request['stream'] is False
-    assert encoder_request['encoder_output_receiver_endpoint_info'] == endpoint_info
-    assert encoder_request['encoder_output_receiver_engine_id'] == 'http://language'
-    assert encoder_request['epd_transfer_id'].startswith('epd-')
+    assert encoder_output_ref.transfer_id == 'epd-test'
+    assert manager.request['stream'] is False
+    assert manager.request['encoder_output_receiver_endpoint_info'] == endpoint_info
+    assert manager.request['encoder_output_receiver_engine_id'] == 'http://language'
+    assert manager.request['epd_transfer_id'].startswith('epd-')
 
 
 def test_call_epd_encoder_node_balances_node_accounting_on_error():
@@ -192,13 +175,39 @@ def test_multimodal_hybrid_request_falls_back_when_selected_node_is_not_epd_capa
     assert manager.forwarded == ('http://normal', '/v1/chat/completions')
 
 
-def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):
+def test_dispatch_epd_language_request_injects_and_frees_encoder_output_ref(monkeypatch):
+
+    class _NodeManager:
+
+        def __init__(self):
+            self.calls = []
+            self.request = None
+
+        def pre_call(self, node_url):
+            self.calls.append(('pre', node_url))
+            return 1.0
+
+        def post_call(self, node_url, start):
+            self.calls.append(('post', node_url, start))
+
+        async def generate(self, request_dict, node_url, path):
+            self.request = request_dict
+            return '{"ok": true}'
+
     called = {}
 
     async def fake_release(encoder_output_ref):
         called['encoder_output_ref'] = encoder_output_ref
 
     monkeypatch.setattr(proxy_mod, 'free_remote_encoder_cache_ref_async', fake_release)
+    manager = _NodeManager()
+    request = ChatCompletionRequest(model='m', messages=[{'role': 'user', 'content': 'hello'}], stream=False)
+    request_dict = {
+        'model': 'm',
+        'messages': [{'role': 'user', 'content': 'hello'}],
+        'temperature': 0.1,
+        'stream': False,
+    }
     encoder_output_ref = {
         'token_ids': [1, 2],
         'input_embedding_ranges': [[0, 2]],
@@ -215,6 +224,13 @@ def test_release_epd_encoder_output_ref_uses_connector_cleanup(monkeypatch):
         },
     }
 
-    asyncio.run(_release_epd_encoder_output_ref(encoder_output_ref))
+    response = asyncio.run(
+        _dispatch_epd_language_request(manager, request, request_dict, 'http://language',
+                                       EncoderOutputRef.model_validate(encoder_output_ref)))
 
+    assert response.status_code == 200
+    assert response.body == b'{"ok":true}'
+    assert manager.request['temperature'] == 0.1
+    assert manager.request['encoder_output_ref']['transfer_id'] == 'epd-test'
+    assert manager.calls == [('pre', 'http://language'), ('post', 'http://language', 1.0)]
     assert called['encoder_output_ref'].transfer_id == 'epd-test'

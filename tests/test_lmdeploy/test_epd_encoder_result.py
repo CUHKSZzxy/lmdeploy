@@ -222,6 +222,17 @@ def test_epd_mm_cache_key_tracks_tensor_and_meta():
 
     assert build_epd_mm_cache_key(mm_input) == build_epd_mm_cache_key(same)
     assert build_epd_mm_cache_key(mm_input) != build_epd_mm_cache_key(changed)
+    assert mm_input.content_hash is not None
+
+    same_content_audio = MultiModalData(
+        modality=Modality.AUDIO,
+        data=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        start=0,
+        end=1,
+        meta={'grid_thw': torch.tensor([1, 1, 1])},
+    )
+    same_content_audio.content_hash = mm_input.content_hash
+    assert build_epd_mm_cache_key(mm_input) != build_epd_mm_cache_key(same_content_audio)
 
 
 def test_epd_mm_cache_key_supports_bfloat16_tensor():
@@ -563,18 +574,14 @@ class _FakeQwen35InnerModel(nn.Module):
 class _FakeQwen35Model(nn.Module):
 
     compute_encoder_prompt_input = Qwen3_5ForConditionalGeneration.compute_encoder_prompt_input
-    _check_epd_encoder_supported = Qwen3_5ForConditionalGeneration._check_epd_encoder_supported
     _compute_epd_encoder_items_uncached = Qwen3_5ForConditionalGeneration._compute_epd_encoder_items_uncached
     _compute_epd_encoder_items_with_cache = EPDEncoderMixin._compute_epd_encoder_items_with_cache
 
-    def __init__(self, deepstack_visual_indexes=None, encoder_only=False):
+    def __init__(self, encoder_only=False):
         super().__init__()
         self.encoder_only = encoder_only
         self.language_only = False
-        vision_config = type('VisionConfig', (), {
-            'deepstack_visual_indexes': deepstack_visual_indexes or [],
-        })()
-        self.config = type('Config', (), {'vision_config': vision_config})()
+        self.config = type('Config', (), {})()
         self.model = _FakeQwen35InnerModel()
         self.input_processor = _FakeInputProcessor()
         self.embed_tokens = nn.Embedding(128, 2)
@@ -766,13 +773,6 @@ def test_mp_executor_encoder_role_start_skips_output_prefetch():
 
     assert called == [('start', (), {})]
     assert executor._prefetch_task is None
-
-
-def test_compute_encoder_prompt_input_rejects_deepstack_visual_model():
-    prompt_input = {'input_ids': [1, 99], 'multimodal': [{'modality': Modality.IMAGE}]}
-
-    with pytest.raises(ValueError, match='DeepStack'):
-        _FakeQwen35Model(deepstack_visual_indexes=[5]).compute_encoder_prompt_input(prompt_input)
 
 
 def test_chat_completions_endpoint_dispatches_encoder_role_to_epd_helper(monkeypatch):

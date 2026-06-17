@@ -5,6 +5,7 @@ import pytest
 from PIL import Image
 
 from lmdeploy.serve.processors import MultimodalProcessor
+from lmdeploy.serve.processors.multimodal import MULTIMODAL_TYPES
 from lmdeploy.vl.constants import Modality
 
 multimodal_module = sys.modules[MultimodalProcessor.__module__]
@@ -355,12 +356,12 @@ def test_has_multimodal_input_detects_all_supported_types():
     """Test multimodal detection includes every supported item type."""
     processor = MultimodalProcessor(tokenizer=None, chat_template=None)
 
-    for item_type in [
-            'image_url', 'image_data', 'image', 'video_url', 'video', 'audio_url', 'audio', 'time_series_url',
-            'time_series'
-    ]:
-        assert processor._has_multimodal_input([{'role': 'user', 'content': [{'type': item_type}]}])
+    for item_type in MULTIMODAL_TYPES:
+        messages = [{'role': 'user', 'content': [{'type': item_type}]}]
+        assert MultimodalProcessor._has_multimodal_input(messages)
+        assert processor._has_multimodal_input(messages)
     assert not processor._has_multimodal_input([{'role': 'user', 'content': [{'type': 'text', 'text': 'hello'}]}])
+    assert not MultimodalProcessor._has_multimodal_input('hello')
 
 
 @pytest.mark.parametrize(

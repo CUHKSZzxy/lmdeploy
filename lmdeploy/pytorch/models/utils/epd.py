@@ -40,7 +40,6 @@ class EPDEncoderMixin:
         if not mm_inputs:
             return dict(prompt_input, input_ids=input_ids)
 
-        self._check_epd_encoder_supported()
         encoder_items = self._compute_epd_encoder_items_with_cache(mm_inputs)
 
         output = dict(prompt_input)
@@ -90,7 +89,3 @@ class EPDEncoderMixin:
 
     def _compute_epd_encoder_items_uncached(self, mm_inputs: list[MultiModalData]) -> list[EPDEncoderItem]:
         raise NotImplementedError
-
-    def _check_epd_encoder_supported(self):
-        """Validate model-specific EPD constraints before cache lookup."""
-        return None

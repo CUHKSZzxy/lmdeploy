@@ -34,6 +34,7 @@ from lmdeploy.serve.openai.protocol import (
     ModelList,
     ModelPermission,
 )
+from lmdeploy.serve.processors import MultimodalProcessor
 from lmdeploy.serve.proxy.utils import AIOHTTP_TIMEOUT, LATENCY_DEQUE_LEN, ErrorCodes, RoutingStrategy, err_msg
 from lmdeploy.serve.utils.server_utils import validate_json_request
 from lmdeploy.utils import get_logger
@@ -467,68 +468,7 @@ class NodeManager:
         return headers
 
 
-_MULTIMODAL_CONTENT_TYPES = {
-    'image',
-    'image_data',
-    'image_url',
-    'time_series',
-    'time_series_url',
-    'video',
-    'video_url',
-}
-
-
-def _has_multimodal_chat_messages(messages) -> bool:
-    if not isinstance(messages, list):
-        return False
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        content = message.get('content')
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if isinstance(item, dict) and item.get('type') in _MULTIMODAL_CONTENT_TYPES:
-                return True
-    return False
-
-
-def _build_epd_language_request(request_dict: dict, encoder_output_ref: dict | EncoderOutputRef) -> dict:
-    request_dict = copy.deepcopy(request_dict)
-    encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
-    request_dict['encoder_output_ref'] = encoder_output_ref.model_dump(mode='json')
-    return request_dict
-
-
-async def _release_epd_encoder_output_ref(encoder_output_ref: dict | EncoderOutputRef | None):
-    if encoder_output_ref is None:
-        return
-    encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
-    await free_remote_encoder_cache_ref_async(encoder_output_ref)
-
-
-async def _stream_epd_language_response(node_manager, request_dict: dict, node_url: str,
-                                        encoder_output_ref: dict | EncoderOutputRef | None, start: float):
-    try:
-        async for line in node_manager.stream_generate(request_dict, node_url, '/v1/chat/completions'):
-            yield line
-    finally:
-        node_manager.post_call(node_url, start)
-        await _release_epd_encoder_output_ref(encoder_output_ref)
-
-
-def _build_epd_encoder_request(request_dict: dict, language_url: str, language_status: Status) -> dict:
-    request_dict = copy.deepcopy(request_dict)
-    request_dict['stream'] = False
-    transfer_config = build_encoder_transfer_config(
-        receiver_endpoint_info=language_status.encoder_output_receiver_endpoint_info,
-        receiver_engine_id=language_url,
-    )
-    request_dict.update(transfer_config.to_request_fields())
-    return request_dict
-
-
-def _extract_epd_encoder_output_ref(response_text: str | bytes) -> dict:
+def _extract_epd_encoder_output_ref(response_text: str | bytes) -> EncoderOutputRef:
     try:
         response = json.loads(response_text)
     except (TypeError, json.JSONDecodeError) as exc:
@@ -539,12 +479,19 @@ def _extract_epd_encoder_output_ref(response_text: str | bytes) -> dict:
             message = error.get('message') if isinstance(error, dict) else str(error)
             raise ValueError(f'encoder node error: {message}')
         raise ValueError('encoder node response does not contain encoder_output_ref')
-    return EncoderOutputRef.model_validate(response['encoder_output_ref']).model_dump(mode='json')
+    return EncoderOutputRef.model_validate(response['encoder_output_ref'])
 
 
 async def _call_epd_encoder_node(node_manager: NodeManager, request_dict: dict, encoder_url: str, language_url: str,
-                                 language_status: Status) -> dict:
-    encoder_request = _build_epd_encoder_request(request_dict, language_url, language_status)
+                                 language_status: Status) -> EncoderOutputRef:
+    encoder_request = copy.deepcopy(request_dict)
+    encoder_request['stream'] = False
+    transfer_config = build_encoder_transfer_config(
+        receiver_endpoint_info=language_status.encoder_output_receiver_endpoint_info,
+        receiver_engine_id=language_url,
+    )
+    encoder_request.update(transfer_config.to_request_fields())
+
     logger.info(f'An Encoder request is dispatched to {encoder_url}')
     start = node_manager.pre_call(encoder_url)
     try:
@@ -555,18 +502,28 @@ async def _call_epd_encoder_node(node_manager: NodeManager, request_dict: dict, 
 
 
 async def _dispatch_epd_language_request(node_manager: NodeManager, request: ChatCompletionRequest, request_dict: dict,
-                                         language_url: str, encoder_output_ref: dict | EncoderOutputRef | None):
+                                         language_url: str, encoder_output_ref: EncoderOutputRef):
+    request_dict = copy.deepcopy(request_dict)
+    request_dict['encoder_output_ref'] = encoder_output_ref.model_dump(mode='json')
+
     logger.info(f'An EPD language request is dispatched to {language_url}')
     start = node_manager.pre_call(language_url)
     if request.stream is True:
-        response = _stream_epd_language_response(node_manager, request_dict, language_url, encoder_output_ref, start)
-        return ProxyStreamingResponse(response, media_type='text/event-stream')
+        async def stream_response():
+            try:
+                async for line in node_manager.stream_generate(request_dict, language_url, '/v1/chat/completions'):
+                    yield line
+            finally:
+                node_manager.post_call(language_url, start)
+                await free_remote_encoder_cache_ref_async(encoder_output_ref)
+
+        return ProxyStreamingResponse(stream_response(), media_type='text/event-stream')
     try:
         response = await node_manager.generate(request_dict, language_url, '/v1/chat/completions')
         return JSONResponse(json.loads(response))
     finally:
         node_manager.post_call(language_url, start)
-        await _release_epd_encoder_output_ref(encoder_output_ref)
+        await free_remote_encoder_cache_ref_async(encoder_output_ref)
 
 
 app = FastAPI(docs_url='/')
@@ -765,7 +722,7 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
         if not node_url:
             return node_manager.handle_unavailable_model(request.model)
 
-        has_multimodal = _has_multimodal_chat_messages(request.messages)
+        has_multimodal = MultimodalProcessor._has_multimodal_input(request.messages)
         node_status = node_manager.nodes[node_url]
         encoder_nodes = node_manager.encoder_nodes
         if has_multimodal and node_status.encoder_output_receiver_endpoint_info:
@@ -782,7 +739,8 @@ async def chat_completions_v1(request: ChatCompletionRequest, raw_request: Reque
                 if encoder_output_ref is None:
                     encoder_output_ref = await _call_epd_encoder_node(node_manager, request_dict, encoder_url,
                                                                       node_url, node_status)
-                request_dict = _build_epd_language_request(request_dict, encoder_output_ref)
+                else:
+                    encoder_output_ref = EncoderOutputRef.model_validate(encoder_output_ref)
             except ValueError as exc:
                 return create_error_response(HTTPStatus.BAD_REQUEST, str(exc))
             return await _dispatch_epd_language_request(node_manager, request, request_dict, node_url,

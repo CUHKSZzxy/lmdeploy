@@ -1187,14 +1187,14 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
         visual = self.model.visual
         device = next(self.model.visual.parameters()).device
         pixel_values = torch.cat([inp.data for inp in mm_inputs]).to(device=device)
-        grid_thw = torch.stack([torch.as_tensor(data.meta['grid_thw'], dtype=torch.long) for data in mm_inputs]).cpu()
+        grid_thw = torch.stack([data.meta['grid_thw'].to(dtype=torch.long) for data in mm_inputs]).cpu()
         vis_pos_emb = visual.rot_pos_emb(grid_thw)
         pos_embeds = visual.fast_pos_embed_interpolate(grid_thw)
         vis_cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                                  grid_thw[:, 0]).to(pixel_values.device)
         vis_cu_seqlens = vis_cu_seqlens.cumsum(dim=0, dtype=torch.int32)
         vis_pos_emb = vis_pos_emb.repeat(1, 2)
-        vis_pos_emb = (vis_pos_emb.cos().to(pixel_values.device), vis_pos_emb.sin().to(pixel_values.device))
+        vis_pos_emb = (vis_pos_emb.cos(), vis_pos_emb.sin())
         with torch.inference_mode():
             split_embeddings = self.model.get_visual_embeddings(pixel_values, grid_thw, vis_cu_seqlens, vis_pos_emb,
                                                                 pos_embeds)
@@ -1205,12 +1205,6 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
             embedding = embedding.detach().contiguous()
             encoder_items.append(EPDEncoderItem(embedding=embedding, start=start, end=end))
         return encoder_items
-
-    def _check_epd_encoder_supported(self):
-        """Validate Qwen3.5-specific EPD constraints."""
-        vision_config = getattr(self.config, 'vision_config', None)
-        if getattr(vision_config, 'deepstack_visual_indexes', None):
-            raise ValueError('DeepStack visual embeddings are not supported by the first EPD encoder producer.')
 
     def prepare_inputs_for_generation(
         self,
@@ -1261,16 +1255,14 @@ class Qwen3_5ForConditionalGeneration(nn.Module, DeployModelMixinV1, CudaGraphMi
                     ts_sr = torch.cat([inp.meta['ts_sr'] for inp in mm_inputs])
                 else:
                     pixel_values = torch.cat([inp.data for inp in mm_inputs])
-                    grid_thw = torch.stack(
-                        [torch.as_tensor(data.meta['grid_thw'], dtype=torch.long) for data in mm_inputs]).cpu()
+                    grid_thw = torch.stack([data.meta['grid_thw'].to(dtype=torch.long) for data in mm_inputs]).cpu()
                     vis_pos_emb = self.model.visual.rot_pos_emb(grid_thw)
                     pos_embeds = self.model.visual.fast_pos_embed_interpolate(grid_thw)
                     vis_cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                                              grid_thw[:, 0]).to(pixel_values.device)
                     vis_cu_seqlens = vis_cu_seqlens.cumsum(dim=0, dtype=torch.int32)
                     vis_pos_emb = vis_pos_emb.repeat(1, 2)
-                    vis_pos_emb = (vis_pos_emb.cos().to(pixel_values.device),
-                                   vis_pos_emb.sin().to(pixel_values.device))
+                    vis_pos_emb = (vis_pos_emb.cos(), vis_pos_emb.sin())
 
         mrope_position_ids = getattr(context, 'mrope_position_ids', None)
 

@@ -3,18 +3,13 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any
 
-import numpy as np
 import torch
 
-from lmdeploy.pytorch.multimodal.data_type import MultiModalData
+from lmdeploy.pytorch.multimodal.data_type import MultiModalData, make_multimodal_content_hash
 
 
 @dataclass
@@ -118,44 +113,10 @@ def set_epd_encoder_cache_from_config(config):
     set_epd_encoder_cache(EncoderCache.from_config(config))
 
 
-def _normalize_cache_meta(value: Any):
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, torch.Tensor):
-        tensor = value.detach().contiguous().cpu()
-        return {
-            'dtype': str(tensor.dtype),
-            'shape': list(tensor.shape),
-            'data': tensor.tolist(),
-        }
-    if isinstance(value, np.ndarray):
-        array = np.ascontiguousarray(value)
-        return {
-            'dtype': str(array.dtype),
-            'shape': list(array.shape),
-            'data': array.tolist(),
-        }
-    if isinstance(value, dict):
-        return {str(key): _normalize_cache_meta(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_cache_meta(item) for item in value]
-    raise TypeError(f'Unsupported EPD cache metadata value: {type(value)}')
-
-
 def build_epd_mm_cache_key(mm_input: MultiModalData) -> str:
     """Build a stable hash for one preprocessed multimodal item."""
-    hasher = hashlib.sha256()
-    hasher.update(str(mm_input.modality.value).encode())
-    tensors = [mm_input.data] if isinstance(mm_input.data, torch.Tensor) else mm_input.data
-    for tensor in tensors:
-        tensor = tensor.detach().contiguous().cpu()
-        hasher.update(str(tensor.dtype).encode())
-        hasher.update(str(tuple(tensor.shape)).encode())
-        hasher.update(tensor.view(torch.uint8).numpy().tobytes())
-    meta = _normalize_cache_meta(mm_input.meta)
-    hasher.update(json.dumps(meta, sort_keys=True, separators=(',', ':')).encode())
-    mrope_pos_ids = _normalize_cache_meta(mm_input.mrope_pos_ids)
-    hasher.update(json.dumps(mrope_pos_ids, sort_keys=True, separators=(',', ':')).encode())
-    return hasher.hexdigest()
+    content_hash = mm_input.content_hash
+    if content_hash is None:
+        content_hash = make_multimodal_content_hash(mm_input.data, mm_input.meta, mm_input.mrope_pos_ids)
+        mm_input.content_hash = content_hash
+    return f'{mm_input.modality.value}:{content_hash}'
