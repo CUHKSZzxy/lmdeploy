@@ -409,9 +409,9 @@ class PytorchEngineConfig:
         model_format: weight quantization policy, options: ['fp8'].
         hf_overrides: Huggingface overrides for the model.
             It can be used to override the default config of the model,
-        language_only: Whether to load only the language path and skip
+        language_model_only: Whether to load only the language path and skip
             multimodal encoder modules. Default to False.
-        encoder_only: Whether to load only the multimodal encoder path and skip
+        mm_encoder_only: Whether to load only the multimodal encoder path and skip
             language model modules. Default to False.
         encoder_cache_size_gb: Multimodal encoder-output cache size in GiB.
             Set to 0 to disable the cache. Default to 4.
@@ -461,8 +461,8 @@ class PytorchEngineConfig:
     model_format: str = None
     enable_metrics: bool = True
     hf_overrides: dict[str, Any] | None = None
-    language_only: bool = False
-    encoder_only: bool = False
+    language_model_only: bool = False
+    mm_encoder_only: bool = False
     encoder_cache_size_gb: float = 4.0
     logprobs_mode: str = None
     # router replay
@@ -518,8 +518,8 @@ class PytorchEngineConfig:
             self.kernel_block_size = 16
             logger.warning('Currently, camb device requires block_size and kernel_block_size to be 16, '
                            'setting both to 16.')
-        if self.language_only and self.encoder_only:
-            raise ValueError('language_only and encoder_only cannot both be enabled.')
+        if self.language_model_only and self.mm_encoder_only:
+            raise ValueError('language_model_only and mm_encoder_only cannot both be enabled.')
         assert self.encoder_cache_size_gb >= 0, 'invalid encoder_cache_size_gb'
 
 

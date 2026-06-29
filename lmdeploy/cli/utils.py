@@ -732,17 +732,17 @@ class ArgumentHelper:
                                    help='kvcache migration management backend when PD disaggregation')
 
     @staticmethod
-    def language_only(parser):
+    def language_model_only(parser):
         """Disable loading multimodal encoder."""
-        return parser.add_argument('--language-only',
+        return parser.add_argument('--language-model-only',
                                    action='store_true',
                                    default=False,
                                    help='load only the language path and disable the multimodal encoder')
 
     @staticmethod
-    def encoder_only(parser):
+    def mm_encoder_only(parser):
         """Disable loading language model."""
-        return parser.add_argument('--encoder-only',
+        return parser.add_argument('--mm-encoder-only',
                                    action='store_true',
                                    default=False,
                                    help='load only the multimodal encoder path and disable the language model')

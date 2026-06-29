@@ -66,13 +66,13 @@ def _reset_epd_encoder_cache():
     set_epd_encoder_cache(None)
 
 
-def test_engine_config_rejects_language_only_with_encoder_only():
-    with pytest.raises(ValueError, match='language_only and encoder_only'):
-        PytorchEngineConfig(language_only=True, encoder_only=True)
+def test_engine_config_rejects_language_model_only_with_mm_encoder_only():
+    with pytest.raises(ValueError, match='language_model_only and mm_encoder_only'):
+        PytorchEngineConfig(language_model_only=True, mm_encoder_only=True)
 
 
-def test_get_task_uses_language_only_without_legacy_disable_flag():
-    task, pipeline_class = get_task('pytorch', 'unused', backend_config=PytorchEngineConfig(language_only=True))
+def test_get_task_uses_language_model_only_without_legacy_disable_flag():
+    task, pipeline_class = get_task('pytorch', 'unused', backend_config=PytorchEngineConfig(language_model_only=True))
 
     assert task == 'llm'
     assert pipeline_class is AsyncEngine
@@ -132,7 +132,7 @@ def test_async_engine_removes_session_when_encoder_output_ref_load_fails(monkeyp
     assert session_mgr.removed == [session_mgr.session]
 
 
-def test_build_language_model_skips_module_in_encoder_only_context():
+def test_build_language_model_skips_module_in_mm_encoder_only_context():
 
     class _TinyLanguageModel(nn.Module):
 
@@ -140,26 +140,26 @@ def test_build_language_model_skips_module_in_encoder_only_context():
             super().__init__()
             self.proj = nn.Linear(1, 1)
 
-    with build_model_context(BuildModelContext(encoder_only=True)):
+    with build_model_context(BuildModelContext(mm_encoder_only=True)):
         model = build_language_model(_TinyLanguageModel)
 
     assert isinstance(model, nn.Identity)
     assert model._is_dummy_mod
 
 
-def test_build_lm_head_skips_module_in_encoder_only_context():
-    with build_model_context(BuildModelContext(encoder_only=True)):
+def test_build_lm_head_skips_module_in_mm_encoder_only_context():
+    with build_model_context(BuildModelContext(mm_encoder_only=True)):
         lm_head = DeployModelMixinV1().build_lm_head(hidden_size=1, vocab_size=1)
 
     assert lm_head is None
 
 
-def test_executor_caps_cache_config_for_encoder_only():
+def test_executor_caps_cache_config_for_mm_encoder_only():
 
     class _Executor(ExecutorBase):
 
         def gather_free_mem(self):
-            raise AssertionError('encoder-only config should not size cache from free memory')
+            raise AssertionError('mm-encoder-only config should not size cache from free memory')
 
         def set_cache_config(self, cache_config, spec_cache_config=None):
             self.updated_cache_config = cache_config
@@ -191,7 +191,7 @@ def test_executor_caps_cache_config_for_encoder_only():
         cache_config=cache_config,
         backend_config=types.SimpleNamespace(),
         dist_config=types.SimpleNamespace(dp=1, world_size=1),
-        misc_config=types.SimpleNamespace(encoder_only=True),
+        misc_config=types.SimpleNamespace(mm_encoder_only=True),
     )
 
     executor.update_configs()
@@ -649,18 +649,18 @@ class _FakeQwen35Model(nn.Module):
     _compute_epd_encoder_items_uncached = Qwen3_5ForConditionalGeneration._compute_epd_encoder_items_uncached
     _compute_epd_encoder_items_with_cache = EPDEncoderMixin._compute_epd_encoder_items_with_cache
 
-    def __init__(self, encoder_only=False):
+    def __init__(self, mm_encoder_only=False):
         super().__init__()
-        self.encoder_only = encoder_only
-        self.language_only = False
+        self.mm_encoder_only = mm_encoder_only
+        self.language_model_only = False
         self.config = type('Config', (), {})()
         self.model = _FakeQwen35InnerModel()
         self.input_processor = _FakeInputProcessor()
         self.embed_tokens = nn.Embedding(128, 2)
 
     def get_input_embeddings(self):
-        if self.encoder_only:
-            raise RuntimeError('encoder-only fake model does not load token embeddings')
+        if self.mm_encoder_only:
+            raise RuntimeError('mm-encoder-only fake model does not load token embeddings')
         return self.embed_tokens
 
     def get_input_processor(self):
@@ -712,7 +712,7 @@ def test_compute_encoder_prompt_input_runs_non_deepstack_visual_path():
     np.testing.assert_allclose(embedding.embeddings, np.array([[10.0, 11.0], [12.0, 13.0]], dtype=np.float32))
 
 
-def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_embeddings():
+def test_compute_encoder_prompt_input_allows_mm_encoder_only_model_without_token_embeddings():
     prompt_input = {
         'input_ids': [1, 99, 99, 2],
         'multimodal': [{
@@ -724,7 +724,7 @@ def test_compute_encoder_prompt_input_allows_encoder_only_model_without_token_em
         }],
     }
 
-    computed = _FakeQwen35Model(encoder_only=True).compute_encoder_prompt_input(prompt_input)
+    computed = _FakeQwen35Model(mm_encoder_only=True).compute_encoder_prompt_input(prompt_input)
 
     assert computed['input_embedding_ranges'] == [[1, 3]]
     np.testing.assert_allclose(computed['input_embeddings'][0].embeddings,
@@ -967,10 +967,10 @@ def test_lifespan_initializes_transfer_manager_only_for_epd_nodes(monkeypatch):
     async def _fake_stop_metrics_handler():
         return None
 
-    def _config(role=EngineRole.Hybrid, language_only=False):
+    def _config(role=EngineRole.Hybrid, language_model_only=False):
         return type('FakeBackendConfig', (), {
             'role': role,
-            'language_only': language_only,
+            'language_model_only': language_model_only,
             'migration_backend': MigrationBackend.DLSlime,
             'dp_rank': 0,
             'enable_metrics': False,
@@ -992,12 +992,12 @@ def test_lifespan_initializes_transfer_manager_only_for_epd_nodes(monkeypatch):
     monkeypatch.setattr(api_server, 'set_encoder_transfer_manager', set_managers.append)
     monkeypatch.setattr(api_server.metrics_processor, 'stop_metrics_handler', _fake_stop_metrics_handler)
 
-    asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_only=False)))
+    asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_model_only=False)))
     assert created == []
     assert set_managers == []
 
-    asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_only=True)))
-    asyncio.run(_run_lifespan(_config(role=EngineRole.Encoder, language_only=False)))
+    asyncio.run(_run_lifespan(_config(role=EngineRole.Hybrid, language_model_only=True)))
+    asyncio.run(_run_lifespan(_config(role=EngineRole.Encoder, language_model_only=False)))
 
     assert created == [
         ('http://language', 0, {}),
@@ -1009,7 +1009,7 @@ def test_lifespan_initializes_transfer_manager_only_for_epd_nodes(monkeypatch):
     assert set_managers[3] is None
 
 
-def test_startup_event_advertises_encoder_receiver_only_for_language_only(monkeypatch):
+def test_startup_event_advertises_encoder_receiver_only_for_language_model_only(monkeypatch):
     from lmdeploy.serve.openai import api_server
 
     class _FakeEngine:
@@ -1025,10 +1025,10 @@ def test_startup_event_advertises_encoder_receiver_only_for_language_only(monkey
         def start_loop(self, loop, use_async_api=True):
             return None
 
-    def _config(language_only=False):
+    def _config(language_model_only=False):
         return type('FakeBackendConfig', (), {
             'role': EngineRole.Hybrid,
-            'language_only': language_only,
+            'language_model_only': language_model_only,
             'migration_backend': MigrationBackend.DLSlime,
             'adapters': [],
             'logprobs_mode': None,
@@ -1046,11 +1046,11 @@ def test_startup_event_advertises_encoder_receiver_only_for_language_only(monkey
     monkeypatch.setattr(api_server, 'get_encoder_transfer_manager',
                         lambda: type('FakeManager', (), {'endpoint_info': {'rdma': 'endpoint'}})())
 
-    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_only=False)))
+    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_model_only=False)))
     asyncio.run(api_server.startup_event())
     assert posts[-1]['status']['encoder_output_receiver_endpoint_info'] is None
 
-    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_only=True)))
+    monkeypatch.setattr(api_server.VariableInterface, 'async_engine', _FakeAsyncEngine(_config(language_model_only=True)))
     asyncio.run(api_server.startup_event())
     assert posts[-1]['status']['encoder_output_receiver_endpoint_info'] == {'rdma': 'endpoint'}
 

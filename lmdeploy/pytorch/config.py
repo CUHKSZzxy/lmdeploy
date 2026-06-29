@@ -564,8 +564,8 @@ class MiscConfig:
     empty_init: bool = False
     model_format: str = None
     hf_overrides: dict[str, Any] = None
-    language_only: bool = False
-    encoder_only: bool = False
+    language_model_only: bool = False
+    mm_encoder_only: bool = False
     encoder_cache_size_gb: float = 4.0
     logprobs_mode: str = None
     dllm_config: DLLMConfig = None
@@ -586,8 +586,8 @@ class MiscConfig:
             prefill_interval=engine_config.prefill_interval,
             model_format=engine_config.model_format,
             hf_overrides=engine_config.hf_overrides,
-            language_only=engine_config.language_only,
-            encoder_only=engine_config.encoder_only,
+            language_model_only=engine_config.language_model_only,
+            mm_encoder_only=engine_config.mm_encoder_only,
             encoder_cache_size_gb=engine_config.encoder_cache_size_gb,
             logprobs_mode=engine_config.logprobs_mode,
             dllm_config=dllm_config,

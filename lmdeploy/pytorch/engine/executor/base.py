@@ -346,8 +346,8 @@ class ExecutorBase:
         self._adjust_block_size()
         self._sync_spec_cache_block_size()
 
-        if self.misc_config.encoder_only:
-            # Encoder-only servers do not decode, so avoid reserving LLM KV/state cache.
+        if self.misc_config.mm_encoder_only:
+            # MM encoder-only servers do not decode, so avoid reserving LLM KV/state cache.
             cache_config = self.cache_config
             cache_config.states_shapes = []
             cache_config.num_state_caches = 0

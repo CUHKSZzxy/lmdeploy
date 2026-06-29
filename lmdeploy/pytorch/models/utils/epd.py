@@ -29,8 +29,8 @@ class EPDEncoderMixin:
         """Compute encoder embeddings through model-specific hooks."""
         if prompt_input.get('input_embeddings') or not prompt_input.get('multimodal'):
             return prompt_input
-        if getattr(self, 'language_only', False):
-            raise ValueError(f'{type(self).__name__} cannot compute EPD encoder embeddings in language-only mode.')
+        if getattr(self, 'language_model_only', False):
+            raise ValueError(f'{type(self).__name__} cannot compute EPD encoder embeddings in language-model-only mode.')
 
         input_ids = prompt_input['input_ids']
         processed = self.input_processor.preprocess_input(input_ids, prompt_input['multimodal'])

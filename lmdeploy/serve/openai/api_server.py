@@ -1448,7 +1448,7 @@ async def startup_event():
         engine_role = engine_config.role.value if hasattr(engine_config, 'role') else 1
         encoder_output_receiver_endpoint_info = None
         if (getattr(engine_config, 'migration_backend', None) == MigrationBackend.DLSlime
-                and getattr(engine_config, 'language_only', False)):
+                and getattr(engine_config, 'language_model_only', False)):
             encoder_output_receiver_endpoint_info = get_encoder_transfer_manager().endpoint_info
         url = f'{VariableInterface.proxy_url}/nodes/add'
         status = {
@@ -1540,7 +1540,7 @@ def create_lifespan_handler(backend_config: PytorchEngineConfig | TurbomindEngin
             health_monitor.start()
 
             use_epd = (getattr(backend_config, 'role', None) == EngineRole.Encoder
-                       or getattr(backend_config, 'language_only', False))
+                       or getattr(backend_config, 'language_model_only', False))
             if (VariableInterface.proxy_url is not None
                 and getattr(backend_config, 'migration_backend', None) == MigrationBackend.DLSlime
                 and use_epd):
@@ -1665,7 +1665,7 @@ def serve(model_path: str,
     VariableInterface.allow_terminate_by_client = allow_terminate_by_client
     VariableInterface.enable_abort_handling = enable_abort_handling
     if isinstance(backend_config, PytorchEngineConfig):
-        use_epd = backend_config.role == EngineRole.Encoder or backend_config.language_only
+        use_epd = backend_config.role == EngineRole.Encoder or backend_config.language_model_only
         if use_epd and backend_config.migration_backend != MigrationBackend.DLSlime:
             raise ValueError('EPD encoder transfer requires --migration-backend DLSlime.')
 

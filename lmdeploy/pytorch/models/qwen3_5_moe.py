@@ -265,8 +265,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self.config = config
         self.ctx_mgr = ctx_mgr
         bm_ctx = get_build_model_context()
-        self.encoder_only = bm_ctx.encoder_only
-        self.language_only = bm_ctx.language_only
+        self.mm_encoder_only = bm_ctx.mm_encoder_only
+        self.language_model_only = bm_ctx.language_model_only
 
         # build preprocessor
         self.input_processor = Qwen3_5MoeInputProcessor(self.config, dtype)
@@ -337,9 +337,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
         def _skip_weight_for_role(name):
             is_visual_weight = name.startswith('visual.') or name.startswith('model.visual.') or '.visual.' in name
-            if self.encoder_only:
+            if self.mm_encoder_only:
                 return not is_visual_weight
-            if self.language_only:
+            if self.language_model_only:
                 return is_visual_weight
             return False
 

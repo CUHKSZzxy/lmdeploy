@@ -141,7 +141,7 @@ class DeployModelMixinV1(DeployModelMixin):
                       **kwargs):
         """Build LM Head."""
         bm_ctx = get_build_model_context()
-        if bm_ctx.encoder_only:
+        if bm_ctx.mm_encoder_only:
             return None
         head_dtype = torch.float32 if bm_ctx.fp32_lm_head else dtype
         lm_head = build_rowwise_linear(
@@ -189,8 +189,8 @@ def vlm_model(vlm_cls):
     @functools.wraps(vlm_cls)
     def wrapper(*args, **kwargs):
         bm_ctx = get_build_model_context()
-        language_only = bm_ctx.language_only
-        if language_only:
+        language_model_only = bm_ctx.language_model_only
+        if language_model_only:
             return _build_dummy_module()
         else:
             return vlm_cls(*args, **kwargs)
@@ -199,9 +199,9 @@ def vlm_model(vlm_cls):
 
 
 def build_language_model(model_cls, *args, **kwargs):
-    """Build language model unless the current build context is encoder-only."""
+    """Build language model unless the current build context is mm-encoder-only."""
     bm_ctx = get_build_model_context()
-    if bm_ctx.encoder_only:
+    if bm_ctx.mm_encoder_only:
         return _build_dummy_module()
     return model_cls(*args, **kwargs)
 

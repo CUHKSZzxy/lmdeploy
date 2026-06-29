@@ -404,7 +404,7 @@ class Engine(EngineBase):
                 req_data['input_multimodals'] = None
                 continue
 
-            if self.engine_config.language_only:
+            if self.engine_config.language_model_only:
                 # ignore multimodal inputs
                 req_data['input_multimodals'] = None
                 logger.warning('Vision encoder has not been loaded, multimodal inputs will be ignored.')
