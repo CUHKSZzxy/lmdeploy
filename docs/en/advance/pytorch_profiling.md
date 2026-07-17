@@ -19,9 +19,15 @@ export LMDEPLOY_PROFILE_DURATION=10
 export LMDEPLOY_PROFILE_OUT_PREFIX="/path/to/save/profile_"
 # save gzip-compressed traces by default; set to 0 for uncompressed JSON
 export LMDEPLOY_PROFILE_USE_GZIP=1
+# merge all rank traces after a finite-duration capture
+export LMDEPLOY_PROFILE_MERGE=1
 ```
 
 After the program exits, the profiling data will be saved to the path specified by `LMDEPLOY_PROFILE_OUT_PREFIX` for performance analysis. Profile traces are gzip-compressed by default.
+
+`LMDEPLOY_PROFILE_MERGE` is disabled by default. When it is enabled, `LMDEPLOY_PROFILE_DURATION` must be greater than 0. Each rank first exports `<prefix><rank>.json.gz`, then global rank 0 creates `<prefix>merged.json.gz`. The individual rank traces are retained. If gzip is disabled, the same names use the `.json` suffix instead. Automatic merging runs only when the configured duration completes; an earlier shutdown still keeps any rank traces it successfully exports.
+
+Use a fresh absolute output prefix for each capture and create its parent directory before launching the server. For multi-node deployments, every rank must see the same output path through shared storage, and host clocks must be synchronized. Trace export and merging can take significantly longer than the configured capture duration.
 
 ## Nsight System
 

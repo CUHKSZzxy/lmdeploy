@@ -19,9 +19,15 @@ export LMDEPLOY_PROFILE_DURATION=10
 export LMDEPLOY_PROFILE_OUT_PREFIX="/path/to/save/profile_"
 # save gzip-compressed traces by default; set to 0 for uncompressed JSON
 export LMDEPLOY_PROFILE_USE_GZIP=1
+# merge all rank traces after a finite-duration capture
+export LMDEPLOY_PROFILE_MERGE=1
 ```
 
 这样在退出程序后，统计信息会被存储在 `LMDEPLOY_PROFILE_OUT_PREFIX` 指定的地址，方便进行性能分析。Profile trace 默认使用 gzip 压缩。
+
+`LMDEPLOY_PROFILE_MERGE` 默认关闭。启用该选项时，`LMDEPLOY_PROFILE_DURATION` 必须大于 0。各 rank 会先导出 `<prefix><rank>.json.gz`，然后由 global rank 0 生成 `<prefix>merged.json.gz`。各 rank 的原始 trace 文件会被保留。关闭 gzip 时，以上文件使用 `.json` 后缀。只有配置的采集时长正常结束后才会自动合并；如果服务提前退出，仍会保留成功导出的各 rank trace。
+
+每次采集应使用新的绝对路径 prefix，并在启动服务前创建其父目录。多机部署时，所有 rank 必须通过共享存储访问同一输出路径，同时各节点时钟需要保持同步。Trace 导出与合并耗时可能明显长于配置的采集时长。
 
 ## Nsight System
 
