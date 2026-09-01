@@ -549,6 +549,7 @@ class BlockTrie:
         recompute_overlap = seq.prefix_cache.recompute_overlap
         fresh_block_range = recompute_overlap.fresh_block_range
         trie_block_map = recompute_overlap.trie_block_map
+        new_nodes: list[Node] = []
         ref_blocks: list[int] = []
         free_blocks: list[int] = []
 
@@ -587,6 +588,7 @@ class BlockTrie:
                              routed_experts=routed_experts,
                              adapter_name=seq.adapter_name)
                 child.attach_to(node)
+                new_nodes.append(child)
                 ref_blocks.append(child.block_id)
             else:
                 # Another sequence inserted this path first. Substitute its
@@ -599,7 +601,10 @@ class BlockTrie:
             node = child
 
         seq.prefix_cache.trie_cursor = node
-        self._kv_lifecycle.commit_path_extension(node, ref_blocks=ref_blocks, free_blocks=free_blocks)
+        self._kv_lifecycle.commit_path_extension(node,
+                                                 new_nodes=new_nodes,
+                                                 ref_blocks=ref_blocks,
+                                                 free_blocks=free_blocks)
 
     def allocate(self, seq: SchedulerSequence):
         """Attach newly allocated full blocks to the prefix-cache trie.
@@ -646,3 +651,10 @@ class BlockTrie:
         if evicted < max_num_blocks:
             evicted += self._kv_lifecycle.evict(max_num_blocks - evicted)
         return evicted
+
+    def get_num_evictable_blocks(self):
+        """Count cached GPU blocks immediately reclaimable by allocation."""
+        if not self.enabled:
+            return 0
+        frozen_blocks = self._state_checkpoints.get_num_evictable_frozen_blocks()
+        return frozen_blocks + self._kv_lifecycle.get_num_evictable_blocks()

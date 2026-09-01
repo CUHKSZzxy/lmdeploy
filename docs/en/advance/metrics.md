@@ -2,6 +2,12 @@
 
 LMDeploy exposes a set of metrics via Prometheus, and provides visualization via Grafana.
 
+For the PyTorch backend, `lmdeploy:gpu_cache_usage_perc` follows vLLM's allocation-pressure semantics. It is the
+fraction of GPU KV-cache blocks unavailable to new work. Idle prefix-cache blocks that are immediately evictable are
+treated as available even though their cached contents remain reusable. Blocks shared with active work and cache
+blocks protected by an asynchronous operation remain in use. Consequently, the metric can return to its idle
+baseline (often zero) while prefix-cache entries are still present.
+
 For the Turbomind backend, `lmdeploy:gpu_cache_usage_perc` is the number of bytes held by live prefix-cache and
 checkpoint objects divided by the configured cache-region size. Prefix-cache hit metrics count prompt tokens that
 the engine actually skips when a request is first scheduled. Turbomind currently reports scheduler metrics for DP 1;

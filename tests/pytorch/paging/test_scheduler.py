@@ -189,6 +189,31 @@ class TestScheduler:
 
         assert scheduler.schedule_metrics.cache_usage == 0.0
 
+    def test_schedule_metrics_excludes_reclaimable_prefix_cache(self, cache_config, scheduler_config, seq_meta,
+                                                                block_size, num_gpu_blocks):
+        cache_config.enable_prefix_caching = True
+        scheduler = Scheduler(scheduler_config=scheduler_config, cache_config=cache_config, seq_meta=seq_meta)
+        block_manager = scheduler.block_manager
+        session = scheduler.add_session(0)
+        token_ids = [1] * (block_size * 2) + [2]
+
+        seq = session.add_sequence(token_ids)
+        block_manager.allocate(seq)
+        scheduler.block_trie.allocate(seq)
+        assert scheduler.schedule_metrics.cache_usage == 3 / num_gpu_blocks
+
+        session.remove_sequence(seq)
+        assert block_manager.get_num_free_gpu_blocks() == num_gpu_blocks - 2
+        assert scheduler.schedule_metrics.cache_usage == 0.0
+
+        matched = session.add_sequence(token_ids)
+        scheduler.block_trie.match(matched)
+        assert matched.num_blocks == 2
+        assert scheduler.schedule_metrics.cache_usage == 2 / num_gpu_blocks
+
+        session.remove_sequence(matched)
+        assert scheduler.schedule_metrics.cache_usage == 0.0
+
     def test_update(self, scheduler, block_size, num_gpu_blocks):
         block_manager = scheduler.block_manager
         session_id1 = 0

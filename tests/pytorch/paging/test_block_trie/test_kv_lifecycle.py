@@ -8,17 +8,20 @@ def test_evict(block_trie, scheduler, num_gpu_blocks):
     block_mgr.allocate(seq)
     block_trie.allocate(seq)
     assert block_mgr.get_num_free_gpu_blocks() == 0
+    assert block_trie.get_num_evictable_blocks() == 0
 
     # Release the sequence refs, leaving the trie as sole block owner.
     block_mgr.free(seq)
     seq.set_step(0)
     assert block_mgr.get_num_free_gpu_blocks() == 1
+    assert block_trie.get_num_evictable_blocks() == num_gpu_blocks - 1
 
     leaf = next(iter(block_trie.leaves))
     block_trie.evict(4)
     new_leaf = next(iter(block_trie.leaves))
     assert leaf != new_leaf
     assert block_mgr.get_num_free_gpu_blocks() == 5
+    assert block_trie.get_num_evictable_blocks() == num_gpu_blocks - 5
 
 
 def test_evict_prunes_stale_non_leaf_entry(block_trie, scheduler, num_gpu_blocks):

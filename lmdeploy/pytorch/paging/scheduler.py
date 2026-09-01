@@ -1530,7 +1530,11 @@ class Scheduler:
     def schedule_metrics(self):
         total_blocks = self.block_manager.num_gpu_blocks
         free_blocks = self.block_manager.get_num_free_gpu_blocks()
-        cache_usage = 1.0 - free_blocks / total_blocks if total_blocks else 0.0
+        # Match vLLM's allocation-pressure semantics: idle prefix blocks stay
+        # cacheable, but count as available because allocation may evict them.
+        evictable_blocks = self.block_trie.get_num_evictable_blocks()
+        available_blocks = free_blocks + evictable_blocks
+        cache_usage = 1.0 - available_blocks / total_blocks if total_blocks else 0.0
         return ScheduleMetrics(
             active_seqs=self.num_running(),
             waiting_seqs=self.num_waiting() + self.num_ready() + self.num_remote_loading(),

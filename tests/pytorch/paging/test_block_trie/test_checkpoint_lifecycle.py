@@ -556,11 +556,14 @@ class TestStateCheckpointLifecycle(BlockTrieTestMixin):
         free_blocks = block_mgr.get_num_free_gpu_blocks()
 
         assert block_trie.evict(1) == 0
+        assert block_trie.get_num_evictable_blocks() == 0
         assert node.state_checkpoint is not None
         assert block_mgr.get_num_free_gpu_blocks() == free_blocks
 
         assert block_trie.state_checkpoints.unpin_save(seq)
+        assert block_trie.get_num_evictable_blocks() == 1
         assert block_trie.evict(1) == 1
+        assert block_trie.get_num_evictable_blocks() == 0
         assert node.state_checkpoint is None
         assert block_mgr.get_num_free_gpu_blocks() == free_blocks + 1
 
@@ -765,11 +768,14 @@ class TestStateCheckpointLifecycle(BlockTrieTestMixin):
         seq.set_step(0)
 
         assert block_trie.evict(1) == 0
+        assert block_trie.get_num_evictable_blocks() == 0
         assert node in block_trie.leaves
         assert node.state_checkpoint.published
         assert node.state_checkpoint.pin_count == 1
         assert ssm_scheduler.state_manager.get_num_free_checkpoint() == free_states
 
         assert block_trie.state_checkpoints.unpin_save(seq)
+        assert block_trie.get_num_evictable_blocks() == 2
         assert block_trie.evict(1) == 1
+        assert block_trie.get_num_evictable_blocks() == 1
         assert ssm_scheduler.state_manager.get_num_free_checkpoint() == free_states + 1

@@ -291,6 +291,14 @@ class StateCheckpointLifecycle:
                  if node.state_checkpoint is not None and node.state_checkpoint.frozen_block_id >= 0)
         return self._evict_checkpoints(nodes, max_num_blocks)
 
+    def get_num_evictable_frozen_blocks(self):
+        """Count unpinned checkpoint-owned frozen KV blocks."""
+        return sum(
+            node.state_checkpoint.frozen_block_id >= 0
+            for node in self._index.unique_nodes()
+            if self._is_evictable_checkpoint(node)
+        )
+
     def discard_stale_index_entry(self, node: Node, key: StateCheckpointKey, reason: str):
         """Remove a stale index entry without releasing a valid checkpoint."""
         removed = self._index.remove_entry(node, key)
