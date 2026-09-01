@@ -33,7 +33,6 @@ class KVBlockLifecycle:
         self.allocator = allocator
         self.state_checkpoints = state_checkpoints
         self.leaves: set[Node] = set()
-        self._nodes: dict[int, Node] = {}
 
     def begin_path_extension(self, node: Node):
         """Remove a leaf that is about to gain a child."""
@@ -42,43 +41,33 @@ class KVBlockLifecycle:
 
     def commit_path_extension(self,
                               node: Node,
-                              new_nodes: list[Node],
                               ref_blocks: list[int],
                               free_blocks: list[int]):
         """Commit leaf bookkeeping and batched allocator ref changes.
 
-        ``new_nodes`` records fresh trie ownership for usage accounting. Each
-        block in ``ref_blocks`` needs one new owner: either the trie ref for a
-        fresh node or the sequence ref after collision deduplication selected
-        an existing trie block. ``free_blocks`` are the fresh sequence blocks
-        replaced by that deduplication.
+        Each block in ``ref_blocks`` needs one new owner: either the trie ref
+        for a fresh node or the sequence ref after collision deduplication
+        selected an existing trie block. ``free_blocks`` are the fresh sequence
+        blocks replaced by that deduplication.
         """
         if node.parent is not None and len(node.children) == 0:
             self.leaves.add(node)
-        for new_node in new_nodes:
-            self._nodes[new_node.block_id] = new_node
         if len(ref_blocks) > 0:
             self.allocator.add_ref_count(np.array(ref_blocks), 1)
         if len(free_blocks) > 0:
             self.allocator.free(np.array(free_blocks))
 
-    def get_num_evictable_blocks(self):
+    def get_num_evictable_blocks(self, nodes: list[Node]):
         """Count trie-owned blocks that do not belong to active work."""
-        if len(self._nodes) == 0:
+        if len(nodes) == 0:
             return 0
 
         blocked_nodes: set[Node] = set()
-        for node in self._nodes.values():
-            if not self.state_checkpoints.is_pinned(node):
-                continue
-            while node.parent is not None:
-                blocked_nodes.add(node)
-                node = node.parent
+        for node in nodes:
+            if self.state_checkpoints.is_pinned(node):
+                blocked_nodes.update(node.path_from_root())
 
-        block_ids = np.array([
-            node.block_id for node in self._nodes.values()
-            if node not in blocked_nodes
-        ], dtype=np.int64)
+        block_ids = np.array([node.block_id for node in nodes if node not in blocked_nodes], dtype=np.int64)
         ref_counts = self.allocator.get_ref_count(block_ids)
         # A ref count of one means only the trie owns the block. Such blocks
         # retain their prefix identity but can be evicted for a new request.
@@ -114,7 +103,6 @@ class KVBlockLifecycle:
 
         evicted_blocks.append(leaf.block_id)
         self.state_checkpoints.release_checkpoint(leaf)
-        self._nodes.pop(leaf.block_id)
         parent = leaf.parent
         if parent is not None:
             leaf.detach_leaf()
