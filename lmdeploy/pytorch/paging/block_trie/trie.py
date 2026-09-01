@@ -587,6 +587,7 @@ class BlockTrie:
                              routed_experts=routed_experts,
                              adapter_name=seq.adapter_name)
                 child.attach_to(node)
+                self._kv_lifecycle.register_node(child)
                 ref_blocks.append(child.block_id)
             else:
                 # Another sequence inserted this path first. Substitute its
@@ -651,12 +652,5 @@ class BlockTrie:
         """Count cached GPU blocks immediately reclaimable by allocation."""
         if not self.enabled:
             return 0
-        nodes = []
-        pending = list(self._roots.values())
-        while pending:
-            node = pending.pop()
-            pending.extend(node.children.values())
-            if node.parent is not None:
-                nodes.append(node)
         frozen_blocks = self._state_checkpoints.get_num_evictable_frozen_blocks()
-        return frozen_blocks + self._kv_lifecycle.get_num_evictable_blocks(nodes)
+        return frozen_blocks + self._kv_lifecycle.get_num_evictable_blocks()

@@ -20,7 +20,7 @@ logger = get_logger('lmdeploy')
 
 
 class KVBlockLifecycle:
-    """Own trie KV references and the auxiliary leaf-candidate index.
+    """Own trie KV references and the auxiliary node indexes.
 
     ``BlockTrie`` decides token identity, collision deduplication, and recompute
     overlap policy. This component applies the resulting reference-count
@@ -33,6 +33,11 @@ class KVBlockLifecycle:
         self.allocator = allocator
         self.state_checkpoints = state_checkpoints
         self.leaves: set[Node] = set()
+        self._attached_nodes: dict[int, Node] = {}
+
+    def register_node(self, node: Node):
+        """Record a newly attached trie node for usage accounting."""
+        self._attached_nodes[node.block_id] = node
 
     def begin_path_extension(self, node: Node):
         """Remove a leaf that is about to gain a child."""
@@ -57,17 +62,18 @@ class KVBlockLifecycle:
         if len(free_blocks) > 0:
             self.allocator.free(np.array(free_blocks))
 
-    def get_num_evictable_blocks(self, nodes: list[Node]):
+    def get_num_evictable_blocks(self):
         """Count trie-owned blocks that do not belong to active work."""
-        if len(nodes) == 0:
+        if len(self._attached_nodes) == 0:
             return 0
 
         blocked_nodes: set[Node] = set()
-        for node in nodes:
+        for node in self._attached_nodes.values():
             if self.state_checkpoints.is_pinned(node):
                 blocked_nodes.update(node.path_from_root())
 
-        block_ids = np.array([node.block_id for node in nodes if node not in blocked_nodes], dtype=np.int64)
+        block_ids = np.array([node.block_id for node in self._attached_nodes.values() if node not in blocked_nodes],
+                             dtype=np.int64)
         ref_counts = self.allocator.get_ref_count(block_ids)
         # A ref count of one means only the trie owns the block. Such blocks
         # retain their prefix identity but can be evicted for a new request.
@@ -103,6 +109,7 @@ class KVBlockLifecycle:
 
         evicted_blocks.append(leaf.block_id)
         self.state_checkpoints.release_checkpoint(leaf)
+        self._attached_nodes.pop(leaf.block_id)
         parent = leaf.parent
         if parent is not None:
             leaf.detach_leaf()
