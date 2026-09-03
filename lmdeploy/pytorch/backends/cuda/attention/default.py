@@ -55,12 +55,24 @@ class TritonAttentionMetadata(AttentionMetadata):
     scheduler_metadata: torch.Tensor = None
     max_kv_seqlen: int = None
     max_q_seqlen: int = None
+    dcp_kv_seqlens: torch.Tensor = None
     kernel_metadata: tuple[Any, ...] = ()
 
 
 def build_triton_attention_metadata(attn_meta_cls, step_context,
                                     sequence_metadata: CudaSequenceMetadata) -> TritonAttentionMetadata:
     """Project CUDA sequence layout into compatible attention metadata."""
+    from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
+    from lmdeploy.pytorch.distributed import get_dcp_world_rank
+
+    dcp_world_rank = get_dcp_world_rank()
+    dcp_world_size, _ = dcp_world_rank
+    if dcp_world_size == 1:
+        dcp_kv_seqlens = sequence_metadata.kv_seqlens
+    else:
+        dcp_kv_seqlens = get_dcp_local_seq_lens(
+            sequence_metadata.kv_seqlens, dcp_world_rank)
+
     return attn_meta_cls(
         is_decoding=step_context.is_decoding,
         block_offsets=sequence_metadata.block_offsets,
@@ -73,6 +85,7 @@ def build_triton_attention_metadata(attn_meta_cls, step_context,
         cu_seqlens_q=sequence_metadata.cu_seqlens_q,
         cu_seqlens_k=sequence_metadata.cu_seqlens_k,
         max_kv_seqlen=sequence_metadata.max_kv_seqlen,
+        dcp_kv_seqlens=dcp_kv_seqlens,
     )
 
 
@@ -157,6 +170,8 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
 
         self.block_sparse_size = block_sparse_size
         self._step_meta_group: int | None = None
+        from lmdeploy.pytorch.distributed import get_dcp_world_rank
+        self.dcp_world_size, self.dcp_rank = get_dcp_world_rank()
 
         register_step_metadata_impl(self)
 
@@ -245,6 +260,8 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
             k_scales_zeros=k_scales_zeros,
             v_scales_zeros=v_scales_zeros,
             quant_policy=quant_policy,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
         )
 
     def _forward_decoding(

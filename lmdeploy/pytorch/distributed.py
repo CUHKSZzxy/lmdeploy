@@ -218,6 +218,40 @@ def _build_tp_group(context: 'DistContext', timeout: timedelta, cpu_backend: str
     context.tp_group = context.attn_tp_group
 
 
+def _build_dcp_group(context: 'DistContext', timeout: timedelta,
+                     cpu_backend: str = 'gloo', ccl_backend: str = 'nccl'):
+    """Split every attention-TP group into decode-context subgroups."""
+    dcp = context.dist_config.dcp
+    if dcp == 1:
+        context.dcp_group = DistGroup(rank=0)
+        return
+
+    attn_tp = context.dist_config.attn_tp
+    world_size = context.dist_config.world_size
+    gpu_groups = []
+    cpu_groups = []
+    for tp_start in range(0, world_size, attn_tp):
+        for dcp_start in range(tp_start, tp_start + attn_tp, dcp):
+            ranks = tuple(range(dcp_start, dcp_start + dcp))
+            gpu_groups.append(
+                dist.new_group(ranks=ranks, timeout=timeout, backend=ccl_backend))
+            cpu_groups.append(
+                dist.new_group(ranks=ranks, timeout=timeout, backend=cpu_backend))
+
+    attn_tp_rank = context.attn_tp_group.rank
+    tp_group_start = context.rank - attn_tp_rank
+    groups_per_tp = attn_tp // dcp
+    group_id = (tp_group_start // attn_tp * groups_per_tp
+                + attn_tp_rank // dcp)
+    context.dcp_group = DistGroup(
+        rank=attn_tp_rank % dcp,
+        cpu_group=cpu_groups[group_id],
+        gpu_group=gpu_groups[group_id],
+        cpu_groups=cpu_groups,
+        gpu_groups=gpu_groups,
+    )
+
+
 def _build_tp_communicators(context: 'DistContext'):
     """Attach one communicator to each rank-local, unique TP group."""
     build_communicator = context.communicator_builder
@@ -242,6 +276,7 @@ class DistContext:
     attn_tp_group: DistGroup = None
     mlp_tp_group: DistGroup = None
     moe_tp_group: DistGroup = None
+    dcp_group: DistGroup = None
 
     cpu_group: dist.ProcessGroup = None
     ep_gpu_group: dist.ProcessGroup = None
@@ -298,7 +333,8 @@ class DistContext:
                               attn_tp_group=DistGroup(rank=0),
                               mlp_tp_group=DistGroup(rank=0),
                               moe_tp_group=DistGroup(rank=0),
-                              tp_group=DistGroup(rank=0))
+                              tp_group=DistGroup(rank=0),
+                              dcp_group=DistGroup(rank=0))
         if world_size == 1:
             return context
 
@@ -311,6 +347,9 @@ class DistContext:
         _build_tp_group(context, timeout, cpu_backend=cpu_backend, ccl_backend=ccl_backend)
         _build_tp_communicators(context)
 
+        # cp
+        _build_dcp_group(context, timeout, cpu_backend=cpu_backend, ccl_backend=ccl_backend)
+
         # ep
         cls._build_ep_group(context, timeout, ccl_backend=ccl_backend)
 
@@ -320,6 +359,8 @@ class DistContext:
         """Close groups."""
         if not dist.is_initialized():
             return
+        if self.dcp_group is not None:
+            self.dcp_group.close()
         if self.attn_tp_group is not None:
             self.attn_tp_group.close()
         if self.mlp_tp_group is not None:
@@ -375,6 +416,12 @@ def get_tp_world_rank(layer_type: str | None = None):
         raise RuntimeError(f'Unknown layer type: {layer_type}')
 
 
+def get_dcp_world_rank():
+    """Get DCP world size and rank."""
+    ctx = get_dist_manager().current_context()
+    return ctx.dist_config.dcp, ctx.dcp_group.rank
+
+
 def get_dp_world_rank():
     ctx = get_dist_manager().current_context()
     return ctx.dist_config.dp, ctx.dp_rank
@@ -424,10 +471,23 @@ def get_tp_group(device: str = 'gpu', layer_type: str = 'attn'):
         return tp_group.gpu_group
 
 
+def get_dcp_group(device: str = 'gpu'):
+    """Get the process group used for decode context parallelism."""
+    _check_group_device(device)
+    group = get_dist_manager().current_context().dcp_group
+    if group is None:
+        return None
+    if device == 'cpu':
+        return group.cpu_group
+    return group.gpu_group
+
+
 def get_group(group_type: str, device: str):
     """Get group."""
     if group_type == 'tp':
         return get_tp_group(device)
+    elif group_type == 'dcp':
+        return get_dcp_group(device)
     elif group_type in ['world', 'all']:
         return get_process_group(device)
     else:
@@ -471,6 +531,13 @@ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group='tp', async_op=Fal
     if isinstance(group, str):
         group = get_group(group, 'gpu')
     return dist.reduce_scatter(output, input_list, op=op, group=group, async_op=async_op)
+
+
+def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group='tp', async_op=False):
+    """Reduce-scatter a concatenated tensor."""
+    if isinstance(group, str):
+        group = get_group(group, 'gpu')
+    return dist.reduce_scatter_tensor(output, input, op=op, group=group, async_op=async_op)
 
 
 def gather_by_tp_sizes(x: torch.Tensor,

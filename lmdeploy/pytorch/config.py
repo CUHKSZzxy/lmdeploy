@@ -154,10 +154,11 @@ class CacheConfig:
     """Config of key value cache."""
 
     max_batches: int
-    block_size: int
+    block_size: int  # physical tokens per cache block on each DCP rank
     num_cpu_blocks: int
     num_gpu_blocks: int
     kernel_block_size: int = -1
+    dcp: int = 1
     window_size: int = -1
     cache_max_entry_count: float = 0.8
     max_prefill_token_num: int = 8192
@@ -180,6 +181,7 @@ class CacheConfig:
 
     def __post_init__(self):
         """Post init."""
+        assert self.dcp >= 1, 'invalid dcp'
         assert self.prefix_cache_state_budget >= 0, 'invalid prefix_cache_state_budget'
         assert self.prefix_cache_decode_state_interval >= 0, 'invalid prefix_cache_decode_state_interval'
         if self.window_size > 1 and self.enable_prefix_caching:
@@ -211,6 +213,7 @@ class DistConfig:
 
     # tp
     tp: int = 1  # default tp, equal to attn_tp
+    dcp: int = 1  # decode context parallelism inside attention tp
     attn_tp: int = None  # tp for attention
     mlp_tp: int = None  # tp for mlp
     moe_tp: int = None  # tp for moe
@@ -223,6 +226,7 @@ class DistConfig:
         """Post init."""
         assert self.dp_rank < self.dp
         assert self.dp >= 1
+        assert self.dcp >= 1
 
         dp = self.dp
         tp = self.tp
@@ -251,6 +255,8 @@ class DistConfig:
         # attn tp
         self.attn_tp = self.attn_tp or self.world_size // dp
         self.tp = self.attn_tp
+        assert self.attn_tp % self.dcp == 0, (
+            f'attn_tp {self.attn_tp} must be divisible by dcp {self.dcp}')
         if self.mlp_tp > 1:
             assert (self.mlp_tp >= self.attn_tp
                     and self.mlp_tp % self.attn_tp == 0), (f'mlp_tp {self.mlp_tp}, attn_tp {self.attn_tp}')
@@ -288,6 +294,7 @@ class DistConfig:
             enable_microbatch=engine_config.enable_microbatch,
             enable_eplb=engine_config.enable_eplb,
             tp=engine_config.tp,
+            dcp=engine_config.dcp,
             attn_tp=engine_config.attn_tp_size,
             mlp_tp=engine_config.mlp_tp_size,
             moe_tp=engine_config.moe_tp_size,

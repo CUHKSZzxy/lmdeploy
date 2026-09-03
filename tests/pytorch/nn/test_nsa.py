@@ -78,6 +78,8 @@ def test_deepgemm_prefill_scores_are_chunked_by_logits_budget(monkeypatch):
     monkeypatch.setattr(cuda_nsa, '_get_deep_gemm', lambda: deep_gemm)
 
     impl = object.__new__(cuda_nsa.TritonNSAIndexFP8)
+    impl.dcp_world_size = 1
+    impl.dcp_rank = 0
     impl.topk = 2
     impl.fill = -1
     impl.max_logits_bytes = 2 * 4 * 4
@@ -115,6 +117,33 @@ def test_deepgemm_prefill_scores_are_chunked_by_logits_budget(monkeypatch):
     assert len(flatten_calls) == 1
     assert flatten_calls[0][:2] == (indexer_k_cache, 1)
     assert torch.equal(selected, torch.tensor([[3, 2]] * 5, dtype=torch.int32))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason='requires CUDA device with cc>=9.0')
+def test_deepgemm_decode_metadata_handles_all_zero_lengths():
+    pytest.importorskip('deep_gemm')
+    from lmdeploy.pytorch.backends.cuda import nsa as cuda_nsa
+
+    batch_size = 64
+    meta = SimpleNamespace(
+        is_decoding=True,
+        block_size=64,
+        block_offset=torch.zeros(
+            batch_size, 1, dtype=torch.int32, device='cuda'),
+        indexer_kv_seqlens=torch.zeros(
+            batch_size, dtype=torch.int32, device='cuda'),
+        q_seqlens=torch.ones(
+            batch_size, dtype=torch.int32, device='cuda'),
+    )
+
+    score_meta = cuda_nsa._build_deep_gemm_score_meta(meta)
+    torch.cuda.synchronize()
+
+    assert torch.equal(score_meta.context_lens,
+                       torch.zeros_like(score_meta.context_lens))
+    assert score_meta.schedule.numel() > 0
 
 
 @pytest.mark.skipif(
@@ -211,6 +240,8 @@ def test_short_prefill_caches_indexer_k_before_optional_scoring(
                         prepare_k_cache)
 
     impl = object.__new__(cuda_nsa.TritonNSAIndexFP8)
+    impl.dcp_world_size = 1
+    impl.dcp_rank = 0
     impl.topk = 2048
     impl.softmax_scale = 1.0
     impl._allow_short_prefill_scoring_skip = allow_skip
@@ -225,6 +256,7 @@ def test_short_prefill_caches_indexer_k_before_optional_scoring(
     meta = SimpleNamespace(
         is_decoding=is_decoding,
         max_kv_seqlen=max_kv_seqlen,
+        global_max_kv_seqlen=max_kv_seqlen,
         cu_seqlen_q=torch.tensor([0, 1]),
         k_seqlens=torch.tensor([1]),
         block_offset=torch.tensor([[0]]),

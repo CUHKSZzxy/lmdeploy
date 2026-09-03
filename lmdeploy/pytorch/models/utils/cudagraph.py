@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 from torch.profiler import record_function
 
+from lmdeploy.pytorch.distributed import get_dcp_world_rank
 from lmdeploy.pytorch.model_inputs import StepContext, get_step_ctx_manager
 
 if TYPE_CHECKING:
@@ -126,6 +127,12 @@ class CudaGraphMixin:
         input_buffers['cu_seqlens_q'] = input_buffers['cu_seqlens'][0]
         input_buffers['cu_seqlens_k'] = input_buffers['cu_seqlens'][1]
 
+        dcp_world_rank = get_dcp_world_rank()
+        dcp_world_size, _ = dcp_world_rank
+        if dcp_world_size > 1:
+            input_buffers['dcp_kv_seqlens'] = torch.zeros(
+                max_batches, dtype=torch.int32, device=device)
+
         if graph_meta.step_meta_plan is not None:
             step_ctx = get_step_ctx_manager().current_context()
             graph_meta.step_meta_buffers = graph_meta.step_meta_plan.make_cudagraph_buffers(
@@ -216,6 +223,19 @@ class CudaGraphMixin:
         attn_metadata.kv_seqlens = input_buffers['kv_seqlens']
         attn_metadata.cu_seqlens_q = input_buffers['cu_seqlens_q']
         attn_metadata.cu_seqlens_k = input_buffers['cu_seqlens_k']
+
+        dcp_world_rank = get_dcp_world_rank()
+        dcp_world_size, _ = dcp_world_rank
+        if dcp_world_size > 1:
+            from lmdeploy.pytorch.backends.cp_utils import fill_dcp_local_seq_lens
+            fill_dcp_local_seq_lens(
+                input_buffers['kv_seqlens'],
+                input_buffers['dcp_kv_seqlens'],
+                dcp_world_rank,
+            )
+            attn_metadata.dcp_kv_seqlens = input_buffers['dcp_kv_seqlens']
+        else:
+            attn_metadata.dcp_kv_seqlens = input_buffers['kv_seqlens']
 
         if graph_meta.step_meta_plan is not None:
             step_ctx = get_step_ctx_manager().current_context()

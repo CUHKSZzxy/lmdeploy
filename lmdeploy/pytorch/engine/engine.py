@@ -328,11 +328,13 @@ class Engine(EngineBase):
         """Get max session len."""
         session_len = self.scheduler_config.max_session_len
         num_gpu_blocks = self.cache_config.num_gpu_blocks - self.cache_config.num_reserved_gpu_blocks
-        max_tokens = (num_gpu_blocks * self.cache_config.block_size)
+        # Convert per-rank physical cache capacity to unsharded token capacity.
+        block_size = self.cache_config.block_size * self.cache_config.dcp
+        max_tokens = num_gpu_blocks * block_size
         window_size = self.cache_config.window_size
         if window_size > 0 and window_size <= max_tokens:
             max_tokens = (1 << 63) - 1
-        max_tokens -= self.cache_config.block_size
+        max_tokens -= block_size
         if session_len is None:
             session_len = max_tokens
         else:

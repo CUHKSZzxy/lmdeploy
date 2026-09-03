@@ -581,7 +581,9 @@ class TestFillKVCacheInt42(TestFillKVCacheInt4):
         print('fill_kv_cache quant42 vs Python reference: all checks passed')
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 9, reason='require device with cc>=9.0')
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability()[0] < 9,
+                    reason='require device with cc>=9.0')
 class TestFillKVCacheBlockedFP8(TestFillKVCache):
 
     @pytest.fixture(autouse=True, scope='class')
@@ -851,3 +853,174 @@ class TestFillKVCacheFP8E5M2Scalar(TestFillKVCacheFP8Scalar):
     @pytest.fixture
     def quant_policy(self):
         yield QuantPolicy.FP8_E5M2
+
+
+def _dcp_owned_current_tokens(states, q_seqlens, history_lens, dcp_size,
+                              dcp_rank):
+    """Pack current-chunk tokens owned by one interleaved DCP rank."""
+    pieces = []
+    start = 0
+    local_q_seqlens = []
+    for q_len, history_len in zip(q_seqlens, history_lens):
+        chunk = states[start:start + q_len]
+        positions = torch.arange(history_len,
+                                 history_len + q_len,
+                                 device=states.device)
+        owned = positions % dcp_size == dcp_rank
+        pieces.append(chunk[owned])
+        local_q_seqlens.append(int(owned.sum()))
+        start += q_len
+    return torch.cat(pieces), local_q_seqlens
+
+
+def _dcp_block_offsets(kv_seqlens, block_size, dcp_size, device):
+    blocks_per_request = [
+        _div_up(kv_len, block_size * dcp_size) for kv_len in kv_seqlens
+    ]
+    max_blocks = max(blocks_per_request)
+    offsets = torch.zeros(len(kv_seqlens),
+                          max_blocks,
+                          device=device,
+                          dtype=torch.int32)
+    next_block = 0
+    for request_id, num_blocks in enumerate(blocks_per_request):
+        offsets[request_id, :num_blocks] = torch.arange(
+            next_block,
+            next_block + num_blocks,
+            device=device,
+            dtype=torch.int32)
+        next_block += num_blocks
+    return offsets, next_block
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('dcp_size', [2, 4])
+def test_fill_kv_cache_dcp_matches_rank_local_reference(dcp_size):
+    from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
+    from lmdeploy.pytorch.kernels.cuda.fill_kv_cache import fill_kv_cache
+
+    torch.manual_seed(7)
+    block_size = 64
+    q_seqlens = [7, 70]
+    history_lens = [61, block_size * dcp_size - 4]
+    kv_seqlens = [q + history for q, history in zip(q_seqlens, history_lens)]
+    num_tokens = sum(q_seqlens)
+    k_states = torch.randn(num_tokens, 1, 32, device='cuda')
+    v_states = torch.randn_like(k_states)
+    q_seqlens_t = torch.tensor(q_seqlens, device='cuda', dtype=torch.int32)
+    q_start = torch.nn.functional.pad(q_seqlens_t.cumsum(0), (1, 0))[:-1]
+    kv_seqlens_t = torch.tensor(kv_seqlens, device='cuda', dtype=torch.int32)
+    block_offsets, num_blocks = _dcp_block_offsets(
+        kv_seqlens, block_size, dcp_size, k_states.device)
+
+    for rank in range(dcp_size):
+        actual_k = torch.full((num_blocks, block_size, 1, 32),
+                              -11.0,
+                              device='cuda')
+        actual_v = torch.full_like(actual_k, -13.0)
+        expected_k = actual_k.clone()
+        expected_v = actual_v.clone()
+        fill_kv_cache(k_states,
+                      v_states,
+                      actual_k,
+                      actual_v,
+                      q_start,
+                      q_seqlens_t,
+                      kv_seqlens_t,
+                      max(q_seqlens),
+                      block_offsets,
+                      dcp_size=dcp_size,
+                      dcp_rank=rank)
+
+        local_k, local_q = _dcp_owned_current_tokens(
+            k_states, q_seqlens, history_lens, dcp_size, rank)
+        local_v, _ = _dcp_owned_current_tokens(
+            v_states, q_seqlens, history_lens, dcp_size, rank)
+        local_q_t = torch.tensor(local_q, device='cuda', dtype=torch.int32)
+        local_q_start = torch.nn.functional.pad(local_q_t.cumsum(0),
+                                                (1, 0))[:-1]
+        local_kv = get_dcp_local_seq_lens(kv_seqlens_t, (dcp_size, rank))
+        fill_kv_cache(local_k,
+                      local_v,
+                      expected_k,
+                      expected_v,
+                      local_q_start,
+                      local_q_t,
+                      local_kv,
+                      max(local_q),
+                      block_offsets)
+
+        assert torch.equal(actual_k, expected_k)
+        assert torch.equal(actual_v, expected_v)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability()[0] < 9,
+                    reason='blocked FP8 cache requires Hopper')
+@pytest.mark.parametrize('dcp_size', [2, 4])
+def test_fill_blocked_fp8_cache_dcp_matches_rank_local_reference(dcp_size):
+    from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
+    from lmdeploy.pytorch.kernels.cuda.fill_kv_cache import fill_kv_cache_blocked_fp8
+
+    torch.manual_seed(11)
+    block_size = 64
+    q_seqlens = [7, 70]
+    history_lens = [61, block_size * dcp_size - 4]
+    kv_seqlens = [q + history for q, history in zip(q_seqlens, history_lens)]
+    num_tokens = sum(q_seqlens)
+    k_states = torch.randn(num_tokens,
+                           1,
+                           128,
+                           device='cuda',
+                           dtype=torch.bfloat16)
+    q_seqlens_t = torch.tensor(q_seqlens, device='cuda', dtype=torch.int32)
+    cu_seqlen_q = torch.nn.functional.pad(q_seqlens_t.cumsum(0), (1, 0))
+    kv_seqlens_t = torch.tensor(kv_seqlens, device='cuda', dtype=torch.int32)
+    block_offsets, num_blocks = _dcp_block_offsets(
+        kv_seqlens, block_size, dcp_size, k_states.device)
+
+    for rank in range(dcp_size):
+        actual_k = torch.zeros((num_blocks, block_size, 1, 128),
+                               device='cuda',
+                               dtype=torch.float8_e4m3fn)
+        actual_s = torch.zeros((num_blocks, block_size, 1, 1),
+                               device='cuda',
+                               dtype=torch.float32)
+        expected_k = actual_k.clone()
+        expected_s = actual_s.clone()
+        fill_kv_cache_blocked_fp8(k_states,
+                                  None,
+                                  actual_k,
+                                  None,
+                                  actual_s,
+                                  None,
+                                  cu_seqlen_q,
+                                  kv_seqlens_t,
+                                  max(q_seqlens),
+                                  block_offsets,
+                                  group_size=128,
+                                  scale_fmt='ue8m0',
+                                  dcp_size=dcp_size,
+                                  dcp_rank=rank)
+
+        local_k, local_q = _dcp_owned_current_tokens(
+            k_states, q_seqlens, history_lens, dcp_size, rank)
+        local_q_t = torch.tensor(local_q, device='cuda', dtype=torch.int32)
+        local_cu_seqlen_q = torch.nn.functional.pad(
+            local_q_t.cumsum(0), (1, 0))
+        local_kv = get_dcp_local_seq_lens(kv_seqlens_t, (dcp_size, rank))
+        fill_kv_cache_blocked_fp8(local_k,
+                                  None,
+                                  expected_k,
+                                  None,
+                                  expected_s,
+                                  None,
+                                  local_cu_seqlen_q,
+                                  local_kv,
+                                  max(local_q),
+                                  block_offsets,
+                                  group_size=128,
+                                  scale_fmt='ue8m0')
+
+        assert torch.equal(actual_k, expected_k)
+        assert torch.equal(actual_s, expected_s)

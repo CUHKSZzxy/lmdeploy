@@ -2,9 +2,12 @@
 from collections.abc import Sequence
 from logging import Logger
 
+import torch
+
 from lmdeploy.messages import QuantPolicy
 from lmdeploy.pytorch import envs
 from lmdeploy.pytorch.config import BackendConfig, CacheConfig, DistConfig, MiscConfig, ModelConfig, SpecDecodeConfig
+from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.utils import get_logger
 
 from .base import ExecutorBase
@@ -27,6 +30,45 @@ def _finalize_sparse_mla_cache_policy(model_configs: Sequence[ModelConfig], cach
     for model_config in sparse_mla_configs:
         model_config.mla_kv_cache_dtype = 'fp8_ds_mla'
     cache_config.quant_policy = QuantPolicy.NONE
+
+
+def _validate_dcp_config(model_config: ModelConfig, cache_config: CacheConfig,
+                         dist_config: DistConfig, misc_config: MiscConfig,
+                         specdecode_config: SpecDecodeConfig | None,
+                         device_type: str) -> None:
+    """Validate the production GLM DSA DCP surface before workers start."""
+    dcp = dist_config.dcp
+    if dcp == 1:
+        return
+
+    if device_type != 'cuda':
+        raise ValueError('DCP is supported only by the CUDA PyTorch backend')
+    if dist_config.dp != 1 or dist_config.ep != 1:
+        raise ValueError('DCP currently requires dp=1 and ep=1')
+    hf_config = model_config.hf_config
+    if getattr(hf_config, 'model_type', None) != 'glm_moe_dsa':
+        raise ValueError('DCP currently supports only GlmMoeDsaForCausalLM')
+    if not model_config.use_flash_mla or model_config.mla_index_topk not in (512, 2048):
+        raise ValueError('DCP requires sparse FlashMLA with DSA top-k 512 or 2048')
+    if model_config.dtype != torch.bfloat16:
+        raise ValueError('DCP requires a bfloat16 GLM model')
+    if cache_config.quant_policy not in (QuantPolicy.NONE, QuantPolicy.FP8):
+        raise ValueError(
+            f'DCP sparse MLA does not support quant_policy={cache_config.quant_policy}. '
+            'Use none/0 for BF16 or fp8/16 for FP8.')
+    replica_count = model_config.num_replicate_key_value_heads
+    if dcp > replica_count or replica_count % dcp != 0:
+        raise ValueError(
+            f'dcp {dcp} must divide KV-head replica count {replica_count}')
+    if cache_config.block_size != 64 or cache_config.kernel_block_size != 64:
+        raise ValueError('DCP requires block_size=kernel_block_size=64')
+    if (cache_config.role != EngineRole.Hybrid
+            or cache_config.kv_transfer_config is not None):
+        raise ValueError(
+            'DCP does not support disaggregation or KV-cache connectors')
+    if (specdecode_config is not None
+            or misc_config.memdecode_config is not None):
+        raise ValueError('DCP does not support speculative decoding or MemDecode')
 
 
 def get_distributed_executor_backend(world_size: int, dp: int, device_type: str, logger: Logger = None):
@@ -104,6 +146,9 @@ def build_executor(
         device_type=device_type,
         block_size=cache_config.block_size,
     )
+
+    _validate_dcp_config(model_config, cache_config, dist_config, misc_config,
+                         specdecode_config, device_type)
 
     # Finalize cache policy before any executor copies configs to workers or
     # builds backend operators. Target and memory models share CacheConfig.

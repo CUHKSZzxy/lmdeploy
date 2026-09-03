@@ -185,8 +185,13 @@ def _build_deep_gemm_score_meta(
     if block_offsets.dtype != torch.int32:
         block_offsets = block_offsets.to(torch.int32)
 
+    # DeepGEMM's scheduler cannot build metadata for an all-empty batch. DCP
+    # legitimately produces one on ranks that do not own the first token.
+    # Keep the real zero lengths for scoring, but give the scheduler a single
+    # masked token so it can construct a valid launch schedule.
+    schedule_context_lens = context_lens.clamp_min(1)
     schedule = deep_gemm.get_paged_mqa_logits_metadata(
-        context_lens, meta.block_size, deep_gemm.get_num_sms())
+        schedule_context_lens, meta.block_size, deep_gemm.get_num_sms())
     if schedule_buffer is not None:
         schedule_buffer.copy_(schedule)
         schedule = schedule_buffer
@@ -278,7 +283,8 @@ class DSAIndexerMetaBuilder(
                 device=graph_meta.device,
             )
         if graph_meta.decode_query_len == 1:
-            indexer_kv_seqlens = input_buffers['kv_seqlens']
+            indexer_kv_seqlens = input_buffers.get('dcp_kv_seqlens',
+                                                   input_buffers['kv_seqlens'])
         else:
             indexer_kv_seqlens = torch.empty(
                 graph_meta.max_tokens,
@@ -323,7 +329,7 @@ class DSAIndexerMetaBuilder(
             block_size=step_context.cache_config.block_size,
             num_gpu_blocks=step_context.cache_config.num_gpu_blocks,
             sequence_metadata=sequence_metadata,
-            indexer_kv_seqlens=buffer.indexer_kv_seqlens,
+            dcp_indexer_kv_seqlens=buffer.indexer_kv_seqlens,
         )
         meta.score_meta = _build_deep_gemm_score_meta(
             meta,
@@ -349,6 +355,8 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
         self.max_logits_bytes = _envs.dsa_indexer_max_logits_mb * (1 << 20)
         self._sparse_index_topk = _get_sparse_index_topk(topk)
         self._step_meta_group: int | None = None
+        from lmdeploy.pytorch.distributed import get_dcp_world_rank
+        self.dcp_world_size, self.dcp_rank = get_dcp_world_rank()
         register_step_metadata_impl(self)
 
     def get_block_cache_requests(self, geometry: BlockCacheGeometry,
@@ -369,7 +377,7 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
     def _should_skip_scoring(self, meta: NSAIndexMeta) -> bool:
         """Whether dense prefill makes index scoring unnecessary."""
         return (self._allow_short_prefill_scoring_skip and not meta.is_decoding
-                and meta.max_kv_seqlen <= self.topk)
+                and meta.global_max_kv_seqlen <= self.topk)
 
     def _maybe_score_and_select(self, q: Tensor, q_s: Tensor,
                                 indexer_k_cache: Tensor,
@@ -403,7 +411,7 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
             k_cache,
             k_s_cache[..., 0],
             meta.cu_seqlen_k,
-            meta.k_seqlens,
+            meta.dcp_k_seqlens,
             meta.block_offset,
             out_size=meta.kv_flatten_size,
         )
@@ -436,19 +444,54 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
         # entry per request. DSA metadata already expands it to one entry per
         # score row, including for a query-row chunk.
         if self._sparse_index_topk is not None:
-            return self._sparse_index_topk(scores,
-                                           meta.q_seqlens,
-                                           kv_seqlens,
-                                           self.topk,
-                                           fill=self.fill,
-                                           descending=True,
-                                           sorted=False)
+            stable_ties = self.dcp_world_size > 1
+            if stable_ties:
+                scores.masked_fill_(torch.isnan(scores), -torch.inf)
+            local_indices = self._sparse_index_topk(scores, meta.q_seqlens,
+                                                    kv_seqlens, self.topk,
+                                                    fill=self.fill,
+                                                    descending=True,
+                                                    sorted=False,
+                                                    stable_ties=stable_ties)
+            if self.dcp_world_size == 1:
+                return local_indices
+            return self._merge_dcp_topk(scores, local_indices)
+        if self.dcp_world_size > 1:
+            raise RuntimeError(
+                'DCP requires the TileLang sparse index top-k kernel.')
         return bitonic_topk(scores,
                             meta.q_seqlens,
                             kv_seqlens,
                             self.topk,
                             fill=self.fill,
                             descending=True)
+
+    def _merge_dcp_topk(self, scores: Tensor, local_indices: Tensor) -> Tensor:
+        """Merge packed local candidate sets into an exact global top-k."""
+        if self.dcp_world_size == 1:
+            return local_indices
+
+        from lmdeploy.pytorch.distributed import all_gather_into_tensor
+        from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import (
+            pack_dcp_topk_candidates,
+            sparse_dcp_candidate_topk,
+        )
+
+        num_rows = scores.size(0)
+        packed = pack_dcp_topk_candidates(
+            scores,
+            local_indices,
+            dcp_world_rank=(self.dcp_world_size, self.dcp_rank))
+        gathered = torch.empty(
+            self.dcp_world_size * num_rows,
+            self.topk,
+            2,
+            dtype=packed.dtype,
+            device=scores.device,
+        )
+        all_gather_into_tensor(gathered, packed, group='dcp')
+        gathered = gathered.view(self.dcp_world_size, num_rows, self.topk, 2)
+        return sparse_dcp_candidate_topk(gathered, k=self.topk, fill=self.fill)
 
     def _score_and_select_prefill(
             self, q: Tensor, q_s: Tensor, indexer_k_cache: Tensor,
@@ -505,6 +548,10 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
                 logits_dtype=torch.float32,
             )
         else:
+            if self.dcp_world_size > 1:
+                raise RuntimeError(
+                    'DCP DSA scoring requires a compatible DeepGEMM installation.'
+                )
             _warn_triton_index_scoring()
             score_bytes = q.size(0) * meta.max_kv_seqlen * 4
             if score_bytes > self.max_logits_bytes:
@@ -518,7 +565,7 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
                                k_cache,
                                k_s_cache[..., 0],
                                meta.cu_seqlen_q,
-                               meta.k_seqlens,
+                               meta.dcp_k_seqlens,
                                meta.block_offset,
                                max_q_seqlen=meta.max_q_seqlen,
                                max_k_seqlen=meta.max_kv_seqlen,
@@ -549,7 +596,9 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
                                   max_q_seqlen=meta.max_q_seqlen,
                                   block_offsets=meta.block_offset,
                                   group_size=self.block_size,
-                                  scale_fmt=self.scale_fmt)
+                                  scale_fmt=self.scale_fmt,
+                                  dcp_size=self.dcp_world_size,
+                                  dcp_rank=self.dcp_rank)
         return self._maybe_score_and_select(q, q_s, indexer_k_cache, meta)
 
     def forward_fused(self, q: Tensor, k: Tensor, weights: Tensor, norm_weight: Tensor, norm_bias: Tensor, cos: Tensor,
@@ -578,7 +627,9 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
                                     block_offsets=meta.block_offset,
                                     max_q_seqlen=meta.max_q_seqlen,
                                     eps=norm_eps,
-                                    rope_interleaved=rope_interleaved)
+                                    rope_interleaved=rope_interleaved,
+                                    dcp_size=self.dcp_world_size,
+                                    dcp_rank=self.dcp_rank)
         return self._maybe_score_and_select(q, q_s, indexer_k_cache, meta)
 
 

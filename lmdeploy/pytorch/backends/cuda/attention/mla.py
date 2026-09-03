@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
 from collections.abc import Hashable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -13,6 +13,10 @@ from ..step_metadata import CudaAttentionMetaBuilder
 from .default import TritonAttentionImpl, TritonAttentionMetadata
 
 logger = get_logger('lmdeploy')
+
+# Bound the transient all-gather buffer; the reconstructed KV itself is the
+# minimum workspace required by cached prefill attention.
+_DCP_PREFILL_GATHER_MAX_BYTES = 64 << 20
 
 
 @dataclass
@@ -56,8 +60,8 @@ def _build_flash_mla_metadata(kv_seqlens,
     return FlashMLAAttentionMetadata(
         tile_scheduler_metadata=tile_scheduler_metadata,
         num_splits=num_splits,
-        # The dense scheduler reads kv_seqlens. The current sparse decode call
-        # uses a fixed top-k width and does not pass topk_length.
+        # Sparse scheduling is fixed by top-k; dense scheduling reads KV
+        # lengths and must be rebuilt as sequences grow.
         scheduler_depends_on_step=index_topk is None,
     )
 
@@ -73,9 +77,13 @@ def update_flash_mla_metadata(attn_metadata,
                               is_fp8_kvcache: bool,
                               index_topk: int | None) -> None:
     """Populate the legacy single-group FlashMLA metadata fields."""
-    metadata = build_flash_mla_metadata(
-        attn_metadata,
-        num_attention_heads=num_attention_heads,
+    from lmdeploy.pytorch.distributed import get_dcp_world_rank
+    dcp_world_size, _ = get_dcp_world_rank()
+    kv_seqlens = (attn_metadata.dcp_kv_seqlens
+                  if dcp_world_size > 1 else attn_metadata.kv_seqlens)
+    metadata = _build_flash_mla_metadata(
+        kv_seqlens,
+        num_attention_heads=num_attention_heads * dcp_world_size,
         decoding_query_len=decoding_query_len,
         is_fp8_kvcache=is_fp8_kvcache,
         index_topk=index_topk,
@@ -88,11 +96,18 @@ def build_flash_mla_graph_metadata(step_context, kv_seqlens,
                                    decoding_query_len: int) -> FlashMLAAttentionMetadata:
     """Build legacy graph metadata from the model-level FlashMLA
     configuration."""
+    from lmdeploy.pytorch.distributed import get_dcp_world_rank
+
     num_attention_heads, _ = step_context.model_config.get_num_qkv_head_by_tp()
+    dcp_world_rank = get_dcp_world_rank()
+    dcp_world_size, _ = dcp_world_rank
+    if dcp_world_size > 1:
+        from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
+        kv_seqlens = get_dcp_local_seq_lens(kv_seqlens, dcp_world_rank)
     model_config = step_context.model_config
     return _build_flash_mla_metadata(
         kv_seqlens,
-        num_attention_heads=num_attention_heads,
+        num_attention_heads=num_attention_heads * dcp_world_size,
         decoding_query_len=decoding_query_len,
         is_fp8_kvcache=model_config.use_mla_fp8_cache,
         index_topk=model_config.mla_index_topk,
@@ -114,10 +129,17 @@ class FlashMLAAttentionMetaBuilder(
     def build(self, step_context, sequence_metadata) -> FlashMLAAttentionMetadata:
         if not step_context.is_decoding:
             return FlashMLAAttentionMetadata()
+        from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
+        from lmdeploy.pytorch.distributed import get_dcp_world_rank
+
         batch_size = sequence_metadata.q_seqlens.size(0)
-        return build_flash_mla_metadata(
-            sequence_metadata,
-            num_attention_heads=self.num_attention_heads,
+        dcp_world_rank = get_dcp_world_rank()
+        dcp_world_size, _ = dcp_world_rank
+        kv_seqlens = get_dcp_local_seq_lens(sequence_metadata.kv_seqlens,
+                                            dcp_world_rank)
+        return _build_flash_mla_metadata(
+            kv_seqlens,
+            num_attention_heads=(self.num_attention_heads * dcp_world_size),
             decoding_query_len=step_context.input_ids.size(1) // batch_size,
             is_fp8_kvcache=step_context.model_config.use_mla_fp8_cache,
             index_topk=self.index_topk,
@@ -129,9 +151,11 @@ class FlashMLAAttentionMetaBuilder(
 
     def make_cudagraph_buffer(self, graph_meta, input_buffers,
                               step_context) -> FlashMLAAttentionMetadata:
+        from lmdeploy.pytorch.distributed import get_dcp_world_rank
+        dcp_world_size, _ = get_dcp_world_rank()
         return _build_flash_mla_metadata(
             torch.ones(graph_meta.max_batchs, dtype=torch.int32, device=graph_meta.device),
-            num_attention_heads=self.num_attention_heads,
+            num_attention_heads=self.num_attention_heads * dcp_world_size,
             decoding_query_len=graph_meta.decode_query_len,
             is_fp8_kvcache=step_context.model_config.use_mla_fp8_cache,
             index_topk=self.index_topk,
@@ -139,6 +163,8 @@ class FlashMLAAttentionMetaBuilder(
 
     def fill_cudagraph_buffer(self, graph_meta, input_buffers, step_context,
                               buffer: FlashMLAAttentionMetadata) -> FlashMLAAttentionMetadata:
+        from lmdeploy.pytorch.distributed import get_dcp_world_rank
+        dcp_world_size, _ = get_dcp_world_rank()
         tile_scheduler_metadata = buffer.tile_scheduler_metadata
         if not isinstance(tile_scheduler_metadata, torch.Tensor):
             # FlashMLA 1.x initializes this object during the first kernel
@@ -148,8 +174,8 @@ class FlashMLAAttentionMetaBuilder(
             return buffer
 
         metadata = _build_flash_mla_metadata(
-            input_buffers['kv_seqlens'],
-            num_attention_heads=self.num_attention_heads,
+            input_buffers.get('dcp_kv_seqlens', input_buffers['kv_seqlens']),
+            num_attention_heads=self.num_attention_heads * dcp_world_size,
             decoding_query_len=graph_meta.decode_query_len,
             is_fp8_kvcache=step_context.model_config.use_mla_fp8_cache,
             index_topk=self.index_topk,
@@ -255,11 +281,13 @@ class FlashMLAImpl(TritonAttentionImpl):
         attn_metadata: TritonAttentionMetadata,
         indices: torch.Tensor = None,
         causal: bool = None,
+        return_lse: bool = False,
     ):
         """Run paged FlashMLA decode with optional provider-ready indices."""
         if causal is None:
             causal = self.causal
-        kv_seqlens = attn_metadata.kv_seqlens
+        kv_seqlens = (attn_metadata.dcp_kv_seqlens
+                      if self.dcp_world_size > 1 else attn_metadata.kv_seqlens)
         block_offsets = attn_metadata.block_offsets
         is_fp8_kvcache = k_cache.dtype == torch.float8_e4m3fn
 
@@ -274,20 +302,28 @@ class FlashMLAImpl(TritonAttentionImpl):
 
         tile_scheduler_metadata, num_splits = self._get_scheduler_metadata(attn_metadata)
 
-        attn_output, _ = self.flash_mla_with_kvcache(query,
-                                                     k_cache=k_cache,
-                                                     block_table=block_offsets,
-                                                     cache_seqlens=kv_seqlens,
-                                                     head_dim_v=self.v_head_size,
-                                                     softmax_scale=self.scale,
-                                                     tile_scheduler_metadata=tile_scheduler_metadata,
-                                                     num_splits=num_splits,
-                                                     causal=causal,
-                                                     is_fp8_kvcache=is_fp8_kvcache,
-                                                     indices=indices)
+        flash_kwargs = dict(
+            k_cache=k_cache,
+            block_table=block_offsets,
+            cache_seqlens=kv_seqlens,
+            head_dim_v=self.v_head_size,
+            softmax_scale=self.scale,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            causal=causal,
+            is_fp8_kvcache=is_fp8_kvcache,
+            indices=indices,
+        )
+        attn_output, softmax_lse = self.flash_mla_with_kvcache(
+            query, **flash_kwargs)
 
         attn_output = attn_output[:, :, :num_q_heads]
         attn_output = attn_output.flatten(0, 1)
+        if return_lse:
+            # FlashMLA returns [batch, heads, query].
+            softmax_lse = softmax_lse[:, :num_q_heads].transpose(1, 2)
+            softmax_lse = softmax_lse.flatten(0, 1)
+            return attn_output, softmax_lse
         return attn_output
 
     def _prefill_triton(
@@ -429,6 +465,121 @@ class FlashMLAImpl(TritonAttentionImpl):
 
         return flatten_k, flatten_v
 
+    def _flatten_dcp_prefill_kv_cache(
+        self,
+        current_key: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        out_dtype: torch.dtype,
+        kv_layout: str,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct global cached prefixes with bounded gather storage."""
+        if self.dcp_world_size == 1:
+            return self._flatten_prefill_kv_cache(
+                k_cache,
+                v_cache,
+                attn_metadata,
+                out_dtype=out_dtype,
+                kv_layout=kv_layout,
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+            )
+
+        from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_cu_seqlens
+        from lmdeploy.pytorch.distributed import all_gather_into_tensor
+        from lmdeploy.pytorch.kernels.cuda.dcp import scatter_dcp_prefill_kv
+
+        dcp_world_rank = self.dcp_world_size, self.dcp_rank
+        dcp_world_size = self.dcp_world_size
+        prefix_lens = attn_metadata.kv_seqlens - attn_metadata.q_seqlens
+        prefix_total = attn_metadata.kv_flatten_size - current_key.size(0)
+        if prefix_total == 0:
+            flatten_k = current_key
+        else:
+            local_lens, local_cu_lens = get_dcp_local_cu_seqlens(
+                prefix_lens, dcp_world_rank)
+            # Sum(ceil(prefix_i / dcp)) is bounded by this value on every
+            # rank. Using the common bound keeps collective shapes identical
+            # without synchronizing device lengths back to the host.
+            num_sequences = prefix_lens.numel()
+            max_local_total = (prefix_total + num_sequences *
+                               (dcp_world_size - 1)) // dcp_world_size
+            local_meta = replace(
+                attn_metadata,
+                kv_start_loc=local_cu_lens[:-1].to(prefix_lens.dtype),
+                kv_seqlens=local_lens,
+                cu_seqlens_k=local_cu_lens,
+                kv_flatten_size=max_local_total,
+                max_kv_seqlen=(attn_metadata.max_kv_seqlen + dcp_world_size -
+                               1) // dcp_world_size,
+            )
+            local_prefix, _ = self._flatten_prefill_kv_cache(
+                k_cache,
+                v_cache,
+                local_meta,
+                out_dtype=out_dtype,
+                kv_layout='shd',
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+            )
+            assert local_prefix.is_contiguous()
+            ranks = torch.arange(dcp_world_size,
+                                 device=prefix_lens.device,
+                                 dtype=prefix_lens.dtype)[:, None]
+            local_lens_by_rank = torch.clamp(torch.div(
+                prefix_lens[None, :] + dcp_world_size - 1 - ranks,
+                dcp_world_size,
+                rounding_mode='floor'),
+                                             min=0)
+
+            flatten_k = current_key.new_empty(attn_metadata.kv_flatten_size,
+                                              *current_key.shape[1:])
+            current_offsets = torch.repeat_interleave(
+                attn_metadata.kv_start_loc + prefix_lens -
+                attn_metadata.q_start_loc,
+                attn_metadata.q_seqlens,
+                output_size=current_key.size(0),
+            )
+            current_destinations = torch.arange(
+                current_key.size(0),
+                device=current_key.device,
+                dtype=current_offsets.dtype) + current_offsets
+            flatten_k.index_copy_(0, current_destinations.long(), current_key)
+
+            row_bytes = local_prefix[0].numel() * local_prefix.element_size()
+            chunk_rows = max(
+                1,
+                _DCP_PREFILL_GATHER_MAX_BYTES // (dcp_world_size * row_bytes))
+            chunk_rows = min(chunk_rows, max_local_total)
+            gathered_workspace = local_prefix.new_empty(
+                dcp_world_size * chunk_rows, *local_prefix.shape[1:])
+            for chunk_start in range(0, max_local_total, chunk_rows):
+                current_rows = min(chunk_rows, max_local_total - chunk_start)
+                local_chunk = local_prefix[chunk_start:chunk_start +
+                                           current_rows]
+                gathered_chunk = gathered_workspace[:dcp_world_size *
+                                                    current_rows]
+                all_gather_into_tensor(gathered_chunk,
+                                       local_chunk,
+                                       group='dcp')
+                scatter_dcp_prefill_kv(
+                    gathered_chunk,
+                    flatten_k,
+                    prefix_lens=prefix_lens,
+                    kv_start_loc=attn_metadata.kv_start_loc,
+                    local_lens=local_lens_by_rank,
+                    chunk_start=chunk_start,
+                )
+
+        flatten_v = flatten_k[..., :self.v_head_size]
+        if kv_layout == 'hsd':
+            flatten_k = flatten_k.transpose(0, 1).contiguous()
+            flatten_v = flatten_v.transpose(0, 1).contiguous()
+        return flatten_k, flatten_v
+
     def _get_max_q_seqlen(
         self,
         query: torch.Tensor,
@@ -497,6 +648,8 @@ class FlashMLAImpl(TritonAttentionImpl):
             block_offsets=block_offsets,
             group_size=128,
             scale_fmt='ue8m0',
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
         )
         self.fill_kv_cache(
             key[..., self._MLA_NOPE_SIZE:],
@@ -508,6 +661,8 @@ class FlashMLAImpl(TritonAttentionImpl):
             kv_seq_length=kv_seqlens,
             max_q_seq_length=fill_max_q_seqlen,
             block_offsets=block_offsets,
+            dcp_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
         )
 
     def _forward_decoding(
@@ -541,6 +696,7 @@ class FlashMLAImpl(TritonAttentionImpl):
         nsa_indices: torch.Tensor = None,
         k_scales_zeros: torch.Tensor = None,
         v_scales_zeros: torch.Tensor = None,
+        current_key: torch.Tensor = None,
     ) -> torch.Tensor:
         """Forward pass for dense MLA prefill.
 
@@ -560,7 +716,8 @@ class FlashMLAImpl(TritonAttentionImpl):
             raise RuntimeError('Sparse MLA indices require FlashMLASparseImpl.')
 
         kv_layout = 'shd' if self.use_fa3 else 'hsd'
-        flatten_k, flatten_v = self._flatten_prefill_kv_cache(
+        flatten_k, flatten_v = self._flatten_dcp_prefill_kv_cache(
+            current_key,
             k_cache,
             v_cache,
             attn_metadata,
@@ -638,4 +795,5 @@ class FlashMLAImpl(TritonAttentionImpl):
                 nsa_indices,
                 k_scales_zeros,
                 v_scales_zeros,
+                current_key=key,
             )
