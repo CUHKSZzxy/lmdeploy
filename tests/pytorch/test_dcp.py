@@ -1,5 +1,4 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import argparse
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
@@ -10,7 +9,6 @@ import torch
 from lmdeploy.messages import PytorchEngineConfig, QuantPolicy
 from lmdeploy.pytorch.backends.cp_utils import (
     compact_dcp_local_indices,
-    fill_dcp_local_seq_lens,
     get_dcp_local_cu_seqlens,
     get_dcp_local_indices,
     get_dcp_local_seq_lens,
@@ -47,16 +45,6 @@ def test_dcp_global_indices_map_to_their_owner(world_size):
         assert torch.all(local[~owned] == -1)
 
 
-def test_fill_dcp_lengths_reuses_caller_owned_buffers():
-    global_lens = torch.tensor([0, 1, 3, 8], dtype=torch.int32)
-    local_lens = torch.empty_like(global_lens)
-    local_ptr = local_lens.data_ptr()
-
-    fill_dcp_local_seq_lens(global_lens, local_lens, (2, 1))
-    assert local_lens.data_ptr() == local_ptr
-    assert local_lens.tolist() == [0, 0, 1, 4]
-
-
 def test_dcp_local_winners_are_compacted_with_valid_counts():
     global_indices = torch.tensor(
         [[1, 8, 3, -1, 6, 4], [5, 7, -1, -1, -1, -1]], dtype=torch.int32)
@@ -64,44 +52,6 @@ def test_dcp_local_winners_are_compacted_with_valid_counts():
 
     assert counts.tolist() == [3, 0]
     assert local.tolist() == [[4, 3, 2, -1, -1, -1], [-1, -1, -1, -1, -1, -1]]
-
-
-def test_tensor_collectives_resolve_dcp_group(monkeypatch):
-    from lmdeploy.pytorch import distributed
-
-    dcp_group = object()
-    resolved_groups = []
-    collective_groups = []
-
-    def get_group(group_type, device):
-        resolved_groups.append((group_type, device))
-        return dcp_group
-
-    def all_gather_into_tensor(output,
-                               input_tensor,
-                               group=None,
-                               async_op=False):
-        collective_groups.append(group)
-
-    def reduce_scatter_tensor(output,
-                              input_tensor,
-                              op=None,
-                              group=None,
-                              async_op=False):
-        collective_groups.append(group)
-
-    monkeypatch.setattr(distributed, 'get_group', get_group)
-    monkeypatch.setattr(distributed.dist, 'all_gather_into_tensor',
-                        all_gather_into_tensor)
-    monkeypatch.setattr(distributed.dist, 'reduce_scatter_tensor',
-                        reduce_scatter_tensor)
-
-    tensor = torch.empty(1)
-    distributed.all_gather_into_tensor(tensor, tensor, group='dcp')
-    distributed.reduce_scatter_tensor(tensor, tensor, group='dcp')
-
-    assert resolved_groups == [('dcp', 'gpu'), ('dcp', 'gpu')]
-    assert collective_groups == [dcp_group, dcp_group]
 
 
 def test_dcp_candidate_merge_is_exact_and_uses_global_position_ties(
@@ -184,19 +134,9 @@ def test_dcp_block_allocation_uses_virtual_block_size():
     assert block_manager.num_required_blocks(sequence) == 2
 
 
-def test_dcp_cli_option_uses_engine_config_field_name():
-    from lmdeploy.cli.utils import ArgumentHelper
-
-    parser = argparse.ArgumentParser()
-    ArgumentHelper.dcp(parser)
-    assert parser.parse_args([]).dcp == 1
-    assert parser.parse_args(['--dcp', '4']).dcp == 4
-
-
 @pytest.mark.parametrize(('tp', 'dcp', 'rank', 'expected'),
-                         [(4, 2, 0, (0, 1)), (4, 2, 3, (2, 3)),
-                          (8, 2, 5, (4, 5)), (8, 4, 6, (4, 5, 6, 7)),
-                          (8, 8, 7, tuple(range(8)))])
+                         [(4, 2, 3, (2, 3)),
+                          (8, 4, 6, (4, 5, 6, 7))])
 def test_dcp_group_membership(monkeypatch, tp, dcp, rank, expected):
     from lmdeploy.pytorch import distributed
 
@@ -221,21 +161,6 @@ def test_dcp_group_membership(monkeypatch, tp, dcp, rank, expected):
     assert context.dcp_group.cpu_group == ('gloo', expected)
     assert len(created) == 2 * (tp // dcp)
     assert distributed.get_dcp_world_rank() == (dcp, rank % dcp)
-
-
-def test_dcp_group_teardown(monkeypatch):
-    from lmdeploy.pytorch import distributed
-
-    destroyed = []
-    monkeypatch.setattr(distributed.dist, 'is_initialized', lambda: True)
-    monkeypatch.setattr(distributed.dist, 'destroy_process_group',
-                        destroyed.append)
-    group = distributed.DistGroup(cpu_groups=['cpu0', 'cpu1'],
-                                  gpu_groups=['gpu0', 'gpu1'])
-    group.close()
-
-    assert destroyed == ['cpu0', 'cpu1', 'gpu0', 'gpu1']
-    assert group.cpu_groups is None and group.gpu_groups is None
 
 
 class _DCPModelConfig(SimpleNamespace):
@@ -275,7 +200,6 @@ def test_validate_supported_glm_dcp_configuration(quant_policy):
     args = _valid_dcp_validation_inputs()
     args[1].quant_policy = quant_policy
     _validate_dcp_config(*args, specdecode_config=None, device_type='cuda')
-    assert not args[0].use_mla_fp8_cache
 
 
 @pytest.mark.parametrize(

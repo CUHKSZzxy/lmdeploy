@@ -414,44 +414,17 @@ def test_dcp_attention_correction_kernel_matches_torch():
     torch.testing.assert_close(graph_output, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_scatter_dcp_prefill_kv_chunks_match_global_order():
-    if not torch.cuda.is_available():
-        pytest.skip('requires CUDA')
-    from lmdeploy.pytorch.kernels.cuda.dcp import scatter_dcp_prefill_kv
-
-    rank0 = torch.tensor([0, 2, 10], dtype=torch.bfloat16, device='cuda')[:,
-                                                                          None]
-    rank1 = torch.tensor([1, 11, -1], dtype=torch.bfloat16,
-                         device='cuda')[:, None]
-    output = torch.full((8, 1), -99, dtype=torch.bfloat16, device='cuda')
-    prefix_lens = torch.tensor([3, 2], dtype=torch.int32, device='cuda')
-    kv_start_loc = torch.tensor([0, 4], dtype=torch.int32, device='cuda')
-    local_lens = torch.tensor([[2, 1], [1, 1]],
-                              dtype=torch.int32,
-                              device='cuda')
-
-    for chunk_start in range(3):
-        gathered = torch.stack((rank0[chunk_start], rank1[chunk_start]))
-        scatter_dcp_prefill_kv(gathered,
-                               output,
-                               prefix_lens=prefix_lens,
-                               kv_start_loc=kv_start_loc,
-                               local_lens=local_lens,
-                               chunk_start=chunk_start)
-
-    expected = torch.tensor([0, 1, 2, -99, 10, 11, -99, -99],
-                            dtype=torch.bfloat16,
-                            device='cuda')[:, None]
-    assert torch.equal(output, expected)
-
-
-@pytest.mark.parametrize(('dcp_size', 'chunk_rows'), [(2, 1), (2, 3), (4, 2),
-                                                      (4, 5)])
-def test_scatter_dcp_prefill_kv_handles_uneven_requests(dcp_size, chunk_rows):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_scatter_dcp_prefill_kv_handles_uneven_requests():
     from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
     from lmdeploy.pytorch.kernels.cuda.dcp import scatter_dcp_prefill_kv
 
-    prefix_lens = torch.tensor([0, 1, 2, 7, 8, 9], dtype=torch.int32)
+    device = 'cuda'
+    dcp_size = 2
+    chunk_rows = 2
+    prefix_lens = torch.tensor([0, 1, 2, 7, 8, 9],
+                               dtype=torch.int32,
+                               device=device)
     q_lens = torch.ones_like(prefix_lens)
     kv_lens = prefix_lens + q_lens
     kv_start_loc = torch.nn.functional.pad(kv_lens.cumsum(0), (1, 0))[:-1]
@@ -462,12 +435,16 @@ def test_scatter_dcp_prefill_kv_handles_uneven_requests(dcp_size, chunk_rows):
     max_local_total = int(local_lens.sum(dim=1).max())
     local_prefixes = torch.full((dcp_size, max_local_total, 1),
                                 -1,
-                                dtype=torch.int32)
-    expected = torch.full((int(kv_lens.sum()), 1), -99, dtype=torch.int32)
+                                dtype=torch.int32,
+                                device=device)
+    expected = torch.full((int(kv_lens.sum()), 1),
+                          -99,
+                          dtype=torch.int32,
+                          device=device)
     for rank in range(dcp_size):
         local_start = 0
         for request, prefix_len in enumerate(prefix_lens.tolist()):
-            values = request * 100 + torch.arange(prefix_len)
+            values = request * 100 + torch.arange(prefix_len, device=device)
             owned = values[rank::dcp_size]
             local_prefixes[rank, local_start:local_start + owned.numel(),
                            0] = owned

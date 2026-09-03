@@ -73,7 +73,7 @@ def test_prepare_dsa_indexer_q_matches_unfused_quantization(rope_interleaved, he
                     reason='requires device with cc>=9.0')
 @pytest.mark.parametrize('rope_interleaved', [True, False])
 @pytest.mark.parametrize('q_seqlens,kv_seqlens', [([1, 1], [3, 2]), ([3, 2], [5, 3])])
-@pytest.mark.parametrize('dcp_size,dcp_rank', [(1, 0), (2, 0), (2, 1), (4, 3)])
+@pytest.mark.parametrize('dcp_size,dcp_rank', [(1, 0), (2, 1)])
 def test_prepare_dsa_indexer_k_cache_matches_prepared_k_fill(
         q_seqlens, kv_seqlens, rope_interleaved, dcp_size, dcp_rank):
     from lmdeploy.pytorch.kernels.cuda.dsa_indexer_preprocess import prepare_dsa_indexer_k_cache

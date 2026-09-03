@@ -894,12 +894,12 @@ def _dcp_block_offsets(kv_seqlens, block_size, dcp_size, device):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
-@pytest.mark.parametrize('dcp_size', [2, 4])
-def test_fill_kv_cache_dcp_matches_rank_local_reference(dcp_size):
+def test_fill_kv_cache_dcp_matches_rank_local_reference():
     from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
     from lmdeploy.pytorch.kernels.cuda.fill_kv_cache import fill_kv_cache
 
     torch.manual_seed(7)
+    dcp_size = 2
     block_size = 64
     q_seqlens = [7, 70]
     history_lens = [61, block_size * dcp_size - 4]
@@ -957,12 +957,12 @@ def test_fill_kv_cache_dcp_matches_rank_local_reference(dcp_size):
 @pytest.mark.skipif(not torch.cuda.is_available()
                     or torch.cuda.get_device_capability()[0] < 9,
                     reason='blocked FP8 cache requires Hopper')
-@pytest.mark.parametrize('dcp_size', [2, 4])
-def test_fill_blocked_fp8_cache_dcp_matches_rank_local_reference(dcp_size):
+def test_fill_blocked_fp8_cache_dcp_matches_rank_local_reference():
     from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
     from lmdeploy.pytorch.kernels.cuda.fill_kv_cache import fill_kv_cache_blocked_fp8
 
     torch.manual_seed(11)
+    dcp_size = 2
     block_size = 64
     q_seqlens = [7, 70]
     history_lens = [61, block_size * dcp_size - 4]

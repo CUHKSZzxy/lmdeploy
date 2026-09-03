@@ -53,9 +53,7 @@ scattering the output heads.
 lmdeploy serve api_server <glm-moe-dsa-model> \
     --backend pytorch \
     --tp 4 \
-    --dcp 2 \
-    --block-size 64 \
-    --kernel-block-size 64
+    --dcp 2
 ```
 
 The equivalent Python configuration is:
@@ -65,12 +63,7 @@ from lmdeploy import PytorchEngineConfig, pipeline
 
 pipe = pipeline(
     '<glm-moe-dsa-model>',
-    backend_config=PytorchEngineConfig(
-        tp=4,
-        dcp=2,
-        block_size=64,
-        kernel_block_size=64,
-    ),
+    backend_config=PytorchEngineConfig(tp=4, dcp=2),
 )
 ```
 
@@ -100,7 +93,6 @@ When `dcp > 1`, the current implementation supports:
   and FlashMLA support for per-row `topk_length`.
 - `tp` is divisible by `dcp`, and `dcp` divides the replicated KV
   head count.
-- Physical and kernel block sizes are both 64.
 - `dp=1`, `ep=1`, and the hybrid engine role.
 - No speculative/MTP decode, sliding-window attention, MemDecode,
   prefill/decode disaggregation, or external KV-cache connector.

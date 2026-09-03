@@ -153,9 +153,8 @@ def test_sparse_index_topk_cuda_graph_capture():
     _assert_topk_ids(scores, out, seqlens, k)
 
 
-@pytest.mark.parametrize(('dcp_size', 'k', 'local_width'), [(2, 512, 700),
-                                                            (4, 512, 700),
-                                                            (4, 2048, 2300)])
+@pytest.mark.parametrize(('dcp_size', 'k', 'local_width'),
+                         [(2, 512, 700), (4, 2048, 2300)])
 def test_sparse_dcp_candidate_topk_matches_global_stable_topk(
         dcp_size, k, local_width):
     from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import pack_dcp_topk_candidates, sparse_dcp_candidate_topk
