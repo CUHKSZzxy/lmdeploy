@@ -104,8 +104,8 @@ def test_sparse_index_topk_expands_batch_kv_seqlens_for_prefill():
     _assert_topk_ids(scores, out, row_seqlens, k)
 
 
-def test_sparse_index_topk_stable_ties_choose_lower_positions():
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import sparse_index_topk
+def test_sparse_dcp_index_topk_stable_ties_choose_lower_positions():
+    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import sparse_dcp_index_topk
 
     device = 'cuda'
     k = 512
@@ -117,11 +117,7 @@ def test_sparse_index_topk_stable_ties_choose_lower_positions():
                               device=device,
                               dtype=torch.int32)
 
-    out = sparse_index_topk(scores,
-                            q_seqlens,
-                            kv_seqlens,
-                            k=k,
-                            stable_ties=True)
+    out = sparse_dcp_index_topk(scores, q_seqlens, kv_seqlens, k=k)
 
     expected = torch.arange(k, device=device, dtype=torch.int32).expand(2, -1)
     assert torch.equal(out, expected)
@@ -157,7 +153,10 @@ def test_sparse_index_topk_cuda_graph_capture():
                          [(2, 512, 700), (4, 2048, 2300)])
 def test_sparse_dcp_candidate_topk_matches_global_stable_topk(
         dcp_size, k, local_width):
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import pack_dcp_topk_candidates, sparse_dcp_candidate_topk
+    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import (
+        pack_dcp_topk_candidates,
+        sparse_dcp_candidate_topk,
+    )
 
     device = 'cuda'
     num_rows = 3
@@ -198,7 +197,7 @@ def test_sparse_dcp_candidate_topk_matches_global_stable_topk(
 
 
 def test_sparse_dcp_candidate_topk_preserves_int32_ids_and_padding():
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import sparse_dcp_candidate_topk
+    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import sparse_dcp_candidate_topk
 
     k = 512
     gathered = torch.empty(2, 1, k, 2, dtype=torch.float32, device='cuda')
@@ -217,7 +216,7 @@ def test_sparse_dcp_candidate_topk_preserves_int32_ids_and_padding():
 
 
 def test_sparse_dcp_candidate_topk_all_valid_order_is_deterministic():
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import sparse_dcp_candidate_topk
+    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import sparse_dcp_candidate_topk
 
     dcp_size = 2
     num_rows = 8
@@ -248,7 +247,10 @@ def test_sparse_dcp_candidate_topk_all_valid_order_is_deterministic():
 
 
 def test_sparse_dcp_candidate_topk_cuda_graph_capture():
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import pack_dcp_topk_candidates, sparse_dcp_candidate_topk
+    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import (
+        pack_dcp_topk_candidates,
+        sparse_dcp_candidate_topk,
+    )
 
     k = 512
     generator = torch.Generator(device='cuda').manual_seed(512)

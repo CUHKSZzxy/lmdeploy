@@ -135,7 +135,7 @@ def _warn_triton_index_scoring():
 
 
 @functools.lru_cache
-def _get_sparse_index_topk(topk: int):
+def _get_sparse_index_topk(topk: int, use_dcp: bool = False):
     try:
         from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import (
             is_sparse_index_topk_supported,
@@ -144,6 +144,11 @@ def _get_sparse_index_topk(topk: int):
     except ImportError:
         return None
     if is_sparse_index_topk_supported(topk):
+        if use_dcp:
+            from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import (
+                sparse_dcp_index_topk,
+            )
+            return sparse_dcp_index_topk
         return sparse_index_topk
     return None
 
@@ -353,10 +358,11 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
         # TODO: configable scale fmt
         self.scale_fmt = 'ue8m0'
         self.max_logits_bytes = _envs.dsa_indexer_max_logits_mb * (1 << 20)
-        self._sparse_index_topk = _get_sparse_index_topk(topk)
-        self._step_meta_group: int | None = None
         from lmdeploy.pytorch.distributed import get_dcp_world_rank
         self.dcp_world_size, self.dcp_rank = get_dcp_world_rank()
+        self._sparse_index_topk = _get_sparse_index_topk(
+            topk, use_dcp=self.dcp_world_size > 1)
+        self._step_meta_group: int | None = None
         register_step_metadata_impl(self)
 
     def get_block_cache_requests(self, geometry: BlockCacheGeometry,
@@ -444,15 +450,13 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
         # entry per request. DSA metadata already expands it to one entry per
         # score row, including for a query-row chunk.
         if self._sparse_index_topk is not None:
-            stable_ties = self.dcp_world_size > 1
-            if stable_ties:
+            if self.dcp_world_size > 1:
                 scores.masked_fill_(torch.isnan(scores), -torch.inf)
             local_indices = self._sparse_index_topk(scores, meta.q_seqlens,
                                                     kv_seqlens, self.topk,
                                                     fill=self.fill,
                                                     descending=True,
-                                                    sorted=False,
-                                                    stable_ties=stable_ties)
+                                                    sorted=False)
             if self.dcp_world_size == 1:
                 return local_indices
             return self._merge_dcp_topk(scores, local_indices)
@@ -472,7 +476,7 @@ class TritonNSAIndexFP8(BaseNSAIndexFP8):
             return local_indices
 
         from lmdeploy.pytorch.distributed import all_gather_into_tensor
-        from lmdeploy.pytorch.kernels.cuda.sparse_index_topk import (
+        from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import (
             pack_dcp_topk_candidates,
             sparse_dcp_candidate_topk,
         )
