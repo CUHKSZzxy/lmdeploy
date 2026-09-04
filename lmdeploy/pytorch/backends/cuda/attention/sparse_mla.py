@@ -335,46 +335,6 @@ class FlashMLASparseImpl(FlashMLAImpl):
             return attn_output[:, :num_q_heads], softmax_lse[:, :num_q_heads]
         return output[:, :num_q_heads]
 
-    def _gather_dcp_query(self, query: torch.Tensor) -> torch.Tensor:
-        """Gather TP-sharded query heads within the DCP subgroup."""
-        if self.dcp_world_size == 1:
-            return query
-        from lmdeploy.pytorch.distributed import all_gather_into_tensor
-
-        transposed = query.transpose(0, 1).contiguous()
-        gathered = transposed.new_empty(
-            self.dcp_world_size * transposed.size(0), *transposed.shape[1:])
-        all_gather_into_tensor(gathered, transposed, group='dcp')
-        return gathered.transpose(0, 1).contiguous()
-
-    def _merge_dcp_attention(self, local_output: torch.Tensor,
-                             local_lse: torch.Tensor,
-                             valid_rows: torch.Tensor) -> torch.Tensor:
-        """Merge shard-local normalized attention with LSE correction."""
-        if self.dcp_world_size == 1:
-            return local_output
-        from lmdeploy.pytorch.distributed import all_gather_into_tensor, reduce_scatter_tensor
-        from lmdeploy.pytorch.kernels.cuda.dcp import correct_dcp_attention_output, prepare_dcp_lse
-
-        local_lse = prepare_dcp_lse(local_lse, valid_rows)
-        gathered_lse = local_lse.new_empty(
-            self.dcp_world_size * local_lse.size(0), local_lse.size(1))
-        all_gather_into_tensor(gathered_lse, local_lse, group='dcp')
-        gathered_lse = gathered_lse.view(self.dcp_world_size, *local_lse.shape)
-        contribution = correct_dcp_attention_output(
-            local_output, gathered_lse, dcp_rank=self.dcp_rank)
-
-        num_heads = contribution.size(0)
-        # The correction kernel writes [heads, tokens, dim] directly so the
-        # head-sharded reduce-scatter needs no separate transpose/copy.
-        assert num_heads % self.dcp_world_size == 0
-        local_heads = num_heads // self.dcp_world_size
-        reduce_output = contribution.new_empty(local_heads,
-                                               contribution.size(1),
-                                               contribution.size(2))
-        reduce_scatter_tensor(reduce_output, contribution, group='dcp')
-        return reduce_output.transpose(0, 1).to(local_output.dtype)
-
     def _forward_decoding(self,
                           query: torch.Tensor,
                           k_cache: torch.Tensor,

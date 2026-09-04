@@ -36,7 +36,7 @@ def _validate_dcp_config(model_config: ModelConfig, cache_config: CacheConfig,
                          dist_config: DistConfig, misc_config: MiscConfig,
                          specdecode_config: SpecDecodeConfig | None,
                          device_type: str) -> None:
-    """Validate the production GLM DSA DCP surface before workers start."""
+    """Validate the supported FlashMLA DCP surface before workers start."""
     dcp = dist_config.dcp
     if dcp == 1:
         return
@@ -45,17 +45,18 @@ def _validate_dcp_config(model_config: ModelConfig, cache_config: CacheConfig,
         raise ValueError('DCP is supported only by the CUDA PyTorch backend')
     if dist_config.dp != 1 or dist_config.ep != 1:
         raise ValueError('DCP currently requires dp=1 and ep=1')
-    hf_config = model_config.hf_config
-    if getattr(hf_config, 'model_type', None) != 'glm_moe_dsa':
-        raise ValueError('DCP currently supports only GlmMoeDsaForCausalLM')
-    if not model_config.use_flash_mla or model_config.mla_index_topk not in (512, 2048):
-        raise ValueError('DCP requires sparse FlashMLA with DSA top-k 512 or 2048')
+    if not model_config.use_flash_mla:
+        raise ValueError('DCP requires a FlashMLA-backed MLA model')
+    is_sparse_mla = model_config.mla_index_topk is not None
+    if is_sparse_mla and model_config.mla_index_topk not in (512, 2048):
+        raise ValueError('DCP sparse MLA requires DSA top-k 512 or 2048')
     if model_config.dtype != torch.bfloat16:
-        raise ValueError('DCP requires a bfloat16 GLM model')
-    if cache_config.quant_policy not in (QuantPolicy.NONE, QuantPolicy.FP8):
+        raise ValueError('DCP requires a bfloat16 MLA model')
+    supported_cache_policies = ((QuantPolicy.NONE, QuantPolicy.FP8)
+                                if is_sparse_mla else (QuantPolicy.NONE, ))
+    if cache_config.quant_policy not in supported_cache_policies:
         raise ValueError(
-            f'DCP sparse MLA does not support quant_policy={cache_config.quant_policy}. '
-            'Use none/0 for BF16 or fp8/16 for FP8.')
+            f'DCP MLA does not support quant_policy={cache_config.quant_policy}')
     replica_count = model_config.num_replicate_key_value_heads
     if dcp > replica_count or replica_count % dcp != 0:
         raise ValueError(

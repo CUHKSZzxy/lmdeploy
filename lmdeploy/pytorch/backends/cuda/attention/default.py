@@ -67,12 +67,8 @@ def build_triton_attention_metadata(attn_meta_cls, step_context,
     from lmdeploy.pytorch.distributed import get_dcp_world_rank
 
     dcp_world_rank = get_dcp_world_rank()
-    dcp_world_size, _ = dcp_world_rank
-    if dcp_world_size == 1:
-        dcp_local_kv_seqlens = sequence_metadata.kv_seqlens
-    else:
-        dcp_local_kv_seqlens = get_dcp_local_seq_lens(
-            sequence_metadata.kv_seqlens, dcp_world_rank)
+    dcp_local_kv_seqlens = get_dcp_local_seq_lens(
+        sequence_metadata.kv_seqlens, dcp_world_rank)
 
     return attn_meta_cls(
         is_decoding=step_context.is_decoding,

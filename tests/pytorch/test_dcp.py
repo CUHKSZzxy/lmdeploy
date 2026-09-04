@@ -173,8 +173,8 @@ class _DCPModelConfig(SimpleNamespace):
 def _valid_dcp_validation_inputs():
     model_config = _DCPModelConfig(
         hf_config=SimpleNamespace(
-            model_type='glm_moe_dsa',
-            architectures=['GlmMoeDsaForCausalLM'],
+            model_type='deepseek_v3',
+            architectures=['DeepseekV3ForCausalLM'],
         ),
         use_flash_mla=True,
         mla_kv_cache_dtype='bfloat16',
@@ -193,18 +193,23 @@ def _valid_dcp_validation_inputs():
     return model_config, cache_config, DistConfig(tp=4, dcp=2), MiscConfig()
 
 
-@pytest.mark.parametrize('quant_policy', [QuantPolicy.NONE, QuantPolicy.FP8])
-def test_validate_supported_glm_dcp_configuration(quant_policy):
+@pytest.mark.parametrize(('mla_index_topk', 'quant_policy'),
+                         [(None, QuantPolicy.NONE),
+                          (2048, QuantPolicy.NONE),
+                          (2048, QuantPolicy.FP8)])
+def test_validate_supported_mla_dcp_configuration(mla_index_topk,
+                                                  quant_policy):
     from lmdeploy.pytorch.engine.executor import _validate_dcp_config
 
     args = _valid_dcp_validation_inputs()
+    args[0].mla_index_topk = mla_index_topk
     args[1].quant_policy = quant_policy
     _validate_dcp_config(*args, specdecode_config=None, device_type='cuda')
 
 
 @pytest.mark.parametrize(
     ('field', 'value', 'message'),
-    [('model_type', 'other', 'GlmMoeDsaForCausalLM'),
+    [('use_flash_mla', False, 'FlashMLA'),
      ('mla_index_topk', 1024, 'top-k 512 or 2048'),
      ('quant_policy', QuantPolicy.INT4, 'quant_policy'),
      ('role', EngineRole.Decode, 'disaggregation')])
@@ -212,9 +217,7 @@ def test_validate_rejects_unsupported_dcp_modes(field, value, message):
     from lmdeploy.pytorch.engine.executor import _validate_dcp_config
 
     model, cache, dist, misc = _valid_dcp_validation_inputs()
-    if field == 'model_type':
-        model.hf_config.model_type = value
-    elif field == 'quant_policy':
+    if field == 'quant_policy':
         cache.quant_policy = value
     elif field == 'role':
         cache = replace(cache, role=value)
@@ -222,6 +225,17 @@ def test_validate_rejects_unsupported_dcp_modes(field, value, message):
         setattr(model, field, value)
 
     with pytest.raises(ValueError, match=message):
+        _validate_dcp_config(model, cache, dist, misc, None, 'cuda')
+
+
+def test_validate_rejects_quantized_dense_mla_dcp():
+    from lmdeploy.pytorch.engine.executor import _validate_dcp_config
+
+    model, cache, dist, misc = _valid_dcp_validation_inputs()
+    model.mla_index_topk = None
+    cache.quant_policy = QuantPolicy.FP8
+
+    with pytest.raises(ValueError, match='quant_policy'):
         _validate_dcp_config(model, cache, dist, misc, None, 'cuda')
 
 

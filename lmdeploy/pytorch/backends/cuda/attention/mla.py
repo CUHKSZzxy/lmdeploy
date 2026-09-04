@@ -92,14 +92,13 @@ def build_flash_mla_graph_metadata(step_context, kv_seqlens,
                                    decoding_query_len: int) -> FlashMLAAttentionMetadata:
     """Build legacy graph metadata from the model-level FlashMLA
     configuration."""
+    from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
     from lmdeploy.pytorch.distributed import get_dcp_world_rank
 
     num_attention_heads, _ = step_context.model_config.get_num_qkv_head_by_tp()
     dcp_world_rank = get_dcp_world_rank()
     dcp_world_size, _ = dcp_world_rank
-    if dcp_world_size > 1:
-        from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_seq_lens
-        kv_seqlens = get_dcp_local_seq_lens(kv_seqlens, dcp_world_rank)
+    kv_seqlens = get_dcp_local_seq_lens(kv_seqlens, dcp_world_rank)
     model_config = step_context.model_config
     return _build_flash_mla_metadata(
         kv_seqlens,
@@ -321,6 +320,47 @@ class FlashMLAImpl(TritonAttentionImpl):
             softmax_lse = softmax_lse.flatten(0, 1)
             return attn_output, softmax_lse
         return attn_output
+
+    def _gather_dcp_query(self, query: torch.Tensor) -> torch.Tensor:
+        """Gather TP-sharded query heads within the DCP subgroup."""
+        if self.dcp_world_size == 1:
+            return query
+        from lmdeploy.pytorch.distributed import all_gather_into_tensor
+
+        transposed = query.transpose(0, 1).contiguous()
+        gathered = transposed.new_empty(
+            self.dcp_world_size * transposed.size(0), *transposed.shape[1:])
+        all_gather_into_tensor(gathered, transposed, group='dcp')
+        return gathered.transpose(0, 1).contiguous()
+
+    def _merge_dcp_attention(self, local_output: torch.Tensor,
+                             local_lse: torch.Tensor,
+                             valid_rows: torch.Tensor) -> torch.Tensor:
+        """Merge shard-local normalized attention with LSE correction."""
+        if self.dcp_world_size == 1:
+            return local_output
+        from lmdeploy.pytorch.distributed import all_gather_into_tensor, reduce_scatter_tensor
+        from lmdeploy.pytorch.kernels.cuda.dcp import correct_dcp_attention_output, prepare_dcp_lse
+
+        local_lse = prepare_dcp_lse(local_lse, valid_rows)
+        gathered_lse = local_lse.new_empty(
+            self.dcp_world_size * local_lse.size(0), local_lse.size(1))
+        all_gather_into_tensor(gathered_lse, local_lse, group='dcp')
+        gathered_lse = gathered_lse.view(self.dcp_world_size,
+                                         *local_lse.shape)
+        contribution = correct_dcp_attention_output(
+            local_output, gathered_lse, dcp_rank=self.dcp_rank)
+
+        num_heads = contribution.size(0)
+        # The correction kernel writes [heads, tokens, dim] directly so the
+        # head-sharded reduce-scatter needs no separate transpose/copy.
+        assert num_heads % self.dcp_world_size == 0
+        local_heads = num_heads // self.dcp_world_size
+        reduce_output = contribution.new_empty(local_heads,
+                                               contribution.size(1),
+                                               contribution.size(2))
+        reduce_scatter_tensor(reduce_output, contribution, group='dcp')
+        return reduce_output.transpose(0, 1).to(local_output.dtype)
 
     def _prefill_triton(
         self,
@@ -718,7 +758,16 @@ class FlashMLAImpl(TritonAttentionImpl):
         """
         if nsa_indices is not None:
             raise RuntimeError('Sparse MLA indices require FlashMLASparseImpl.')
-        return self._decoding_paged(query, k_cache, attn_metadata)
+        if self.dcp_world_size == 1:
+            return self._decoding_paged(query, k_cache, attn_metadata)
+
+        query = self._gather_dcp_query(query)
+        local_output, local_lse = self._decoding_paged(
+            query, k_cache, attn_metadata, return_lse=True)
+        return self._merge_dcp_attention(
+            local_output,
+            local_lse,
+            valid_rows=attn_metadata.dcp_local_kv_seqlens > 0)
 
     def _forward_prefill(
         self,

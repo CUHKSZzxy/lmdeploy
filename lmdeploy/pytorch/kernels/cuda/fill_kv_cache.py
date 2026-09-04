@@ -87,10 +87,7 @@ def _fill_kv_cache_kernel(
     kv_seqlen = tl.load(KVSeqLens + batch_id)
     history_seqlen = kv_seqlen - q_seqlen
 
-    if DCP_SIZE == 1:
-        kv_block_id = history_seqlen // BLOCK + block_id
-    else:
-        kv_block_id = history_seqlen // (BLOCK * DCP_SIZE) + block_id
+    kv_block_id = history_seqlen // (BLOCK * DCP_SIZE) + block_id
 
     if kv_seqlen <= 0:
         return
@@ -1115,10 +1112,7 @@ def _fill_kv_cache_blocked_fp8_kernel(
     kv_seqlen = tl.load(KVSeqLens + batch_id)
     history_seqlen = kv_seqlen - q_seqlen
 
-    if DCP_SIZE == 1:
-        kv_block_id = history_seqlen // BLOCK + block_id
-    else:
-        kv_block_id = history_seqlen // (BLOCK * DCP_SIZE) + block_id
+    kv_block_id = history_seqlen // (BLOCK * DCP_SIZE) + block_id
 
     if kv_seqlen <= 0:
         return

@@ -37,20 +37,21 @@ lmdeploy serve api_server Qwen/Qwen3-235B-A22B --tp 8 --cp 2
 
 ## PyTorch decode context parallelism
 
-The PyTorch backend supports decode context parallelism for
-`GlmMoeDsaForCausalLM`. DCP reuses ranks from the attention tensor-parallel
-group and shards each logical MLA and DSA indexer KV sequence over a
-contiguous subgroup. It does not launch additional model ranks.
+The PyTorch backend supports decode context parallelism for FlashMLA-backed
+MLA models. DCP reuses ranks from the attention tensor-parallel group and
+shards each logical MLA KV sequence over a contiguous subgroup. Sparse MLA
+also shards the DSA indexer cache. DCP does not launch additional model
+ranks.
 
 For example, `TP=8,DCP=4` creates the DCP groups `[0,1,2,3]` and
 `[4,5,6,7]`. Inside each group, global token position `p` is stored by rank
 `p % 4` at local position `p // 4`. Each rank scans only its local history.
-The ranks exchange DSA top-k candidates, gather query heads, and merge local
-attention results with their log-sum-exp statistics before reducing and
-scattering the output heads.
+The ranks gather query heads and merge local attention results with their
+log-sum-exp statistics before reducing and scattering the output heads.
+Sparse MLA additionally exchanges DSA top-k candidates.
 
 ```bash
-lmdeploy serve api_server <glm-moe-dsa-model> \
+lmdeploy serve api_server <mla-model> \
     --backend pytorch \
     --tp 4 \
     --dcp 2
@@ -62,7 +63,7 @@ The equivalent Python configuration is:
 from lmdeploy import PytorchEngineConfig, pipeline
 
 pipe = pipeline(
-    '<glm-moe-dsa-model>',
+    '<mla-model>',
     backend_config=PytorchEngineConfig(tp=4, dcp=2),
 )
 ```
@@ -75,26 +76,28 @@ A physical FlashMLA cache page continues to hold 64 local tokens. With
 the logical token capacity grows by approximately `N`.
 
 DCP is decode-oriented: normal prefill attention remains tensor parallel.
-Prefill still inserts MLA and DSA cache entries according to the DCP owner
-rule. When a cached prefix is reused, LMDeploy gathers and de-interleaves one
-bounded context chunk at a time. Each chunk is attended independently, then
-combined with the current-token result using its log-sum-exp statistics. The
-full cached prefix is therefore never materialized on one rank. The same
-partition-and-merge flow is used after DSA switches prefill from dense MLA to
-sparse top-k attention.
+Prefill still inserts MLA cache entries according to the DCP owner rule, as
+well as DSA cache entries for sparse MLA. When a cached prefix is reused,
+LMDeploy gathers and de-interleaves one bounded context chunk at a time. Each
+chunk is attended independently, then combined with the current-token result
+using its log-sum-exp statistics. The full cached prefix is therefore never
+materialized on one rank. The same partition-and-merge flow is used after DSA
+switches prefill from dense MLA to sparse top-k attention.
 
-Both the BF16 MLA cache and the blocked-FP8 MLA cache are supported. CUDA
-graph decode uses fixed-size candidate, sequence-length, LSE, and collective
-shapes from the existing batch buckets.
+The BF16 MLA cache is supported for dense and sparse MLA. The blocked-FP8 MLA
+cache is also supported for sparse MLA. CUDA graph decode uses fixed-size
+sequence-length, LSE, and collective shapes from the existing batch buckets;
+sparse MLA also uses fixed-size candidate shapes.
 
 ### Current restrictions
 
 When `dcp > 1`, the current implementation supports:
 
 - CUDA on NVIDIA Hopper/SM90.
-- `GlmMoeDsaForCausalLM` with sparse FlashMLA and DSA top-k 512 or 2048.
-- Compatible DeepGEMM MQA-logits APIs, the TileLang sparse top-k selector,
-  and FlashMLA support for per-row `topk_length`.
+- FlashMLA-backed dense MLA models, or sparse MLA models with DSA top-k 512
+  or 2048. Model activations must use BF16.
+- Sparse MLA requires compatible DeepGEMM MQA-logits APIs, the TileLang
+  sparse top-k selector, and FlashMLA support for per-row `topk_length`.
 - `tp` is divisible by `dcp`, and `dcp` divides the replicated KV
   head count.
 - `dp=1`, `ep=1`, and the hybrid engine role.
