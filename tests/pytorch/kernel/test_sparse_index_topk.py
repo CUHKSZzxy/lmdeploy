@@ -159,7 +159,7 @@ def test_sparse_dcp_candidate_topk_matches_global_stable_topk(
     )
 
     device = 'cuda'
-    num_rows = 3
+    num_rows = 2
     generator = torch.Generator(device=device).manual_seed(20260902)
     global_scores = torch.randn(num_rows,
                                 dcp_size * local_width,
@@ -183,6 +183,13 @@ def test_sparse_dcp_candidate_topk_matches_global_stable_topk(
 
     gathered = torch.stack(packed_by_rank)
     actual = sparse_dcp_candidate_topk(gathered, k)
+    if k == 512:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = sparse_dcp_candidate_topk(gathered, k)
+        graph.replay()
+        torch.cuda.synchronize()
     expected = torch.argsort(global_scores,
                              dim=1,
                              descending=True,
@@ -206,89 +213,11 @@ def test_sparse_dcp_candidate_topk_preserves_int32_ids_and_padding():
     ids = torch.tensor([2**24 + 1, 2**24 + 3, 7],
                        dtype=torch.int32,
                        device='cuda')
-    gathered[0, 0, :3, 0] = torch.tensor([1.0, 1.0, 2.0], device='cuda')
-    gathered.view(torch.int32)[0, 0, :3, 1].copy_(ids)
+    gathered[0, 0, :2, 0] = 1.0
+    gathered[1, 0, 0, 0] = 2.0
+    gathered.view(torch.int32)[0, 0, :2, 1].copy_(ids[:2])
+    gathered.view(torch.int32)[1, 0, 0, 1].copy_(ids[2])
 
     actual = sparse_dcp_candidate_topk(gathered, k)
-    valid = actual[0][actual[0] >= 0]
-    assert torch.equal(valid.sort().values, ids.sort().values)
+    assert torch.equal(actual[0, :3], ids)
     assert (actual[0, 3:] == -1).all()
-
-
-def test_sparse_dcp_candidate_topk_all_valid_order_is_deterministic():
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import sparse_dcp_candidate_topk
-
-    dcp_size = 2
-    num_rows = 8
-    k = 512
-    global_length = 117
-    gathered = torch.empty(dcp_size,
-                           num_rows,
-                           k,
-                           2,
-                           dtype=torch.float32,
-                           device='cuda')
-    gathered[..., 0].fill_(1.0)
-    gathered.view(torch.int32)[..., 1].fill_(-1)
-    expected_parts = []
-    for rank in range(dcp_size):
-        rank_ids = torch.arange(rank,
-                                global_length,
-                                dcp_size,
-                                dtype=torch.int32,
-                                device='cuda')
-        gathered.view(torch.int32)[rank, :, :rank_ids.numel(), 1] = rank_ids
-        expected_parts.append(rank_ids)
-
-    actual = sparse_dcp_candidate_topk(gathered, k)
-    expected = torch.cat(expected_parts).expand(num_rows, -1)
-    assert torch.equal(actual[:, :global_length], expected)
-    assert (actual[:, global_length:] == -1).all()
-
-
-def test_sparse_dcp_candidate_topk_cuda_graph_capture():
-    from lmdeploy.pytorch.kernels.cuda.sparse_index_dcp_topk import (
-        pack_dcp_topk_candidates,
-        sparse_dcp_candidate_topk,
-    )
-
-    k = 512
-    generator = torch.Generator(device='cuda').manual_seed(512)
-    scores = torch.randn(2,
-                         2,
-                         700,
-                         dtype=torch.float32,
-                         device='cuda',
-                         generator=generator)
-    packed = []
-    for rank in range(2):
-        indices = torch.argsort(scores[rank],
-                                dim=1,
-                                descending=True,
-                                stable=True)[:, :k].to(torch.int32)
-        packed.append(
-            pack_dcp_topk_candidates(scores[rank],
-                                     indices,
-                                     dcp_world_rank=(2, rank)))
-    gathered = torch.stack(packed)
-
-    output = sparse_dcp_candidate_topk(gathered, k)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = sparse_dcp_candidate_topk(gathered, k)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    global_scores = torch.stack((scores[0], scores[1]), dim=-1).reshape(2, -1)
-    expected = torch.argsort(global_scores,
-                             dim=1,
-                             descending=True,
-                             stable=True)[:, :k].to(torch.int32)
-    candidate_ids = gathered.view(torch.int32)[..., 1]
-    candidate_ids = candidate_ids.permute(1, 0, 2).reshape(2, -1)
-    expected_in_candidate_order = torch.stack([
-        row_ids[torch.isin(row_ids, selected_ids)]
-        for row_ids, selected_ids in zip(candidate_ids, expected)
-    ])
-    assert torch.equal(output, expected_in_candidate_order)

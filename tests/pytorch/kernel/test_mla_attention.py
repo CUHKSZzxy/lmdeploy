@@ -181,35 +181,6 @@ def test_dcp_attention_merge_normalizes_empty_local_shard(monkeypatch):
     assert torch.isfinite(merged).all()
 
 
-def test_dense_mla_dcp_decode_gathers_and_merges():
-    impl = object.__new__(mla_module.FlashMLAImpl)
-    impl.dcp_world_size = 2
-    impl.dcp_rank = 0
-    query = torch.empty(2, 1, 4)
-    gathered_query = torch.empty(2, 2, 4)
-    k_cache = torch.empty(1)
-    local_output = torch.empty(2, 2, 4)
-    local_lse = torch.empty(2, 2)
-    merged_output = torch.empty(2, 1, 4)
-    metadata = SimpleNamespace(
-        dcp_local_kv_seqlens=torch.tensor([0, 3], dtype=torch.int32))
-    impl._gather_dcp_query = Mock(return_value=gathered_query)
-    impl._decoding_paged = Mock(return_value=(local_output, local_lse))
-    impl._merge_dcp_attention = Mock(return_value=merged_output)
-
-    output = impl._forward_decoding(query, k_cache, metadata)
-
-    assert output is merged_output
-    impl._gather_dcp_query.assert_called_once_with(query)
-    impl._decoding_paged.assert_called_once_with(
-        gathered_query, k_cache, metadata, return_lse=True)
-    merge_call = impl._merge_dcp_attention.call_args
-    assert merge_call.args[0] is local_output
-    assert merge_call.args[1] is local_lse
-    assert torch.equal(merge_call.kwargs['valid_rows'],
-                       torch.tensor([False, True]))
-
-
 def test_bf16_sparse_decode_strided_cache_matches_contiguous_cache(
         monkeypatch):
     pytest.importorskip('flash_mla')

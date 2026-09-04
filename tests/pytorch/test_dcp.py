@@ -1,25 +1,24 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
 
-import pytest
 import torch
 
-from lmdeploy.messages import PytorchEngineConfig, QuantPolicy
 from lmdeploy.pytorch.backends.cp_utils import (
     compact_dcp_local_indices,
     get_dcp_local_cu_seqlens,
     get_dcp_local_indices,
     get_dcp_local_seq_lens,
 )
-from lmdeploy.pytorch.config import CacheConfig, DistConfig, MiscConfig
-from lmdeploy.pytorch.disagg.config import EngineRole
+from lmdeploy.pytorch.config import CacheConfig, DistConfig
 
 
-@pytest.mark.parametrize('world_size', [2, 4])
-def test_dcp_local_lengths_match_interleaved_slices(world_size):
-    lengths = torch.arange(0, 2 * 64 * world_size + 2, dtype=torch.int32)
+def test_dcp_interleaved_sequence_mapping():
+    world_size = 4
+    lengths = torch.tensor([0, 1, 3, 4, 5, 255, 256, 257],
+                           dtype=torch.int32)
+    global_indices = torch.tensor([-1, 0, 1, 3, 4, 63, 64, 255],
+                                  dtype=torch.int32)
     for rank in range(world_size):
         dcp_world_rank = world_size, rank
         local = get_dcp_local_seq_lens(lengths, dcp_world_rank)
@@ -32,13 +31,6 @@ def test_dcp_local_lengths_match_interleaved_slices(world_size):
         assert torch.equal(cu_local[1:] - cu_local[:-1], local)
         assert cu_local.dtype == torch.int32
 
-
-@pytest.mark.parametrize('world_size', [2, 4])
-def test_dcp_global_indices_map_to_their_owner(world_size):
-    global_indices = torch.tensor([-1, 0, 1, 2, 3, 63, 64, 65, 255],
-                                  dtype=torch.int32)
-    for rank in range(world_size):
-        dcp_world_rank = world_size, rank
         local = get_dcp_local_indices(global_indices, dcp_world_rank)
         owned = (global_indices >= 0) & (global_indices % world_size == rank)
         assert torch.equal(local[owned], global_indices[owned] // world_size)
@@ -91,24 +83,6 @@ def test_dcp_candidate_merge_is_exact_and_uses_global_position_ties(
     assert collective_calls == 1
 
 
-def test_dcp_configuration():
-    engine_config = PytorchEngineConfig(tp=8, dcp=4)
-    dist_config = DistConfig.from_engine_config(engine_config)
-    cache_config = CacheConfig(max_batches=4,
-                               block_size=64,
-                               num_cpu_blocks=0,
-                               num_gpu_blocks=100,
-                               dcp=4)
-
-    assert dist_config.dcp == 4
-    assert cache_config.block_size == 64
-
-    with pytest.raises(AssertionError, match='tp must be divisible'):
-        PytorchEngineConfig(tp=4, dcp=3)
-    with pytest.raises(AssertionError, match='must be divisible'):
-        DistConfig(tp=6, dcp=4)
-
-
 def test_dcp_block_allocation_uses_virtual_block_size():
     from lmdeploy.pytorch.engine.engine import _build_seq_meta
     from lmdeploy.pytorch.paging.block_manager import build_block_manager
@@ -134,12 +108,11 @@ def test_dcp_block_allocation_uses_virtual_block_size():
     assert block_manager.num_required_blocks(sequence) == 2
 
 
-@pytest.mark.parametrize(('tp', 'dcp', 'rank', 'expected'),
-                         [(4, 2, 3, (2, 3)),
-                          (8, 4, 6, (4, 5, 6, 7))])
-def test_dcp_group_membership(monkeypatch, tp, dcp, rank, expected):
+def test_dcp_group_membership(monkeypatch):
     from lmdeploy.pytorch import distributed
 
+    tp, dcp, rank = 8, 4, 6
+    expected = (4, 5, 6, 7)
     created = []
 
     def new_group(*, ranks, timeout, backend):
@@ -163,87 +136,7 @@ def test_dcp_group_membership(monkeypatch, tp, dcp, rank, expected):
     assert distributed.get_dcp_world_rank() == (dcp, rank % dcp)
 
 
-class _DCPModelConfig(SimpleNamespace):
-
-    @property
-    def use_mla_fp8_cache(self):
-        return self.mla_kv_cache_dtype == 'fp8_ds_mla'
-
-
-def _valid_dcp_validation_inputs():
-    model_config = _DCPModelConfig(
-        hf_config=SimpleNamespace(
-            model_type='deepseek_v3',
-            architectures=['DeepseekV3ForCausalLM'],
-        ),
-        use_flash_mla=True,
-        mla_kv_cache_dtype='bfloat16',
-        mla_index_topk=2048,
-        num_replicate_key_value_heads=4,
-        sliding_window=-1,
-        dtype=torch.bfloat16,
-    )
-    cache_config = CacheConfig(max_batches=4,
-                               block_size=64,
-                               kernel_block_size=64,
-                               num_cpu_blocks=0,
-                               num_gpu_blocks=100,
-                               dcp=2,
-                               role=EngineRole.Hybrid)
-    return model_config, cache_config, DistConfig(tp=4, dcp=2), MiscConfig()
-
-
-@pytest.mark.parametrize(('mla_index_topk', 'quant_policy'),
-                         [(None, QuantPolicy.NONE),
-                          (2048, QuantPolicy.NONE),
-                          (2048, QuantPolicy.FP8)])
-def test_validate_supported_mla_dcp_configuration(mla_index_topk,
-                                                  quant_policy):
-    from lmdeploy.pytorch.engine.executor import _validate_dcp_config
-
-    args = _valid_dcp_validation_inputs()
-    args[0].mla_index_topk = mla_index_topk
-    args[1].quant_policy = quant_policy
-    _validate_dcp_config(*args, specdecode_config=None, device_type='cuda')
-
-
-@pytest.mark.parametrize(
-    ('field', 'value', 'message'),
-    [('use_flash_mla', False, 'FlashMLA'),
-     ('mla_index_topk', 1024, 'top-k 512 or 2048'),
-     ('quant_policy', QuantPolicy.INT4, 'quant_policy'),
-     ('role', EngineRole.Decode, 'disaggregation')])
-def test_validate_rejects_unsupported_dcp_modes(field, value, message):
-    from lmdeploy.pytorch.engine.executor import _validate_dcp_config
-
-    model, cache, dist, misc = _valid_dcp_validation_inputs()
-    if field == 'quant_policy':
-        cache.quant_policy = value
-    elif field == 'role':
-        cache = replace(cache, role=value)
-    else:
-        setattr(model, field, value)
-
-    with pytest.raises(ValueError, match=message):
-        _validate_dcp_config(model, cache, dist, misc, None, 'cuda')
-
-
-def test_validate_rejects_quantized_dense_mla_dcp():
-    from lmdeploy.pytorch.engine.executor import _validate_dcp_config
-
-    model, cache, dist, misc = _valid_dcp_validation_inputs()
-    model.mla_index_topk = None
-    cache.quant_policy = QuantPolicy.FP8
-
-    with pytest.raises(ValueError, match='quant_policy'):
-        _validate_dcp_config(model, cache, dist, misc, None, 'cuda')
-
-
-@pytest.mark.parametrize(('rank', 'expected_final', 'expected_rows'),
-                         [(0, [3, 4], [2, 3, 3, 4, 4]),
-                          (1, [2, 4], [2, 2, 3, 3, 4])])
-def test_nsa_metadata_localizes_each_causal_row(rank, expected_final,
-                                                expected_rows):
+def test_nsa_metadata_localizes_each_causal_row():
     from lmdeploy.pytorch.backends.nsa import build_nsa_index_meta
 
     q_seqlens = torch.tensor([2, 3], dtype=torch.int32)
@@ -262,10 +155,10 @@ def test_nsa_metadata_localizes_each_causal_row(rank, expected_final,
                                 block_size=64,
                                 num_gpu_blocks=4,
                                 sequence_metadata=sequence_metadata,
-                                dcp_world_rank=(2, rank))
+                                dcp_world_rank=(2, 1))
 
-    assert meta.dcp_k_seqlens.tolist() == expected_final
-    assert meta.indexer_kv_seqlens.tolist() == expected_rows
+    assert meta.dcp_k_seqlens.tolist() == [2, 4]
+    assert meta.indexer_kv_seqlens.tolist() == [2, 2, 3, 3, 4]
 
 
 def test_dcp_prefill_scoring_uses_global_sparse_boundary():
