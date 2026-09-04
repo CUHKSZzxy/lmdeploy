@@ -12,13 +12,20 @@ def _prepare_dcp_lse_kernel(
     ValidRows,
     Out,
     numel,
+    stride_lr,
+    stride_lh,
     num_heads: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # ``offsets`` indexes the dense output, while ``Lse`` may be a view whose
+    # physical row width is larger than ``num_heads``. Recover the logical
+    # [row, head] coordinates and address the input with its actual strides.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < numel
     rows = offsets // num_heads
-    lse = tl.load(Lse + offsets, mask=mask).to(tl.float32)
+    heads = offsets % num_heads
+    lse = tl.load(Lse + rows * stride_lr + heads * stride_lh,
+                  mask=mask).to(tl.float32)
     valid = tl.load(ValidRows + rows, mask=mask, other=0)
     invalid_lse = (lse != lse) | (lse == float('inf'))
     lse = tl.where(valid & ~invalid_lse, lse, -float('inf'))
@@ -214,11 +221,18 @@ def prepare_dcp_lse(local_lse: torch.Tensor,
                          device=local_lse.device)
     numel = local_lse.numel()
     block = 256
+    # FlashMLA may pad the gathered query heads for kernel alignment and slice
+    # its LSE result back to the original head count. The sliced tensor then
+    # has the expected [tokens, heads] shape but retains the padded row stride.
+    # Pass both input strides so this normalization kernel can also compact the
+    # LSE for all-gather without an extra ``contiguous()`` copy.
     _prepare_dcp_lse_kernel[(triton.cdiv(numel, block), )](
         local_lse,
         valid_rows,
         output,
         numel,
+        local_lse.stride(0),
+        local_lse.stride(1),
         num_heads=local_lse.size(1),
         BLOCK=block,
     )

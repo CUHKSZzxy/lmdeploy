@@ -425,12 +425,15 @@ def test_dcp_attention_correction_kernel_matches_torch():
                                dtype=torch.bfloat16,
                                device='cuda',
                                generator=generator)
+    # Model FlashMLA's head-padding result: slicing restores the logical head
+    # count but leaves a larger physical row stride.
     all_lse = torch.randn(4,
                           5,
-                          8,
+                          16,
                           dtype=torch.float32,
                           device='cuda',
-                          generator=generator)
+                          generator=generator)[..., :8]
+    assert not all_lse.is_contiguous()
     all_lse[0, 0] = torch.nan
     all_lse[:, 1] = -torch.inf
     valid_rows = torch.tensor([False, True, True, True, True], device='cuda')
