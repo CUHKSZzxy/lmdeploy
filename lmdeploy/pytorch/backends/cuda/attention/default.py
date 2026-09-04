@@ -37,6 +37,7 @@ class TritonAttentionMetadata(AttentionMetadata):
         scheduler_metadata: Scheduler metadata for FA3.
         max_kv_seqlen: Maximum KV sequence length in the batch.
         max_q_seqlen: Maximum query sequence length in the batch.
+        dcp_local_kv_seqlens: Rank-local KV sequence lengths under DCP.
     """
     is_decoding: bool
     block_offsets: torch.Tensor
@@ -55,7 +56,7 @@ class TritonAttentionMetadata(AttentionMetadata):
     scheduler_metadata: torch.Tensor = None
     max_kv_seqlen: int = None
     max_q_seqlen: int = None
-    dcp_kv_seqlens: torch.Tensor = None
+    dcp_local_kv_seqlens: torch.Tensor = None
     kernel_metadata: tuple[Any, ...] = ()
 
 
@@ -68,9 +69,9 @@ def build_triton_attention_metadata(attn_meta_cls, step_context,
     dcp_world_rank = get_dcp_world_rank()
     dcp_world_size, _ = dcp_world_rank
     if dcp_world_size == 1:
-        dcp_kv_seqlens = sequence_metadata.kv_seqlens
+        dcp_local_kv_seqlens = sequence_metadata.kv_seqlens
     else:
-        dcp_kv_seqlens = get_dcp_local_seq_lens(
+        dcp_local_kv_seqlens = get_dcp_local_seq_lens(
             sequence_metadata.kv_seqlens, dcp_world_rank)
 
     return attn_meta_cls(
@@ -85,7 +86,7 @@ def build_triton_attention_metadata(attn_meta_cls, step_context,
         cu_seqlens_q=sequence_metadata.cu_seqlens_q,
         cu_seqlens_k=sequence_metadata.cu_seqlens_k,
         max_kv_seqlen=sequence_metadata.max_kv_seqlen,
-        dcp_kv_seqlens=dcp_kv_seqlens,
+        dcp_local_kv_seqlens=dcp_local_kv_seqlens,
     )
 
 

@@ -314,7 +314,7 @@ def test_cudagraph_replay_refreshes_stable_dcp_lengths(monkeypatch):
                                  position_ids, [],
                                  metadata,
                                  inputs_embeds=None)
-    local_buffer = graph_meta.input_buffers['dcp_kv_seqlens']
+    local_buffer = graph_meta.input_buffers['dcp_local_kv_seqlens']
     buffer_ptr = local_buffer.data_ptr()
     assert local_buffer.tolist() == [2, 4, 0, 0]
 
@@ -327,5 +327,5 @@ def test_cudagraph_replay_refreshes_stable_dcp_lengths(monkeypatch):
                                  position_ids, [],
                                  metadata,
                                  inputs_embeds=None)
-    assert metadata.dcp_kv_seqlens.data_ptr() == buffer_ptr
-    assert metadata.dcp_kv_seqlens.tolist() == [3, 4, 0, 0]
+    assert metadata.dcp_local_kv_seqlens.data_ptr() == buffer_ptr
+    assert metadata.dcp_local_kv_seqlens.tolist() == [3, 4, 0, 0]

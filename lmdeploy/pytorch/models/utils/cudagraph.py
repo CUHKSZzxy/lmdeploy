@@ -130,7 +130,7 @@ class CudaGraphMixin:
         dcp_world_rank = get_dcp_world_rank()
         dcp_world_size, _ = dcp_world_rank
         if dcp_world_size > 1:
-            input_buffers['dcp_kv_seqlens'] = torch.zeros(
+            input_buffers['dcp_local_kv_seqlens'] = torch.zeros(
                 max_batches, dtype=torch.int32, device=device)
 
         if graph_meta.step_meta_plan is not None:
@@ -230,12 +230,12 @@ class CudaGraphMixin:
             from lmdeploy.pytorch.backends.cp_utils import fill_dcp_local_seq_lens
             fill_dcp_local_seq_lens(
                 input_buffers['kv_seqlens'],
-                input_buffers['dcp_kv_seqlens'],
+                input_buffers['dcp_local_kv_seqlens'],
                 dcp_world_rank,
             )
-            attn_metadata.dcp_kv_seqlens = input_buffers['dcp_kv_seqlens']
+            attn_metadata.dcp_local_kv_seqlens = input_buffers['dcp_local_kv_seqlens']
         else:
-            attn_metadata.dcp_kv_seqlens = input_buffers['kv_seqlens']
+            attn_metadata.dcp_local_kv_seqlens = input_buffers['kv_seqlens']
 
         if graph_meta.step_meta_plan is not None:
             step_ctx = get_step_ctx_manager().current_context()

@@ -76,6 +76,69 @@ def _correct_dcp_attention_output_kernel(
 
 
 @triton.jit
+def _merge_attention_states_kernel(
+    PrefixOutput,
+    PrefixLse,
+    SuffixOutput,
+    SuffixLse,
+    Output,
+    OutputLse,
+    stride_pob,
+    stride_poh,
+    stride_pod,
+    stride_plb,
+    stride_plh,
+    stride_sob,
+    stride_soh,
+    stride_sod,
+    stride_slb,
+    stride_slh,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    stride_olb,
+    stride_olh,
+    head_dim: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    prefix_lse = tl.load(PrefixLse + row * stride_plb +
+                         head * stride_plh).to(tl.float32)
+    suffix_lse = tl.load(SuffixLse + row * stride_slb +
+                         head * stride_slh).to(tl.float32)
+    prefix_lse = tl.where((prefix_lse == prefix_lse)
+                          & (prefix_lse != float('inf')), prefix_lse,
+                          -float('inf'))
+    suffix_lse = tl.where((suffix_lse == suffix_lse)
+                          & (suffix_lse != float('inf')), suffix_lse,
+                          -float('inf'))
+    max_lse = tl.maximum(prefix_lse, suffix_lse)
+    valid = max_lse != -float('inf')
+    safe_max = tl.where(valid, max_lse, 0.0)
+    prefix_exp = tl.exp(prefix_lse - safe_max)
+    suffix_exp = tl.exp(suffix_lse - safe_max)
+    denominator = prefix_exp + suffix_exp
+    prefix_scale = tl.where(valid, prefix_exp / denominator, 0.0)
+    suffix_scale = tl.where(valid, suffix_exp / denominator, 0.0)
+
+    dims = tl.arange(0, BLOCK_D)
+    mask = dims < head_dim
+    prefix_offset = (row * stride_pob + head * stride_poh +
+                     dims * stride_pod)
+    suffix_offset = (row * stride_sob + head * stride_soh +
+                     dims * stride_sod)
+    output_offset = row * stride_ob + head * stride_oh + dims * stride_od
+    prefix = tl.load(PrefixOutput + prefix_offset, mask=mask, other=0.0)
+    suffix = tl.load(SuffixOutput + suffix_offset, mask=mask, other=0.0)
+    merged = prefix * prefix_scale + suffix * suffix_scale
+    tl.store(Output + output_offset, merged, mask=mask)
+    tl.store(OutputLse + row * stride_olb + head * stride_olh,
+             tl.where(valid, tl.log(denominator) + safe_max,
+                      -float('inf')))
+
+
+@triton.jit
 def _scatter_dcp_prefill_kv_kernel(
     Gathered,
     Output,
@@ -106,7 +169,7 @@ def _scatter_dcp_prefill_kv_kernel(
     found = False
     while request < num_sequences:
         request_len = tl.load(LocalLens + rank * stride_lr +
-                              request * stride_ls)
+                              request * stride_ls).to(tl.int32)
         owns_position = ((local_position >= request_start)
                          & (local_position < request_start + request_len))
         request_id = tl.where(owns_position, request, request_id)
@@ -210,6 +273,47 @@ def correct_dcp_attention_output(local_output: torch.Tensor,
         num_warps=4,
     )
     return corrected
+
+
+def merge_attention_states(
+        prefix_output: torch.Tensor, prefix_lse: torch.Tensor,
+        suffix_output: torch.Tensor,
+        suffix_lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge two independently normalized attention results."""
+    assert prefix_output.shape == suffix_output.shape
+    assert prefix_lse.shape == suffix_lse.shape == prefix_output.shape[:2]
+    if not prefix_output.is_cuda:
+        lse = torch.stack([prefix_lse.float(), suffix_lse.float()])
+        lse = torch.where(torch.isfinite(lse), lse,
+                          torch.full_like(lse, -torch.inf))
+        merged_lse = torch.logsumexp(lse, dim=0)
+        weights = torch.exp(lse - merged_lse)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        output = (prefix_output.float() * weights[0, ..., None] +
+                  suffix_output.float() * weights[1, ..., None])
+        return output.to(prefix_output.dtype), merged_lse
+
+    output = torch.empty_like(prefix_output)
+    output_lse = torch.empty_like(prefix_lse, dtype=torch.float32)
+    block_d = triton.next_power_of_2(prefix_output.size(2))
+    _merge_attention_states_kernel[prefix_output.shape[:2]](
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        output,
+        output_lse,
+        *prefix_output.stride(),
+        *prefix_lse.stride(),
+        *suffix_output.stride(),
+        *suffix_lse.stride(),
+        *output.stride(),
+        *output_lse.stride(),
+        head_dim=prefix_output.size(2),
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return output, output_lse
 
 
 def scatter_dcp_prefill_kv(gathered: torch.Tensor, output: torch.Tensor, *,

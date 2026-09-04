@@ -288,7 +288,7 @@ class DSAIndexerMetaBuilder(
                 device=graph_meta.device,
             )
         if graph_meta.decode_query_len == 1:
-            indexer_kv_seqlens = input_buffers.get('dcp_kv_seqlens',
+            indexer_kv_seqlens = input_buffers.get('dcp_local_kv_seqlens',
                                                    input_buffers['kv_seqlens'])
         else:
             indexer_kv_seqlens = torch.empty(

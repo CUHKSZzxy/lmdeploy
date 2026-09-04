@@ -14,10 +14,6 @@ from .default import TritonAttentionImpl, TritonAttentionMetadata
 
 logger = get_logger('lmdeploy')
 
-# Bound the transient all-gather buffer; the reconstructed KV itself is the
-# minimum workspace required by cached prefill attention.
-_DCP_PREFILL_GATHER_MAX_BYTES = 64 << 20
-
 
 @dataclass
 class FlashMLAAttentionMetadata:
@@ -79,7 +75,7 @@ def update_flash_mla_metadata(attn_metadata,
     """Populate the legacy single-group FlashMLA metadata fields."""
     from lmdeploy.pytorch.distributed import get_dcp_world_rank
     dcp_world_size, _ = get_dcp_world_rank()
-    kv_seqlens = (attn_metadata.dcp_kv_seqlens
+    kv_seqlens = (attn_metadata.dcp_local_kv_seqlens
                   if dcp_world_size > 1 else attn_metadata.kv_seqlens)
     metadata = _build_flash_mla_metadata(
         kv_seqlens,
@@ -174,7 +170,7 @@ class FlashMLAAttentionMetaBuilder(
             return buffer
 
         metadata = _build_flash_mla_metadata(
-            input_buffers.get('dcp_kv_seqlens', input_buffers['kv_seqlens']),
+            input_buffers.get('dcp_local_kv_seqlens', input_buffers['kv_seqlens']),
             num_attention_heads=self.num_attention_heads * dcp_world_size,
             decoding_query_len=graph_meta.decode_query_len,
             is_fp8_kvcache=step_context.model_config.use_mla_fp8_cache,
@@ -286,7 +282,7 @@ class FlashMLAImpl(TritonAttentionImpl):
         """Run paged FlashMLA decode with optional provider-ready indices."""
         if causal is None:
             causal = self.causal
-        kv_seqlens = (attn_metadata.dcp_kv_seqlens
+        kv_seqlens = (attn_metadata.dcp_local_kv_seqlens
                       if self.dcp_world_size > 1 else attn_metadata.kv_seqlens)
         block_offsets = attn_metadata.block_offsets
         is_fp8_kvcache = k_cache.dtype == torch.float8_e4m3fn
@@ -465,120 +461,157 @@ class FlashMLAImpl(TritonAttentionImpl):
 
         return flatten_k, flatten_v
 
-    def _flatten_dcp_prefill_kv_cache(
+    def _gather_dcp_prefill_context_chunk(
         self,
-        current_key: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
+        prefix_lens: torch.Tensor,
+        chunk_start: int,
+        chunk_size: int,
         out_dtype: torch.dtype,
-        kv_layout: str,
         k_scales_zeros: torch.Tensor = None,
         v_scales_zeros: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reconstruct global cached prefixes with bounded gather storage."""
-        if self.dcp_world_size == 1:
-            return self._flatten_prefill_kv_cache(
-                k_cache,
-                v_cache,
-                attn_metadata,
-                out_dtype=out_dtype,
-                kv_layout=kv_layout,
-                k_scales_zeros=k_scales_zeros,
-                v_scales_zeros=v_scales_zeros,
-            )
-
+        """Gather one globally ordered cached-prefix chunk."""
         from lmdeploy.pytorch.backends.cp_utils import get_dcp_local_cu_seqlens
         from lmdeploy.pytorch.distributed import all_gather_into_tensor
         from lmdeploy.pytorch.kernels.cuda.dcp import scatter_dcp_prefill_kv
 
         dcp_world_rank = self.dcp_world_size, self.dcp_rank
         dcp_world_size = self.dcp_world_size
+        block_size = k_cache.size(1)
+        virtual_block_size = block_size * dcp_world_size
+        assert chunk_start % virtual_block_size == 0
+        assert chunk_size % virtual_block_size == 0
+
+        chunk_lens = torch.clamp(prefix_lens - chunk_start,
+                                 min=0,
+                                 max=chunk_size)
+        local_lens, local_cu_lens = get_dcp_local_cu_seqlens(
+            chunk_lens, dcp_world_rank)
+        local_capacity = chunk_lens.numel() * chunk_size // dcp_world_size
+        block_start = chunk_start // virtual_block_size
+        num_blocks = chunk_size // virtual_block_size
+        local_meta = replace(
+            attn_metadata,
+            block_offsets=attn_metadata.block_offsets[:, block_start:
+                                                       block_start + num_blocks],
+            kv_start_loc=local_cu_lens[:-1].to(prefix_lens.dtype),
+            kv_seqlens=local_lens,
+            cu_seqlens_k=local_cu_lens,
+            kv_flatten_size=local_capacity,
+            max_kv_seqlen=chunk_size // dcp_world_size,
+        )
+        local_k, _ = self._flatten_prefill_kv_cache(
+            k_cache,
+            v_cache,
+            local_meta,
+            out_dtype=out_dtype,
+            kv_layout='shd',
+            k_scales_zeros=k_scales_zeros,
+            v_scales_zeros=v_scales_zeros,
+        )
+        gathered = local_k.new_empty(dcp_world_size * local_capacity,
+                                     *local_k.shape[1:])
+        all_gather_into_tensor(gathered, local_k, group='dcp')
+
+        ranks = torch.arange(dcp_world_size,
+                             device=prefix_lens.device,
+                             dtype=prefix_lens.dtype)[:, None]
+        local_lens_by_rank = torch.clamp(torch.div(
+            chunk_lens[None, :] + dcp_world_size - 1 - ranks,
+            dcp_world_size,
+            rounding_mode='floor'),
+                                         min=0)
+        chunk_cu_lens = torch.nn.functional.pad(
+            chunk_lens.cumsum(0, dtype=torch.int32), (1, 0))
+        context_k = local_k.new_empty(chunk_lens.numel() * chunk_size,
+                                     *local_k.shape[1:])
+        scatter_dcp_prefill_kv(
+            gathered,
+            context_k,
+            prefix_lens=chunk_lens,
+            kv_start_loc=chunk_cu_lens[:-1],
+            local_lens=local_lens_by_rank,
+            chunk_start=0,
+        )
+        return context_k, chunk_cu_lens
+
+    def _prefill_dcp_context(
+        self,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Attend to current tokens and bounded cached-prefix chunks."""
+        from lmdeploy.pytorch.kernels.cuda.dcp import merge_attention_states
+
+        q_cu_lens = attn_metadata.cu_seqlens_q
+        max_q_seqlen = self._get_max_q_seqlen(query, attn_metadata)
+        current_v = current_key[..., :self.v_head_size]
+        output, output_lse = self.flash_attention_fwd(
+            query,
+            current_key,
+            current_v,
+            cu_seqlens_q=q_cu_lens,
+            cu_seqlens_k=q_cu_lens,
+            max_seqlen_q=max_q_seqlen,
+            max_seqlen_k=max_q_seqlen,
+            softmax_scale=self.scale,
+            causal=self.causal,
+            kv_layout='shd',
+            return_lse=True,
+        )
+
         prefix_lens = attn_metadata.kv_seqlens - attn_metadata.q_seqlens
         prefix_total = attn_metadata.kv_flatten_size - current_key.size(0)
-        if prefix_total == 0:
-            flatten_k = current_key
-        else:
-            local_lens, local_cu_lens = get_dcp_local_cu_seqlens(
-                prefix_lens, dcp_world_rank)
-            # Sum(ceil(prefix_i / dcp)) is bounded by this value on every
-            # rank. Using the common bound keeps collective shapes identical
-            # without synchronizing device lengths back to the host.
-            num_sequences = prefix_lens.numel()
-            max_local_total = (prefix_total + num_sequences *
-                               (dcp_world_size - 1)) // dcp_world_size
-            local_meta = replace(
-                attn_metadata,
-                kv_start_loc=local_cu_lens[:-1].to(prefix_lens.dtype),
-                kv_seqlens=local_lens,
-                cu_seqlens_k=local_cu_lens,
-                kv_flatten_size=max_local_total,
-                max_kv_seqlen=(attn_metadata.max_kv_seqlen + dcp_world_size -
-                               1) // dcp_world_size,
-            )
-            local_prefix, _ = self._flatten_prefill_kv_cache(
+        batch_size = prefix_lens.numel()
+        chunk_size = self._get_dcp_prefill_chunk_size(
+            current_key.size(0), batch_size, k_cache.size(1))
+        max_prefix_len = min(prefix_total,
+                             max(0, attn_metadata.max_kv_seqlen - 1))
+        for chunk_start in range(0, max_prefix_len, chunk_size):
+            context_k, context_cu_lens = self._gather_dcp_prefill_context_chunk(
                 k_cache,
                 v_cache,
-                local_meta,
-                out_dtype=out_dtype,
-                kv_layout='shd',
+                attn_metadata,
+                prefix_lens,
+                chunk_start,
+                chunk_size,
+                out_dtype=query.dtype,
                 k_scales_zeros=k_scales_zeros,
                 v_scales_zeros=v_scales_zeros,
             )
-            assert local_prefix.is_contiguous()
-            ranks = torch.arange(dcp_world_size,
-                                 device=prefix_lens.device,
-                                 dtype=prefix_lens.dtype)[:, None]
-            local_lens_by_rank = torch.clamp(torch.div(
-                prefix_lens[None, :] + dcp_world_size - 1 - ranks,
-                dcp_world_size,
-                rounding_mode='floor'),
-                                             min=0)
-
-            flatten_k = current_key.new_empty(attn_metadata.kv_flatten_size,
-                                              *current_key.shape[1:])
-            current_offsets = torch.repeat_interleave(
-                attn_metadata.kv_start_loc + prefix_lens -
-                attn_metadata.q_start_loc,
-                attn_metadata.q_seqlens,
-                output_size=current_key.size(0),
+            context_output, context_lse = self.flash_attention_fwd(
+                query,
+                context_k,
+                context_k[..., :self.v_head_size],
+                cu_seqlens_q=q_cu_lens,
+                cu_seqlens_k=context_cu_lens,
+                max_seqlen_q=max_q_seqlen,
+                max_seqlen_k=chunk_size,
+                softmax_scale=self.scale,
+                causal=False,
+                kv_layout='shd',
+                return_lse=True,
             )
-            current_destinations = torch.arange(
-                current_key.size(0),
-                device=current_key.device,
-                dtype=current_offsets.dtype) + current_offsets
-            flatten_k.index_copy_(0, current_destinations.long(), current_key)
+            output, output_lse = merge_attention_states(
+                output, output_lse, context_output, context_lse)
+        return output
 
-            row_bytes = local_prefix[0].numel() * local_prefix.element_size()
-            chunk_rows = max(
-                1,
-                _DCP_PREFILL_GATHER_MAX_BYTES // (dcp_world_size * row_bytes))
-            chunk_rows = min(chunk_rows, max_local_total)
-            gathered_workspace = local_prefix.new_empty(
-                dcp_world_size * chunk_rows, *local_prefix.shape[1:])
-            for chunk_start in range(0, max_local_total, chunk_rows):
-                current_rows = min(chunk_rows, max_local_total - chunk_start)
-                local_chunk = local_prefix[chunk_start:chunk_start +
-                                           current_rows]
-                gathered_chunk = gathered_workspace[:dcp_world_size *
-                                                    current_rows]
-                all_gather_into_tensor(gathered_chunk,
-                                       local_chunk,
-                                       group='dcp')
-                scatter_dcp_prefill_kv(
-                    gathered_chunk,
-                    flatten_k,
-                    prefix_lens=prefix_lens,
-                    kv_start_loc=attn_metadata.kv_start_loc,
-                    local_lens=local_lens_by_rank,
-                    chunk_start=chunk_start,
-                )
-
-        flatten_v = flatten_k[..., :self.v_head_size]
-        if kv_layout == 'hsd':
-            flatten_k = flatten_k.transpose(0, 1).contiguous()
-            flatten_v = flatten_v.transpose(0, 1).contiguous()
-        return flatten_k, flatten_v
+    def _get_dcp_prefill_chunk_size(self, num_query_tokens: int,
+                                    batch_size: int,
+                                    block_size: int) -> int:
+        """Size context chunks from the current prefill token budget."""
+        virtual_block_size = block_size * self.dcp_world_size
+        average_q = max(1, num_query_tokens // batch_size)
+        return max(virtual_block_size,
+                   average_q // virtual_block_size * virtual_block_size)
 
     def _get_max_q_seqlen(
         self,
@@ -715,17 +748,35 @@ class FlashMLAImpl(TritonAttentionImpl):
         if nsa_indices is not None:
             raise RuntimeError('Sparse MLA indices require FlashMLASparseImpl.')
 
-        kv_layout = 'shd' if self.use_fa3 else 'hsd'
-        flatten_k, flatten_v = self._flatten_dcp_prefill_kv_cache(
-            current_key,
-            k_cache,
-            v_cache,
-            attn_metadata,
-            out_dtype=query.dtype,
-            kv_layout=kv_layout,
-            k_scales_zeros=k_scales_zeros,
-            v_scales_zeros=v_scales_zeros,
-        )
+        prefix_total = attn_metadata.kv_flatten_size - current_key.size(0)
+        if self.dcp_world_size > 1 and prefix_total > 0:
+            return self._prefill_dcp_context(
+                query,
+                current_key,
+                k_cache,
+                v_cache,
+                attn_metadata,
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+            )
+
+        if self.dcp_world_size > 1:
+            flatten_k = current_key
+            flatten_v = current_key[..., :self.v_head_size]
+            if not self.use_fa3:
+                flatten_k = flatten_k.transpose(0, 1).contiguous()
+                flatten_v = flatten_v.transpose(0, 1).contiguous()
+        else:
+            kv_layout = 'shd' if self.use_fa3 else 'hsd'
+            flatten_k, flatten_v = self._flatten_prefill_kv_cache(
+                k_cache,
+                v_cache,
+                attn_metadata,
+                out_dtype=query.dtype,
+                kv_layout=kv_layout,
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+            )
 
         if self.use_fa3:
             return self._prefill_fa3(query, flatten_k, attn_metadata)

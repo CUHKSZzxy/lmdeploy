@@ -56,9 +56,13 @@ def compact_dcp_local_indices(
         dcp_world_rank: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor]:
     """Filter global winners to this rank and compact valid local ids."""
     local_indices = get_dcp_local_indices(indices, dcp_world_rank)
-    valid = local_indices >= 0
+    return compact_valid_indices(local_indices)
+
+
+def compact_valid_indices(
+        indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Move valid indices before ``-1`` padding, preserving their order."""
+    valid = indices >= 0
     valid_counts = valid.sum(dim=-1, dtype=torch.int32)
-    # Stable partition keeps the global selector's order while moving invalid
-    # slots behind all local winners. Shapes remain fixed for CUDA graphs.
     order = torch.argsort((~valid).to(torch.int32), dim=-1, stable=True)
-    return local_indices.gather(-1, order), valid_counts
+    return indices.gather(-1, order), valid_counts

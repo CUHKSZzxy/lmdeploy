@@ -76,8 +76,12 @@ the logical token capacity grows by approximately `N`.
 
 DCP is decode-oriented: normal prefill attention remains tensor parallel.
 Prefill still inserts MLA and DSA cache entries according to the DCP owner
-rule. When a cached prefix is reused, LMDeploy gathers and de-interleaves the
-rank-local prefix records before running the existing prefill attention path.
+rule. When a cached prefix is reused, LMDeploy gathers and de-interleaves one
+bounded context chunk at a time. Each chunk is attended independently, then
+combined with the current-token result using its log-sum-exp statistics. The
+full cached prefix is therefore never materialized on one rank. The same
+partition-and-merge flow is used after DSA switches prefill from dense MLA to
+sparse top-k attention.
 
 Both the BF16 MLA cache and the blocked-FP8 MLA cache are supported. CUDA
 graph decode uses fixed-size candidate, sequence-length, LSE, and collective

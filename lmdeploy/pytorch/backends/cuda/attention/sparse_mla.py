@@ -159,12 +159,112 @@ class FlashMLASparseImpl(FlashMLAImpl):
 
     def _prefill_sparse(self, query: torch.Tensor, flatten_k: torch.Tensor,
                         nsa_indices: torch.Tensor,
-                        attn_metadata: TritonAttentionMetadata) -> torch.Tensor:
+                        attn_metadata: TritonAttentionMetadata,
+                        return_lse: bool = False
+                        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run sparse prefill over flattened BF16 KV."""
         indices = self.index_mapper.map_flat_prefill(nsa_indices,
                                                      attn_metadata.q_seqlens,
                                                      attn_metadata.cu_seqlens_k)
-        return self._flash_mla_sparse_forward(query, flatten_k, indices)
+        return self._flash_mla_sparse_forward(query,
+                                              flatten_k,
+                                              indices,
+                                              return_lse=return_lse)
+
+    def _map_dcp_prefill_partition(
+            self, nsa_indices: torch.Tensor,
+            attn_metadata: TritonAttentionMetadata,
+            partition_starts: torch.Tensor,
+            partition_cu_lens: torch.Tensor) -> torch.Tensor:
+        """Map request-local global indices into one flattened partition."""
+        num_tokens = nsa_indices.size(0)
+        request_ids = torch.repeat_interleave(
+            torch.arange(attn_metadata.q_seqlens.numel(),
+                         device=nsa_indices.device,
+                         dtype=attn_metadata.q_start_loc.dtype),
+            attn_metadata.q_seqlens,
+            output_size=num_tokens)
+        starts = partition_starts[request_ids]
+        ends = starts + (partition_cu_lens[1:] -
+                         partition_cu_lens[:-1])[request_ids]
+        valid = (nsa_indices >= starts[:, None]) & (nsa_indices < ends[:, None])
+        mapped = (nsa_indices - starts[:, None] +
+                  partition_cu_lens[:-1][request_ids, None])
+        return torch.where(valid, mapped, -1).to(torch.int32)[:, None]
+
+    def _prefill_sparse_partition(
+            self, query: torch.Tensor, flatten_k: torch.Tensor,
+            indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one sparse partition and neutralize rows without selected KV."""
+        from lmdeploy.pytorch.backends.cp_utils import compact_valid_indices
+
+        indices, valid_counts = compact_valid_indices(indices)
+        valid_counts = valid_counts.flatten()
+        output, lse = self._flash_mla_sparse_forward(query,
+                                                     flatten_k,
+                                                     indices,
+                                                     return_lse=True,
+                                                     topk_length=valid_counts)
+        valid_rows = valid_counts > 0
+        output.masked_fill_(~valid_rows[:, None, None], 0)
+        lse = torch.where(valid_rows[:, None] & torch.isfinite(lse), lse,
+                          torch.full_like(lse, -torch.inf)).contiguous()
+        return output, lse
+
+    def _prefill_sparse_dcp(
+        self,
+        query: torch.Tensor,
+        current_key: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        nsa_indices: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """Run sparse prefill over bounded current and cached partitions."""
+        from lmdeploy.pytorch.kernels.cuda.dcp import merge_attention_states
+
+        prefix_lens = attn_metadata.kv_seqlens - attn_metadata.q_seqlens
+        current_indices = self._map_dcp_prefill_partition(
+            nsa_indices,
+            attn_metadata,
+            prefix_lens,
+            attn_metadata.cu_seqlens_q,
+        )
+        output, output_lse = self._prefill_sparse_partition(
+            query, current_key, current_indices)
+
+        batch_size = prefix_lens.numel()
+        chunk_size = self._get_dcp_prefill_chunk_size(
+            current_key.size(0), batch_size, k_cache.size(1))
+        prefix_total = attn_metadata.kv_flatten_size - current_key.size(0)
+        max_prefix_len = min(prefix_total,
+                             max(0, attn_metadata.max_kv_seqlen - 1))
+        for chunk_start in range(0, max_prefix_len, chunk_size):
+            context_k, context_cu_lens = self._gather_dcp_prefill_context_chunk(
+                k_cache,
+                v_cache,
+                attn_metadata,
+                prefix_lens,
+                chunk_start,
+                chunk_size,
+                out_dtype=query.dtype,
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+            )
+            starts = torch.full_like(prefix_lens, chunk_start)
+            context_indices = self._map_dcp_prefill_partition(
+                nsa_indices,
+                attn_metadata,
+                starts,
+                context_cu_lens,
+            )
+            context_output, context_lse = self._prefill_sparse_partition(
+                query, context_k, context_indices)
+            output, output_lse = merge_attention_states(
+                output, output_lse, context_output, context_lse)
+        return output
 
     def _decoding_sparse_bf16(
             self, query: torch.Tensor, k_cache: torch.Tensor,
@@ -339,14 +439,28 @@ class FlashMLASparseImpl(FlashMLAImpl):
                                             current_key=current_key)
         if nsa_indices is None:
             raise RuntimeError('Sparse MLA requires DSA top-k indices.')
-        flatten_k, _ = self._flatten_dcp_prefill_kv_cache(
-            current_key,
-            k_cache,
-            v_cache,
-            attn_metadata,
-            out_dtype=query.dtype,
-            kv_layout='shd',
-            k_scales_zeros=k_scales_zeros,
-            v_scales_zeros=v_scales_zeros,
-        )
+        if self.dcp_world_size > 1:
+            prefix_total = attn_metadata.kv_flatten_size - current_key.size(0)
+            if prefix_total > 0:
+                return self._prefill_sparse_dcp(
+                    query,
+                    current_key,
+                    k_cache,
+                    v_cache,
+                    nsa_indices,
+                    attn_metadata,
+                    k_scales_zeros=k_scales_zeros,
+                    v_scales_zeros=v_scales_zeros,
+                )
+            flatten_k = current_key
+        else:
+            flatten_k, _ = self._flatten_prefill_kv_cache(
+                k_cache,
+                v_cache,
+                attn_metadata,
+                out_dtype=query.dtype,
+                kv_layout='shd',
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+            )
         return self._prefill_sparse(query, flatten_k, nsa_indices, attn_metadata)

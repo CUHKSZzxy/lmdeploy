@@ -4,6 +4,69 @@ import pytest
 import torch
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+def test_flash_attention_lse_merges_context_partitions():
+    from lmdeploy.pytorch.kernels.cuda.dcp import merge_attention_states
+    from lmdeploy.pytorch.kernels.cuda.flashattention import flash_attn_varlen_func
+
+    torch.manual_seed(9)
+    query = torch.randn(7, 4, 32, device='cuda', dtype=torch.float16)
+    key = torch.randn(13, 4, 32, device='cuda', dtype=torch.float16)
+    value = torch.randn_like(key)
+    cu_q = torch.tensor([0, 7], device='cuda', dtype=torch.int32)
+    cu_k = torch.tensor([0, 13], device='cuda', dtype=torch.int32)
+
+    full_output, full_lse = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        causal=False,
+        kv_layout='shd',
+        return_lse=True,
+    )
+    left_output, left_lse = flash_attn_varlen_func(
+        query,
+        key[:5],
+        value[:5],
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=torch.tensor([0, 5], device='cuda', dtype=torch.int32),
+        causal=False,
+        kv_layout='shd',
+        return_lse=True,
+    )
+    right_output, right_lse = flash_attn_varlen_func(
+        query,
+        key[5:],
+        value[5:],
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=torch.tensor([0, 8], device='cuda', dtype=torch.int32),
+        causal=False,
+        kv_layout='shd',
+        return_lse=True,
+    )
+    padded_output = left_output.new_empty(left_output.size(0),
+                                          left_output.size(1) * 2,
+                                          left_output.size(2))
+    padded_output[:, ::2].copy_(left_output)
+    left_output = padded_output[:, ::2]
+    padded_lse = left_lse.new_empty(left_lse.size(0), left_lse.size(1) * 2)
+    padded_lse[:, ::2].copy_(left_lse)
+    left_lse = padded_lse[:, ::2]
+    merged_output, merged_lse = merge_attention_states(
+        left_output, left_lse, right_output, right_lse)
+
+    expected_lse = torch.logsumexp(
+        torch.einsum('qhd,khd->qhk', query.float(), key.float()) /
+        query.size(-1)**0.5,
+        dim=-1,
+    )
+    torch.testing.assert_close(full_lse, expected_lse, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(merged_lse, full_lse, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(merged_output, full_output, atol=2e-3, rtol=2e-3)
+
+
 def _conti_input(data, q_seqlens):
     data = [x[:l] for x, l in zip(data, q_seqlens)]
     data = torch.cat(data, dim=0)

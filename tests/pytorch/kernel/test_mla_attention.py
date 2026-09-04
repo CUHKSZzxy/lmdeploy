@@ -312,7 +312,29 @@ def test_sparse_mla_prefill_routes_by_kv_length(monkeypatch):
     assert dense_prefill.call_args.kwargs['nsa_indices'] is None
 
 
-def test_dcp_prefill_reconstructs_cached_prefix_in_global_order(monkeypatch):
+def test_dcp_sparse_prefill_maps_partition_indices():
+    impl = object.__new__(FlashMLASparseImpl)
+    metadata = SimpleNamespace(
+        q_seqlens=torch.tensor([2, 1], dtype=torch.int32),
+        q_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    indices = torch.tensor([[2, 3, 4, 5], [4, 1, -1, -1],
+                            [5, 6, -1, -1]],
+                           dtype=torch.int32)
+
+    mapped = impl._map_dcp_prefill_partition(
+        indices,
+        metadata,
+        partition_starts=torch.tensor([3, 5], dtype=torch.int32),
+        partition_cu_lens=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+
+    assert mapped.dtype == torch.int32
+    assert mapped[:, 0].tolist() == [[-1, 0, 1, -1], [1, -1, -1, -1],
+                                    [2, -1, -1, -1]]
+
+
+def test_dcp_prefill_gathers_one_context_chunk_in_global_order(monkeypatch):
     from lmdeploy.pytorch import distributed
     from lmdeploy.pytorch.backends.cuda.attention.default import TritonAttentionMetadata
 
@@ -320,33 +342,23 @@ def test_dcp_prefill_reconstructs_cached_prefix_in_global_order(monkeypatch):
     impl.dcp_world_size = 2
     impl.dcp_rank = 0
     impl.v_head_size = 2
-    # Rank 0 owns request-0 prefix tokens [0, 2] and request-1 token [10].
-    local_prefix = torch.tensor([0, 2, 10], dtype=torch.bfloat16)
+    # The first two-token context chunk contains one token per rank/request.
+    local_prefix = torch.tensor([0, 10], dtype=torch.bfloat16)
     local_prefix = local_prefix[:, None, None].expand(-1, 1, 4).contiguous()
     impl._flatten_prefill_kv_cache = Mock(return_value=(local_prefix,
                                                         local_prefix[..., :2]))
 
-    # Rank 1 owns request-0 token [1] and request-1 token [11]. The last row
-    # pads its two-token local prefix to rank 0's three-token maximum.
-    rank1_prefix = torch.tensor([1, 11, 0], dtype=torch.bfloat16)
+    rank1_prefix = torch.tensor([1, 11], dtype=torch.bfloat16)
     rank1_prefix = rank1_prefix[:, None, None].expand(-1, 1, 4).contiguous()
-
-    monkeypatch.setattr(mla_module, '_DCP_PREFILL_GATHER_MAX_BYTES', 16)
-    gather_starts = []
 
     def fake_all_gather(output, input_tensor, group='tp', async_op=False):
         assert group == 'dcp'
-        start = len(gather_starts)
         rows = input_tensor.size(0)
-        gather_starts.append(start)
         output[:rows].copy_(input_tensor)
-        output[rows:].copy_(rank1_prefix[start:start + rows])
+        output[rows:].copy_(rank1_prefix)
 
     monkeypatch.setattr(distributed, 'all_gather_into_tensor', fake_all_gather)
 
-    # Current chunks are request-0 [100], request-1 [200, 201].
-    current_key = torch.tensor([100, 200, 201], dtype=torch.bfloat16)
-    current_key = current_key[:, None, None].expand(-1, 1, 4).contiguous()
     metadata = TritonAttentionMetadata(
         is_decoding=False,
         q_seqlens=torch.tensor([1, 2], dtype=torch.int32),
@@ -358,17 +370,18 @@ def test_dcp_prefill_reconstructs_cached_prefix_in_global_order(monkeypatch):
         max_kv_seqlen=4,
     )
 
-    flatten_k, flatten_v = impl._flatten_dcp_prefill_kv_cache(
-        current_key,
-        torch.empty(0),
+    context_k, context_cu_lens = impl._gather_dcp_prefill_context_chunk(
+        torch.empty(1, 1, 1, 4),
         torch.empty(0),
         metadata,
+        prefix_lens=torch.tensor([3, 2], dtype=torch.int32),
+        chunk_start=0,
+        chunk_size=2,
         out_dtype=torch.bfloat16,
-        kv_layout='shd')
+    )
 
-    assert flatten_k[:, 0, 0].tolist() == [0, 1, 2, 100, 10, 11, 200, 201]
-    assert torch.equal(flatten_v, flatten_k[..., :2])
-    assert gather_starts == [0, 1, 2]
+    assert context_k[:4, 0, 0].tolist() == [0, 1, 10, 11]
+    assert context_cu_lens.tolist() == [0, 2, 4]
 
 
 def test_dcp_attention_correction_kernel_matches_torch():
